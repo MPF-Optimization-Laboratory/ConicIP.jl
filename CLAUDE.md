@@ -23,6 +23,9 @@ Pure-Julia conic interior-point solver for quadratic programs with linear, secon
 - Block diagonal matrices (`Block`) hold per-cone scaling matrices (Diagonal, SymWoodbury, VecCongurance)
 - Nesterov-Todd scaling computed per cone block
 - `Id(n)` creates n×n identity as `Diagonal(ones(n))`
+- `v4x1` struct fields alias passed matrices (no copy) — buffer reuse requires lifetime analysis
+- Local closures `÷(x,y)` and `∘(x,y)` are cone group division/product; in-place variants are `cone_div!`/`cone_prod!`
+- Julia gotcha: Unicode operators (`÷`, `∘`) cannot have `!` appended — `÷!` is a parse error
 
 ## Running Tests
 
