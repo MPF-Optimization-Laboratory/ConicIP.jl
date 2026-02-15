@@ -18,7 +18,10 @@ makedocs(;
             "Getting Started" => "tutorials/getting_started.md",
             "Linear Programs" => "tutorials/lp.md",
             "Quadratic Programs" => "tutorials/qp.md",
+            "Second-Order Cone" => "tutorials/socp.md",
+            "Semidefinite (Experimental)" => "tutorials/sdp.md",
         ],
+        "JuMP Integration" => "jump.md",
         "API Reference" => "api.md",
     ],
 )

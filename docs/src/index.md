@@ -40,12 +40,3 @@ sol.status
 ```@example quickstart
 round.(sol.y, digits=4)
 ```
-
-## Contents
-
-```@contents
-Pages = [
-    "index.md",
-]
-Depth = 2
-```
