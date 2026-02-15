@@ -22,6 +22,8 @@ makedocs(;
             "Semidefinite (Experimental)" => "tutorials/sdp.md",
         ],
         "JuMP Integration" => "jump.md",
+        "Custom KKT Solvers" => "custom_kkt.md",
+        "Mathematical Background" => "mathematical_background.md",
         "API Reference" => "api.md",
     ],
 )
