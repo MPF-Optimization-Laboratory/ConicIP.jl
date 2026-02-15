@@ -3,7 +3,6 @@ ConicIP.jl: A Pure Julia Conic QP Solver
 
 [![CI](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/actions/workflows/CI.yml)
 [![codecov](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl)
-[![Documentation (stable)](https://img.shields.io/badge/docs-stable-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/)
 [![Documentation (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 
