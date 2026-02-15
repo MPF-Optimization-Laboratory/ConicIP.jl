@@ -7,7 +7,7 @@ Solves the 3x3 system
 ```
 ┌             ┐ ┌    ┐   ┌   ┐
 │ Q   G'  -A' │ │ y' │ = │ y │
-│ G           │ │ w' │   │ w │ 
+│ G           │ │ w' │   │ w │
 │ A       FᵀF │ │ v' │   │ v │
 └             ┘ └    ┘   └   ┘
 ```
@@ -21,16 +21,18 @@ function kktsolver_qr(Q, A, G, cone_dims)
   m = size(A,1) # Number of inequality constraints
   p = size(G,1) # Number of equality constraints
 
-  (Q0,R1) = qr(full(G'), thin = false)
+  F = qr(Matrix(G'))
+  Q0 = F.Q * Matrix{Float64}(LinearAlgebra.I, size(G',1), size(G',1))  # materialize full Q
+  R1 = F.R
   Q1      = Q0[:,1:p]
   Q2      = Q0[:,p+1:end]
 
   function solve3x3gen(F, F⁻ᵀ)
 
-    F⁻ᵀ     = full(inv(F))'
-    Atil    = F⁻ᵀ*full(A)
+    F⁻ᵀ     = Matrix(inv(F))'
+    Atil    = F⁻ᵀ*Matrix(A)
     QpAᵀA   = Q + Atil'Atil
-    L = qrfact(Q2'*(QpAᵀA)*Q2)
+    L = qr(Q2'*(QpAᵀA)*Q2)
 
     function solve3x3(bx, by, bz)
 
@@ -41,7 +43,7 @@ function kktsolver_qr(Q, A, G, cone_dims)
                     Q1'*(QpAᵀA*(Q1*Q1ᵀx)) -
                     Q1'*(QpAᵀA*(Q2*Q2ᵀx)) )
       x    = Q0'\[Q1ᵀx; Q2ᵀx]
-      Fz   = ( F⁻ᵀ*bz - 
+      Fz   = ( F⁻ᵀ*bz -
                Atil*(Q1*(Q1ᵀx)) - Atil*(Q2*(Q2ᵀx)) )
       z    = inv(F)*Fz
 
@@ -89,7 +91,7 @@ function lift(F::Block)
 
     end
 
-    if isa(Blk, Diag)
+    if isa(Blk, Diagonal)
 
       for i = 1:length(Blk.diag)
         push!(IA, In[i]); push!(JA, In[i]); push!(VA, Blk.diag[i])
@@ -110,7 +112,7 @@ function count_lift(cone_dims)
   for (btype, k) = cone_dims
     if btype == "Q"; n = n + k + 2*(2*k) + 4;  end
     if btype == "R"; n = n + k; end
-    if btype == "S"; n = n + k^2; end      
+    if btype == "S"; n = n + k^2; end
   end
   return n
 end
@@ -123,7 +125,7 @@ function count_dense(cone_dims)
   for (btype, k) = cone_dims
     if btype == "Q"; n = n + k^2;  end
     if btype == "R"; n = n + k; end
-    if btype == "S"; n = n + k^2; end      
+    if btype == "S"; n = n + k^2; end
   end
   return n
 end
@@ -136,9 +138,9 @@ function placeholder(cone_dims)
   B = Block(num_cones);
   for i = 1:num_cones
     (ctype, k) = cone_dims[i]
-    if ctype == "R"; B[i] = ConicIP.Diag(2*rand(k)); end
-    if ctype == "Q"; B[i] = SymWoodbury(ConicIP.Diag(3*rand(k)), rand(k), 1.); end
-    if ctype == "S"; B[i] = ConicIP.VecCongurance(ConicIP.mat(rand(k)) + I); end
+    if ctype == "R"; B[i] = Diagonal(2*rand(k)); end
+    if ctype == "Q"; B[i] = SymWoodbury(Diagonal(3*rand(k)), rand(k), 1.); end
+    if ctype == "S"; B[i] = ConicIP.VecCongurance(ConicIP.mat(rand(k)) + LinearAlgebra.I); end
   end
   return B
 end
@@ -157,12 +159,12 @@ function identical_sparse_structure(A::SparseMatrixCSC,B::SparseMatrixCSC)
   return false
 end
 
-""" 
+"""
 Solves the 3x3 system
 ```
 ┌             ┐ ┌    ┐   ┌   ┐
 │ Q   G'  -A' │ │ y' │ = │ y │
-│ G           │ │ w' │   │ w │ 
+│ G           │ │ w' │   │ w │
 │ A       FᵀF │ │ v' │   │ v │
 └             ┘ └    ┘   └   ┘
 ```
@@ -173,7 +175,7 @@ Intelligently chooses between solve3x3gen_sparse_lift and
 solve3x3gen_sparse_dense by approximating the number of non-zeros in
 both and choosing the form with more sparsity. The former is better
 for large second order cones, while the latter is better if the
-constraints are the product of many small cones. 
+constraints are the product of many small cones.
 """
 function kktsolver_sparse(Q, A, G, cone_dims)
 
@@ -193,14 +195,14 @@ function kktsolver_sparse(Q, A, G, cone_dims)
     (FᵀFA, FᵀFB, invFᵀFD) = lift(Fp'Fp); r = size(invFᵀFD,1)
     Z = [ Q             G'            -A'            spzeros(n,r)
           G             spzeros(p,p)   spzeros(p,m)  spzeros(p,r)
-          A             spzeros(m,p)   FᵀFA          FᵀFB                         
+          A             spzeros(m,p)   FᵀFA          FᵀFB
           spzeros(r,n)  spzeros(r,p)   FᵀFB'         invFᵀFD        ]
-    Zᶠ  = lufact(Z)
+    Zᶠ  = lu(Z)
     Z.nzval[:] = 1:length(Z.nzval)
-    I₁₁ = round( Int, Z[n+p+1:n+p+m,n+p+1:n+p+m].nzval )
-    I₁₂ = round( Int, Z[n+p+1:n+p+m,n+p+m+1:end].nzval )
-    I₂₁ = round( Int, Z[n+p+m+1:end,n+p+1:n+p+m].nzval )
-    I₂₂ = round( Int, Z[n+p+m+1:end,n+p+m+1:end].nzval )
+    I₁₁ = round.( Int, Z[n+p+1:n+p+m,n+p+1:n+p+m].nzval )
+    I₁₂ = round.( Int, Z[n+p+1:n+p+m,n+p+m+1:end].nzval )
+    I₂₁ = round.( Int, Z[n+p+m+1:end,n+p+1:n+p+m].nzval )
+    I₂₂ = round.( Int, Z[n+p+m+1:end,n+p+m+1:end].nzval )
 
     function solve3x3gen_lift(F, F⁻ᵀ)
 
@@ -208,25 +210,27 @@ function kktsolver_sparse(Q, A, G, cone_dims)
       # In the first iteration, FᵀF is the identity. This
       # detects that
       if r == 0
-        Z₀ = [ Q        G'             -A' 
+        Z₀ = [ Q        G'             -A'
                G        spzeros(p,p)   spzeros(p,m)
                A        spzeros(m,p)   FᵀFA         ]
-        Z₀ᶠ = lufact(Z₀)
+        Z₀ᶠ = lu(Z₀)
         function solve3x3I(Δy, Δw, Δv)
           z = Z₀ᶠ\[Δy; Δw; Δv]
           return (z[1:n,:], z[n+1:n+p,:], z[n+p+1:end,:])
-        end       
+        end
         return solve3x3I
       else
         # If the sparsity structure is the same, you can reuse
         # the symbolic factorization.
-        Zᶠ.nzval[I₁₁] = FᵀFA.nzval
-        Zᶠ.nzval[I₁₂] = FᵀFB.nzval
-        Zᶠ.nzval[I₂₁] = FᵀFB'.nzval
-        Zᶠ.nzval[I₂₂] = invFᵀFD.nzval        
-        Zᶠ.numeric = C_NULL; SparseArrays.UMFPACK.umfpack_numeric!(Zᶠ)
+        Zᶠ_lu = Zᶠ
+        # Build a fresh sparse matrix with the updated values
+        Z_new = [ Q             G'            -A'            spzeros(n,r)
+                  G             spzeros(p,p)   spzeros(p,m)  spzeros(p,r)
+                  A             spzeros(m,p)   FᵀFA          FᵀFB
+                  spzeros(r,n)  spzeros(r,p)   FᵀFB'         invFᵀFD        ]
+        Zᶠ_lu = lu(Z_new)
         function solve3x3lift(Δy, Δw, Δv)
-          z = Zᶠ\[Δy; Δw; Δv; zeros(r,1)]
+          z = Zᶠ_lu\[Δy; Δw; Δv; zeros(r,1)]
           return (z[1:n,:], z[n+1:n+p,:], z[(n+p+1):(n+m+p),:])
         end
         return solve3x3lift
@@ -239,43 +243,25 @@ function kktsolver_sparse(Q, A, G, cone_dims)
 
     # Compute sparse structure and analyze it
     FᵀFp = sparse(Fp'Fp)
-    Z = [ Q        G'             -A' 
+    Z = [ Q        G'             -A'
           G        spzeros(p,p)   spzeros(p,m)
           A        spzeros(m,p)   FᵀFp         ]
-    Zᶠ = lufact(Z)
-    Z.nzval[:] = 1:length(Z.nzval)
-    Iᵤ = round(Int,Z[end-m+1:end,end-m+1:end].nzval)
 
     function solve3x3gen_nolift(F, F⁻ᵀ)
-      
+
       FᵀF = sparse(F'F)
 
-      # Check if FᵀF has the same sparsity structure as FᵀF₀
-      # If not, construct a new matrix
-      if !identical_sparse_structure(FᵀF, FᵀFp)
-        Z₀ = [ Q        G'             -A' 
-               G        spzeros(p,p)   spzeros(p,m)
-               A        spzeros(m,p)   FᵀF          ]
-        Z₀ᶠ = lufact(Z₀)
-        function solve3x3I(Δy, Δw, Δv)
-          z = Z₀ᶠ\[Δy; Δw; Δv]
-          return (z[1:n,:], z[n+1:n+p,:], z[n+p+1:end,:])
-        end       
-        return solve3x3I
-      else
-        # If the sparsity structure is the same, you can reuse
-        # the symbolic factorization.
-        Zᶠ.nzval[Iᵤ] = FᵀF.nzval
-        Zᶠ.numeric = C_NULL
-        SparseArrays.UMFPACK.umfpack_numeric!(Zᶠ)
-        function solve3x3_nolift(Δy, Δw, Δv)
-          z = Zᶠ\[Δy; Δw; Δv]
-          return (z[1:n,:], z[n+1:n+p,:], z[n+p+1:end,:])
-        end                 
-        return solve3x3_nolift
+      Z₀ = [ Q        G'             -A'
+              G        spzeros(p,p)   spzeros(p,m)
+              A        spzeros(m,p)   FᵀF          ]
+      Z₀ᶠ = lu(Z₀)
+      function solve3x3_nolift(Δy, Δw, Δv)
+        z = Z₀ᶠ\[Δy; Δw; Δv]
+        return (z[1:n,:], z[n+1:n+p,:], z[n+p+1:end,:])
       end
+      return solve3x3_nolift
 
-    end  
+    end
 
     return solve3x3gen_nolift
 
@@ -288,7 +274,7 @@ Solves the 2x2 system
 ```
 ┌                   ┐ ┌    ┐   ┌   ┐
 │ Q + A'F⁻¹F⁻ᵀA  G' │ │ y' │ = │ y │
-│ G                 │ │ w' │   │ w │ 
+│ G                 │ │ w' │   │ w │
 └                   ┘ └    ┘   └   ┘
 ```
 """
@@ -303,10 +289,10 @@ function kktsolver_2x2(Q, A, G, cone_dims)
     F⁻ᵀ = sparse(F⁻ᵀ)
     AᵀF⁻¹F⁻ᵀA = A'*(F⁻ᵀ'*(F⁻ᵀ*A))
 
-    Z = [ Q + AᵀF⁻¹F⁻ᵀA   G'            
+    Z = [ Q + AᵀF⁻¹F⁻ᵀA   G'
           G               spzeros(p,p) ]
 
-    Z = lufact(Z)
+    Z = lu(Z)
 
     function solve2x2(Δy, Δw)
 
@@ -351,4 +337,13 @@ function pivotgen(kktsolver_2x2,Q,A,G,cone_dims)
 
 end
 
+"""
+    pivot(kktsolver_2x2)
+
+Wrap a 2-by-2 KKT solver into a 3-by-3 solver by pivoting on the
+third component. The inner solver handles the Schur complement system;
+`pivot` reconstructs the full solution.
+
+See also [`conicIP`](@ref) for the KKT solver interface specification.
+"""
 pivot(kktsolver_2x2) = (Q,A,G,cone_dims) -> pivotgen(kktsolver_2x2,Q,A,G,cone_dims)

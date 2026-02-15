@@ -7,18 +7,19 @@ Ax = b
 
 and checks if the equations are consistent.
 """
-function imcols(A,b, ϵ = 1e-8)
+function imcols(A, b, ϵ = 1e-8)
 
   A = sparse(A)
-  nA = vecnorm(A); A = A/nA; b = b/nA
+  nA = norm(A); A = A/nA; b = b/nA
 
   if isempty(A); return ([], true); end
 
-  B = qrfact(A');
-  k = size(A,2);
-  x = SparseArrays.CHOLMOD.Dense(rand(k,3));
-  Z = SparseArrays.SPQR.solve(SparseArrays.SPQR.RETX_EQUALS_B, B, x);
-  R = find(sum(abs(Z),2) .> ϵ)
+  F = qr(sparse(A'))
+  R_mat = F.R
+  n_r = min(size(R_mat)...)
+  diag_R = [abs(R_mat[i,i]) for i in 1:n_r]
+  piv = F.pcol  # column permutation
+  R = sort(piv[findall(diag_R .> ϵ)])
 
   if isempty(R); return ([], true); end
 
@@ -74,7 +75,7 @@ function preprocess_conicIP(Q, c::Matrix,
     println("   - No changes made")
   end
 
-  z = ones(n); z[ID] = 0; Z = spdiagm(z)
+  z = ones(n); z[ID] .= 0; Z = spdiagm(0 => z)
 
        # Augmented constraints
        #             |

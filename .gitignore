@@ -1,3 +1,6 @@
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
+.worktrees/
+docs/build/
+/Manifest.toml
