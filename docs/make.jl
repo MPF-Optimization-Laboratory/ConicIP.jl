@@ -13,6 +13,12 @@ makedocs(;
     ),
     pages = [
         "Home" => "index.md",
+        "Installation" => "installation.md",
+        "Tutorials" => [
+            "Getting Started" => "tutorials/getting_started.md",
+            "Linear Programs" => "tutorials/lp.md",
+            "Quadratic Programs" => "tutorials/qp.md",
+        ],
         "API Reference" => "api.md",
     ],
 )
