@@ -517,9 +517,14 @@ function conicIP(
   block_data   = zip(block_types, cum_range(block_sizes),
                      [i for i in 1:length(block_types)])
 
+  # Pre-allocated buffers for in-place ÷! and ∘! (avoids zeros(m,1) per call)
+  _div_buf   = zeros(m, 1)
+  _prod_buf1 = zeros(m, 1)
+  _prod_buf2 = zeros(m, 1)
+
   normc = norm(c)
   normd = isempty(d) ? -Inf : norm(d)
-  normb = isempty(b) ? -Inf : norm(b)
+  normb = normsafe(b)
 
   # Sanity Checks
   ◂ = nothing
@@ -607,11 +612,41 @@ function conicIP(
 
   end
 
+  function cone_div!(o,x,y)
+
+    # In-place group division x ○\ y → o
+
+    fill!(o, 0.0)
+    @inbounds for (btype, I, i) = block_data
+      xI = view(x,I); yI = view(y,I); oI = view(o,I)
+      if btype == "R"; drp!(xI, yI, oI);  end
+      if btype == "Q"; dsoc!(xI, yI, oI); end
+      if btype == "S"; dsdc!(xI, yI, oI); end
+    end
+    return o;
+
+  end
+
   function ∘(x,y)
 
     # Group product x ○ y
 
     o = zeros(length(x),1)
+    @inbounds for (btype, I, i) = block_data
+      xI = view(x,I); yI = view(y,I); oI = view(o,I)
+      if btype == "R"; xrp!(xI, yI, oI);  end
+      if btype == "Q"; xsoc!(xI, yI, oI); end
+      if btype == "S"; xsdc!(xI, yI, oI); end
+    end
+    return o;
+
+  end
+
+  function cone_prod!(o,x,y)
+
+    # In-place group product x ○ y → o
+
+    fill!(o, 0.0)
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; xrp!(xI, yI, oI);  end
@@ -641,7 +676,8 @@ function conicIP(
 
     function solve4x4(r)
 
-      t1 = F'*(r.s ÷ λ)
+      cone_div!(_div_buf, r.s, λ)
+      t1 = F'*_div_buf
       (Δy, Δw, Δv)  = solve3x3(r.y, r.w, r.v + t1)
       axpy!(-1, F'*(F*Δv), t1) # > Δs = t1 - F*(F*Δv)
       return v4x1(Δy,Δw,Δv,t1)
@@ -699,10 +735,11 @@ function conicIP(
     #         │ A              -I │ │ z.v │    = block(λ)*λ
     #         │           S     V │ │ z.s │
     #         └                   ┘ └     ┘
+    cone_prod!(_prod_buf1, λ, λ)
     rleft = v4x1( Q*z.y + Gᵀ*z.w - Aᵀ*z.v ,
                   G*z.y                   ,
                   A*z.y - z.s             ,
-                  λ ∘ λ                   )
+                  _prod_buf1              )
 
     # True Residual of nonlinear KKT System
     r0 = v4x1(rleft.y - c, rleft.w - d, rleft.v - b, rleft.s);
@@ -716,8 +753,8 @@ function conicIP(
     # ────────────────────────────────────────────────────────────
 
     cᵀy = dot(c,z.y)
-    rDu = norm(r0.y)/(1+norm(c))
-    rPr = normsafe(r0.v)/(1+normsafe(b))
+    rDu = norm(r0.y)/(1+normc)
+    rPr = normsafe(r0.v)/(1+normb)
     rCp = normsafe(r0.s)/(1+abs(cᵀy));
 
     if max(rDu, rPr, rCp) < optBest
@@ -849,7 +886,8 @@ function conicIP(
     Fdfs   = F*d_aff.v
 
     # >> lc = -(F⁻ᵀdfs ∘ Fdfs) + (σ*μ)[1]*e;
-    lc = (F⁻ᵀdfs ∘ Fdfs); axpy!(-(σ*μ)[1], e, lc);
+    cone_prod!(_prod_buf2, F⁻ᵀdfs, Fdfs); lc = _prod_buf2
+    axpy!(-(σ*μ)[1], e, lc);
     scal!(length(e), -1., lc, 1)
 
     r  =  v4x1(r0.y, r0.w, r0.v, rleft.s - lc)
@@ -861,15 +899,17 @@ function conicIP(
     Δz  = solve(r);
     rStep = 1;
     for rStep = 1:maxRefinementSteps
+      cone_prod!(_prod_buf1, λ, F*Δz.v)
+      cone_prod!(_prod_buf2, λ, F⁻ᵀ*Δz.s)
       rkkt  = v4x1( Q*Δz.y  + Gᵀ*Δz.w  - Aᵀ*Δz.v , # y
                     G*Δz.y                       , # w
                     A*Δz.y - Δz.s                , # v
-                    λ∘(F*Δz.v) + λ∘(F⁻ᵀ*Δz.s) )    # s
+                    _prod_buf1 + _prod_buf2      )    # s
       rIr = r - rkkt
       rnorm = norm(rIr)/(n + 2*m)
       if rnorm < refinementThreshold; break; end
       Δzr = solve(rIr)
-      Δz  = Δz + Δzr
+      axpy4!(1.0, Δzr, Δz)
     end
 
     # ────────────────────────────────────────────────────────────
