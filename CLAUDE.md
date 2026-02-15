@@ -38,7 +38,13 @@ julia --project -e 'using Pkg; Pkg.test()'
 - Built with Documenter.jl: `docs/make.jl`
 - Docs worktree at `.worktrees/docs` (branch `docs/documenter-setup`)
 - Build locally: `julia --project=docs docs/make.jl`
-- CI deploys to GitHub Pages via `.github/workflows/docs.yml`
+- CI deploys to GitHub Pages via `.github/workflows/Documentation.yml`
+
+## Benchmarking
+
+- `benchmark/profile.jl` — profiling script (timing, allocation, type stability)
+- `benchmark/report.md` — performance analysis and improvement roadmap
+- Run: `julia --project -e 'include("benchmark/profile.jl")'`
 
 ## Git Workflow
 
