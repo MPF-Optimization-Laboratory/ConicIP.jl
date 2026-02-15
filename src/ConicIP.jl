@@ -17,6 +17,28 @@ Create an `n`-by-`n` identity matrix as `Diagonal(ones(n))`.
 """
 Id(n::Integer) = Diagonal(ones(n))
 
+# ──────────────────────────────────────────────────────────────
+#  Linear operator representing a congruence transform of a
+#  matrix in vectorized form
+#  (struct defined here so blockmatrices.jl can reference it
+#   in the BlockElem union; methods added after mat/vecm below)
+# ──────────────────────────────────────────────────────────────
+
+"""
+    VecCongurance(R)
+
+Linear operator representing a congruence transform in vectorized form.
+The action `W * x` computes `vecm(R' * mat(x) * R)`.
+
+Used internally as the Nesterov-Todd scaling matrix for semidefinite cones.
+"""
+mutable struct VecCongurance; R :: Matrix; end
+
+Base.adjoint(W::VecCongurance)         = VecCongurance(W.R');
+Base.inv(W::VecCongurance)             = VecCongurance(inv(W.R))
+Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/2)
+*(W1::VecCongurance, W2::VecCongurance) = VecCongurance(W2.R * W1.R)
+
 include("blockmatrices.jl")
 include("kktsolvers.jl")
 
@@ -43,26 +65,8 @@ function axpy4!(α::Number, x::v4x1, y::v4x1)
     axpy!(α, x.v, y.v); axpy!(α, x.s, y.s)
 end
 
-# ──────────────────────────────────────────────────────────────
-#  Linear operator representing a congruence transform of a
-#  matrix in vectorized form
-# ──────────────────────────────────────────────────────────────
-
-"""
-    VecCongurance(R)
-
-Linear operator representing a congruence transform in vectorized form.
-The action `W * x` computes `vecm(R' * mat(x) * R)`.
-
-Used internally as the Nesterov-Todd scaling matrix for semidefinite cones.
-"""
-mutable struct VecCongurance; R :: Matrix; end
-
+# VecCongurance methods that depend on mat/vecm (defined below)
 *(W::VecCongurance, x::VectorTypes)    = vecm(W.R'*mat(x)*W.R)
-Base.adjoint(W::VecCongurance)         = VecCongurance(W.R');
-Base.inv(W::VecCongurance)             = VecCongurance(inv(W.R))
-Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/2)
-*(W1::VecCongurance, W2::VecCongurance) = VecCongurance(W2.R * W1.R)
 
 function Base.Matrix(W::VecCongurance)
   n = size(W,1)
@@ -185,7 +189,9 @@ function nestod_soc(z,s)
   J = Diagonal(Float64[β for i = 1:n])
   J = Diagonal([-β; fill(β, n-1)])
 
-  return SymWoodbury(J, w, 1.)
+  # Ensure w is a Vector so SymWoodbury stores Vector B (not Matrix).
+  # This guarantees inv(SymWoodbury) returns SymWoodbury (not Woodbury).
+  return SymWoodbury(J, vec(collect(w)), 1.)
 
 end
 
@@ -522,6 +528,9 @@ function conicIP(
   _prod_buf1 = zeros(m, 1)
   _prod_buf2 = zeros(m, 1)
 
+  # Pre-allocated Block for inv(F)' — reused each iteration
+  F⁻ᵀ_cache = Block(size(block_sizes, 1))
+
   normc = norm(c)
   normd = isempty(d) ? -Inf : norm(d)
   normb = normsafe(b)
@@ -723,7 +732,8 @@ function conicIP(
   for Iter = 1:maxIters
 
     F    = nt_scaling(z.v, z.s)   # Nesterov-Todd Scaling Matrix
-    F⁻ᵀ  = inv(F)'
+    inv_adjoint!(F⁻ᵀ_cache, F)
+    F⁻ᵀ  = F⁻ᵀ_cache
     λ    = F*z.v;                 # This is also F⁻ᵀ*z.s.
 
     solve = solve4x4gen(λ,F,F⁻ᵀ)   # Caches 4x4 solver

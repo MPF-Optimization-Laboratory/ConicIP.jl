@@ -7,6 +7,13 @@ import Base: +, *, -, \, ^, getindex, setindex!, show, print
 export Block, size, block_idx, broadcastf,
     copy, getindex, setindex!, +, -, *, \, inv, square;
 
+# Union of all block element types — Julia's union-splitting handles small unions efficiently.
+# SymWoodbury{Float64} matches all concrete SymWoodbury variants (Vector vs Matrix B,
+# scalar vs Matrix D) produced by nestod_soc and SymWoodbury products.
+const BlockElem = Union{Diagonal{Float64, Vector{Float64}},
+                        SymWoodbury{Float64},
+                        VecCongurance, Matrix{Float64}}
+
 """
     Block(size::Int)
     Block(Blk::Vector)
@@ -27,11 +34,11 @@ application via [`broadcastf`](@ref).
 """
 mutable struct Block <: AbstractMatrix{Real}
 
-  Blocks::Vector{Any}
+  Blocks::Vector{BlockElem}
 
-  Block(size::Int) = new(Vector{Any}(undef, size))
-  Block(Blk::Vector{Any}) = new(Blk)
-  Block(Blk::Array) = new(convert(Vector{Any}, Blk))
+  Block(size::Int) = new(Vector{BlockElem}(undef, size))
+  Block(Blk::Vector{BlockElem}) = new(Blk)
+  Block(Blk::AbstractVector) = new(BlockElem[b for b in Blk])
 
 end
 
@@ -42,8 +49,9 @@ function Base.size(A::Block)
 end
 
 Base.size(A::Block, i::Integer)    = (i == 1 || i == 2) ? size(A)[1] : 1
-getindex(A::Block, i::Integer)     = A.Blocks[i]
-setindex!(A::Block, B, i::Integer) = begin; A.Blocks[i] = B; end
+getindex(A::Block, i::Int)         = A.Blocks[i]
+setindex!(A::Block, B::BlockElem, i::Int) = begin; A.Blocks[i] = B; end
+setindex!(A::Block, B, i::Int) = begin; A.Blocks[i] = Matrix{Float64}(B); end
 
 """
     block_idx(A::Block)
@@ -122,6 +130,16 @@ function broadcastf(op::Function, A::Block, X::Matrix)
 
 end
 
+# Direct sparse conversion for SymWoodbury: A + B*D*B'
+# Avoids dense Matrix(W) intermediate allocation.
+function SparseArrays.sparse(W::SymWoodbury)
+  A_sp = sparse(W.A)
+  B_mat = W.B isa Vector ? reshape(W.B, :, 1) : W.B
+  B_sp = sparse(B_mat)
+  D_sp = W.D isa Number ? W.D : sparse(W.D)
+  return A_sp + B_sp * D_sp * B_sp'
+end
+
 function SparseArrays.sparse(A::Block)
 
   I₊, J₊, V₊ = Int[], Int[], Float64[]
@@ -165,6 +183,19 @@ Base.deepcopy(A::Block)    = Block(deepcopy(A.Blocks))
 Base.inv(A::Block)         = broadcastf(inv, A)
 -(A::Block)                = broadcastf(-, A)
 Base.adjoint(A::Block)     = broadcastf(adjoint, A)
+
+"""
+    inv_adjoint!(dest::Block, src::Block)
+
+Compute `adjoint(inv(src))` block-wise, reusing the `dest` Block shell.
+Avoids allocating two intermediate Blocks for `inv(F)'`.
+"""
+function inv_adjoint!(dest::Block, src::Block)
+    for i = 1:length(src.Blocks)
+        dest.Blocks[i] = adjoint(inv(src.Blocks[i]))
+    end
+    return dest
+end
 *(A::Block, B::Block)      = broadcastf(*, A, B)
 *(A::Adjoint{<:Any,Block}, B::Block) = broadcastf((a,b) -> a'*b, parent(A), B)
 

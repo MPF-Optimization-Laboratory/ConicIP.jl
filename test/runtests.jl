@@ -81,6 +81,10 @@ end
         D = Matrix{Float64}(I, 3, 3)
         @test ConicIP.maxstep_sdc(ConicIP.vecm(X), ConicIP.vecm(D)) == Inf
 
+        # Test direct sparse(SymWoodbury) avoids dense materialization
+        sw = ConicIP.WoodburyMatrices.SymWoodbury(Diagonal(rand(50)), randn(50, 2), Matrix(1.0I, 2, 2))
+        @test sparse(sw) ≈ Matrix(sw)
+
     end
 
     @testset "Box Constrained QP, H = I" begin
