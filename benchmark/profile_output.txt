@@ -1,0 +1,405 @@
+ConicIP.jl Performance Profile
+Julia 1.12.3
+Threads: 1
+Time: 2026-02-14T19:39:11.991
+
+====================================================================================================
+  MACRO BENCHMARKS
+====================================================================================================
+
+--- Box QP dense Q (n=500) ---
+  n=500, m=1000, p=0, cones=[("R", 1000)]
+  [kktsolver_qr      ]   0.1493s     321.9 MB  GC= 0.8%  iters=  8  status=Optimal
+  [kktsolver_sparse  ]   0.4300s     670.0 MB  GC= 1.3%  iters=  8  status=Optimal
+  [pivot(2x2)        ]   0.0830s     529.2 MB  GC= 2.7%  iters=  8  status=Optimal
+
+--- Box QP sparse Q (n=1000) ---
+  n=1000, m=2000, p=0, cones=[("R", 2000)]
+  [kktsolver_qr      ]   0.8936s    1262.4 MB  GC=16.0%  iters=  7  status=Optimal
+  [kktsolver_sparse  ]   0.0162s      43.2 MB  GC= 0.0%  iters=  7  status=Optimal
+  [pivot(2x2)        ]   0.0074s      22.5 MB  GC= 0.0%  iters=  7  status=Optimal
+
+--- Single large SOC (n=500) ---
+  n=500, m=501, p=0, cones=[("Q", 501)]
+  [kktsolver_qr      ]   0.0763s     164.2 MB  GC= 0.0%  iters=  6  status=Optimal
+  [kktsolver_sparse  ]   0.0099s      19.0 MB  GC= 0.0%  iters=  6  status=Optimal
+  [pivot(2x2)        ]   0.8210s     772.9 MB  GC= 1.3%  iters=  6  status=Optimal
+
+--- Many small SOCs (k=250, n=500) ---
+  n=500, m=750, p=0, cones=[("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3), ("Q", 3)]
+  [kktsolver_qr      ]   0.1397s     305.8 MB  GC= 1.9%  iters=  9  status=Optimal
+  [kktsolver_sparse  ]   1.0078s     566.3 MB  GC= 0.5%  iters=  9  status=Optimal
+  [pivot(2x2)        ]   0.2009s     589.9 MB  GC= 1.9%  iters=  9  status=Optimal
+
+--- Small SDP (k=10) ---
+  n=55, m=55, p=0, cones=[("S", 55)]
+  [kktsolver_qr      ]   0.0020s       4.1 MB  GC= 0.0%  iters=  5  status=Optimal
+  [kktsolver_sparse  ]   0.0024s       4.5 MB  GC= 0.0%  iters=  5  status=Optimal
+  [pivot(2x2)        ]   0.0014s       3.0 MB  GC= 0.0%  iters=  5  status=Optimal
+
+--- Larger SDP (k=30) ---
+  n=465, m=465, p=0, cones=[("S", 465)]
+  [kktsolver_qr      ]   0.0979s     204.4 MB  GC= 3.2%  iters=  5  status=Optimal
+  [kktsolver_sparse  ]   0.0674s     193.6 MB  GC= 0.0%  iters=  5  status=Optimal
+  [pivot(2x2)        ]   0.0274s     115.4 MB  GC= 0.0%  iters=  5  status=Optimal
+
+--- Mixed R+Q + equalities (n=200, p=10) ---
+  n=200, m=251, p=10, cones=[("R", 200), ("Q", 51)]
+  [kktsolver_qr      ]   0.0253s      52.4 MB  GC= 0.0%  iters= 11  status=Optimal
+  [kktsolver_sparse  ]   0.0482s      39.6 MB  GC= 0.0%  iters= 11  status=Optimal
+  [pivot(2x2)        ]   0.0404s     161.9 MB  GC= 0.0%  iters= 11  status=Optimal
+
+--- Mixed R+Q+S (n=86) ---
+  n=86, m=86, p=0, cones=[("R", 50), ("Q", 21), ("S", 15)]
+  [kktsolver_qr      ]   0.0045s       7.8 MB  GC= 0.0%  iters=  8  status=Optimal
+  [kktsolver_sparse] warmup failed: DimensionMismatch("")
+  [pivot(2x2)] trial 1 failed: PosDefException(5)
+
+====================================================================================================
+  STATISTICAL PROFILING (flat, top 30 by count)
+====================================================================================================
+
+--- Profile: Box QP sparse ---
+ Count  Overhead File                    Line Function
+ =====  ======== ====                    ==== ========
+     5         0 @LinearAlgebra/src/matmul.jl  507 generic_matmatmul_wrapper!(C::Mat…
+     5         0 @LinearAlgebra/src/matmul.jl  513 _syrk_herk_gemm_wrapper!
+     5         0 @LinearAlgebra/src/matmul.jl  725 syrk_wrapper!(C::Matrix{Float64},…
+     5         0 @LinearAlgebra/src/matmul.jl  603 copytri!
+     5         0 @ConicIP/src/ConicIP.jl  645 (::ConicIP.var"#solve4x4#25"{Matr…
+     5         0 @ConicIP/src/kktsolvers.jl   45 (::ConicIP.var"#solve3x3#kktsolve…
+     5         0 @LinearAlgebra/src/generic.jl 1385 _iszero
+     5         0 @Base/reducedim.jl      326 mapreduce
+     5         0 @Base/reducedim.jl      326 #mapreduce#728
+     5         0 @Base/reducedim.jl      331 _mapreduce_dim
+     5         0 @Base/reduce.jl          36 mapfoldl_impl
+     5         0 @Base/reduce.jl          40 foldl_impl
+     6         0 @LinearAlgebra/src/matmul.jl  265 mul!
+     6         0 @LinearAlgebra/src/matmul.jl  297 mul!
+     6         0 @LinearAlgebra/src/matmul.jl  328 _mul!
+     8         8 @Base/essentials.jl     920 getindex
+     9         0 @Base/array.jl          997 setindex!
+     9         9 @Base/array.jl         1003 _setindex!
+    14         0 @Base/abstractarray.jl 1443 setindex!
+    14         0 @Base/multidimensional.jl 1008 _setindex!
+    14         0 @Base/multidimensional.jl 1020 _unsafe_setindex!(::IndexLinear, …
+    14         0 @Base/cartesian.jl       64 macro expansion
+    14         0 @Base/multidimensional.jl 1022 macro expansion
+    16         0 @ConicIP/src/blockmatrices.jl  148 (Matrix)(A::Block)
+    17         0 @ConicIP/src/kktsolvers.jl   32 (::ConicIP.var"#solve3x3gen#kktso…
+    19         0 @Base/array.jl          377 similar
+    21         0 @Base/boot.jl           661 Array
+    24         0 @ConicIP/src/kktsolvers.jl   34 (::ConicIP.var"#solve3x3gen#kktso…
+    24         0 @LinearAlgebra/src/matmul.jl  136 *
+   126         0 @SparseArrays/src/sparsematrix.jl  974 Array
+   127         0 @ConicIP/src/kktsolvers.jl   33 (::ConicIP.var"#solve3x3gen#kktso…
+   147         0 @Base/boot.jl           651 Array
+   147         0 @Base/boot.jl           604 new_as_memoryref
+   147       147 @Base/boot.jl           588 GenericMemory
+   168         0 @ConicIP/src/ConicIP.jl  693 conicIP(Q::SparseMatrixCSC{Float6…
+   171         0 @ConicIP/src/ConicIP.jl  640 solve4x4gen
+   177         0 @Base/client.jl         550 _start()
+   177         0 @Base/client.jl         283 exec_options(opts::Base.JLOptions)
+   177         0 @Base/boot.jl           489 eval(m::Module, e::Any)
+   177         0 @Base/Base.jl           308 (::Base.IncludeInto)(fname::Strin…
+   177         0 @Base/Base.jl           307 include(mapexpr::Function, mod::M…
+   177         0 @Base/loading.jl       2930 _include(mapexpr::Function, mod::…
+   177         0 @Base/loading.jl       2870 include_string(mapexpr::typeof(id…
+   177         0 @ConicIP/benchmark/profile.jl  442 main()
+   177         0 @ConicIP/benchmark/profile.jl  248 run_profiling()
+   177         0 @Profile/src/Profile.jl   60 macro expansion
+   177         0 @ConicIP/src/ConicIP.jl  464 kwcall(::@NamedTuple{verbose::Boo…
+Total snapshots: 1704. Utilization: 50% across all threads and tasks. Use the `groupby` kwarg to break down by thread and/or task.
+
+--- Profile: Single SOC ---
+ Count  Overhead File                    Line Function
+ =====  ======== ====                    ==== ========
+     5         0 @WoodburyMatrices/src/symwoodbury.jl  166 symmetrize!(A::Diagonal{Float64, …
+     5         0 @ConicIP/src/kktsolvers.jl   32 (::ConicIP.var"#solve3x3gen#kktso…
+     6         0 @ConicIP/src/kktsolvers.jl   33 (::ConicIP.var"#solve3x3gen#kktso…
+     6         0 @Base/array.jl          377 similar
+     6         0 @Base/boot.jl           661 Array
+     6         0 @Base/boot.jl           651 Array
+     6         0 @Base/boot.jl           604 new_as_memoryref
+     6         6 @Base/boot.jl           588 GenericMemory
+     7         0 @LinearAlgebra/src/matmul.jl  136 *
+    12         0 @ConicIP/src/ConicIP.jl  693 conicIP(Q::SparseMatrixCSC{Float6…
+    12         0 @ConicIP/src/ConicIP.jl  640 solve4x4gen
+    18         0 @Base/client.jl         550 _start()
+    18         0 @Base/client.jl         283 exec_options(opts::Base.JLOptions)
+    18         0 @Base/boot.jl           489 eval(m::Module, e::Any)
+    18         0 @Base/Base.jl           308 (::Base.IncludeInto)(fname::Strin…
+    18         0 @Base/Base.jl           307 include(mapexpr::Function, mod::M…
+    18         0 @Base/loading.jl       2930 _include(mapexpr::Function, mod::…
+    18         0 @Base/loading.jl       2870 include_string(mapexpr::typeof(id…
+    18         0 @ConicIP/benchmark/profile.jl  442 main()
+    18         0 @ConicIP/benchmark/profile.jl  248 run_profiling()
+    18         0 @Profile/src/Profile.jl   60 macro expansion
+    18         0 @ConicIP/src/ConicIP.jl  464 kwcall(::@NamedTuple{verbose::Boo…
+Total snapshots: 180. Utilization: 50% across all threads and tasks. Use the `groupby` kwarg to break down by thread and/or task.
+
+--- Profile: Small SDP ---
+┌ Warning: There were no samples collected.
+│ Run your program longer (perhaps by running it multiple times),
+│ or adjust the delay between samples with `Profile.init()`.
+└ @ Profile ~/.julia/juliaup/julia-1.12.3+0.aarch64.apple.darwin14/share/julia/stdlib/v1.12/Profile/src/Profile.jl:1367
+
+--- Profile: Mixed R+Q+S ---
+ Count  Overhead File                    Line Function
+ =====  ======== ====                    ==== ========
+Total snapshots: 8. Utilization: 50% across all threads and tasks. Use the `groupby` kwarg to break down by thread and/or task.
+
+====================================================================================================
+  ALLOCATION TRACKING
+====================================================================================================
+
+--- Block * Matrix allocations ---
+  Diagonal Block(500) * Matrix:  8576 bytes
+  SymWoodbury Block(500) * Matrix:  17088 bytes
+  VecCongurance Block(55) * Matrix:  4160 bytes
+
+--- inv(Block) allocations ---
+  inv(Diagonal Block):  4256 bytes
+  inv(SymWoodbury Block):  25952 bytes
+  inv(VecCongurance Block):  6400 bytes
+
+--- inv(Block)' allocations ---
+  inv(Diagonal Block)':  4352 bytes
+  inv(SymWoodbury Block)':  39312 bytes
+  inv(VecCongurance Block)':  7456 bytes
+
+--- sparse(Block) allocations ---
+  sparse(Diagonal Block):  118336 bytes
+  sparse(SymWoodbury Block):  58765920 bytes
+  sparse(VecCongurance Block):  815120 bytes
+
+--- Per-cone arithmetic (÷ and ∘ primitives) ---
+  drp!(500):  0 bytes
+  xrp!(500):  0 bytes
+  dsoc!(500):  0 bytes
+  xsoc!(500):  0 bytes
+  dsdc!(55):  12560 bytes
+  xsdc!(55):  5264 bytes
+
+--- mat/vecm allocations ---
+  mat(k=30, n=465):  8272 bytes
+  vecm(k=30):  4176 bytes
+
+====================================================================================================
+  TYPE STABILITY AUDIT
+====================================================================================================
+
+--- @code_warntype: Block * Matrix{Float64} ---
+MethodInstance for broadcastf(::typeof(*), ::Block, ::Matrix{Float64})
+  from broadcastf(op::Function, A::Block, X::Matrix) @ ConicIP ~/Documents/projects/Software/ConicIP.jl/src/blockmatrices.jl:112
+Arguments
+  #self#::Core.Const(ConicIP.broadcastf)
+  op::Core.Const(*)
+  A::Block
+  X::Matrix{Float64}
+Locals
+  @_5::UNION{NOTHING, TUPLE{UNITRANGE{INT64}, INT64}}
+  val::Nothing
+  i::Int64
+  Y::Matrix{Float64}
+  I::UnitRange{Int64}
+  XI::SubArray{Float64, 2, Matrix{Float64}, Tuple{UnitRange{Int64}, Base.Slice{Base.OneTo{Int64}}}, false}
+Body::Matrix{Float64}
+1 ─       Core.NewvarNode(:(val))
+│   %2  = ConicIP.similar::Core.Const(similar)
+│         (Y = (%2)(X))
+│         (i = 1)
+│         nothing
+│   %6  = ConicIP.block_idx::Core.Const(ConicIP.block_idx)
+│   %7  = (%6)(A)::Vector{UnitRange{Int64}}
+│         (@_5 = Base.iterate(%7))
+│   %9  = @_5::UNION{NOTHING, TUPLE{UNITRANGE{INT64}, INT64}}
+│   %10 = (%9 === nothing)::Bool
+│   %11 = Base.not_int(%10)::Bool
+└──       goto #4 if not %11
+2 ┄ %13 = @_5::Tuple{UnitRange{Int64}, Int64}
+│         (I = Core.getfield(%13, 1))
+│   %15 = Core.getfield(%13, 2)::Int64
+│   %16 = ConicIP.view::Core.Const(view)
+│   %17 = I::UnitRange{Int64}
+│   %18 = ConicIP.:(:)::Core.Const(Colon())
+│         (XI = (%16)(X, %17, %18))
+│   %20 = Base.getproperty(A, :Blocks)::Vector{Any}
+│   %21 = i::Int64
+│   %22 = Base.getindex(%20, %21)::ANY
+│   %23 = XI::Core.PartialStruct(SubArray{Float64, 2, Matrix{Float64}, Tuple{UnitRange{Int64}, Base.Slice{Base.OneTo{Int64}}}, false}, Any[Matrix{Float64}, Tuple{UnitRange{Int64}, Base.Slice{Base.OneTo{Int64}}}, Core.Const(0), Core.Const(0)])
+│   %24 = (op)(%22, %23)::ANY
+│   %25 = Y::Matrix{Float64}
+│   %26 = I::UnitRange{Int64}
+│   %27 = ConicIP.:(:)::Core.Const(Colon())
+│         Base.setindex!(%25, %24, %26, %27)
+│   %29 = ConicIP.:+::Core.Const(+)
+│   %30 = i::Int64
+│         (i = (%29)(%30, 1))
+│         (@_5 = Base.iterate(%7, %15))
+│   %33 = @_5::UNION{NOTHING, TUPLE{UNITRANGE{INT64}, INT64}}
+│   %34 = (%33 === nothing)::Bool
+│   %35 = Base.not_int(%34)::Bool
+└──       goto #4 if not %35
+3 ─       goto #2
+4 ┄       (val = nothing)
+│         nothing
+│         val
+│   %41 = Y::Matrix{Float64}
+└──       return %41
+
+
+--- @code_warntype: inv(Block) ---
+MethodInstance for broadcastf(::typeof(inv), ::Block)
+  from broadcastf(op::Function, A::Block) @ ConicIP ~/Documents/projects/Software/ConicIP.jl/src/blockmatrices.jl:79
+Arguments
+  #self#::Core.Const(ConicIP.broadcastf)
+  op::Core.Const(inv)
+  A::Block
+Locals
+  @_4::UNION{NOTHING, TUPLE{INT64, INT64}}
+  B::Block
+  i::Int64
+Body::Block
+1 ─ %1  = ConicIP.copy::Core.Const(copy)
+│         (B = (%1)(A))
+│   %3  = ConicIP.:(:)::Core.Const(Colon())
+│   %4  = ConicIP.length::Core.Const(length)
+│   %5  = Base.getproperty(A, :Blocks)::Vector{Any}
+│   %6  = (%4)(%5)::Int64
+│   %7  = (%3)(1, %6)::Core.PartialStruct(UnitRange{Int64}, Any[Core.Const(1), Int64])
+│         (@_4 = Base.iterate(%7))
+│   %9  = @_4::UNION{NOTHING, TUPLE{INT64, INT64}}
+│   %10 = (%9 === nothing)::Bool
+│   %11 = Base.not_int(%10)::Bool
+└──       goto #4 if not %11
+2 ┄ %13 = @_4::Tuple{Int64, Int64}
+│         (i = Core.getfield(%13, 1))
+│   %15 = Core.getfield(%13, 2)::Int64
+│   %16 = i::Int64
+│   %17 = Base.getindex(A, %16)::ANY
+│   %18 = (op)(%17)::ANY
+│   %19 = B::Block
+│   %20 = i::Int64
+│         Base.setindex!(%19, %18, %20)
+│         (@_4 = Base.iterate(%7, %15))
+│   %23 = @_4::UNION{NOTHING, TUPLE{INT64, INT64}}
+│   %24 = (%23 === nothing)::Bool
+│   %25 = Base.not_int(%24)::Bool
+└──       goto #4 if not %25
+3 ─       goto #2
+4 ┄ %28 = B::Block
+└──       return %28
+
+
+--- @code_warntype: Block' (adjoint) ---
+MethodInstance for broadcastf(::typeof(adjoint), ::Block)
+  from broadcastf(op::Function, A::Block) @ ConicIP ~/Documents/projects/Software/ConicIP.jl/src/blockmatrices.jl:79
+Arguments
+  #self#::Core.Const(ConicIP.broadcastf)
+  op::Core.Const(adjoint)
+  A::Block
+Locals
+  @_4::UNION{NOTHING, TUPLE{INT64, INT64}}
+  B::Block
+  i::Int64
+Body::Block
+1 ─ %1  = ConicIP.copy::Core.Const(copy)
+│         (B = (%1)(A))
+│   %3  = ConicIP.:(:)::Core.Const(Colon())
+│   %4  = ConicIP.length::Core.Const(length)
+│   %5  = Base.getproperty(A, :Blocks)::Vector{Any}
+│   %6  = (%4)(%5)::Int64
+│   %7  = (%3)(1, %6)::Core.PartialStruct(UnitRange{Int64}, Any[Core.Const(1), Int64])
+│         (@_4 = Base.iterate(%7))
+│   %9  = @_4::UNION{NOTHING, TUPLE{INT64, INT64}}
+│   %10 = (%9 === nothing)::Bool
+│   %11 = Base.not_int(%10)::Bool
+└──       goto #4 if not %11
+2 ┄ %13 = @_4::Tuple{Int64, Int64}
+│         (i = Core.getfield(%13, 1))
+│   %15 = Core.getfield(%13, 2)::Int64
+│   %16 = i::Int64
+│   %17 = Base.getindex(A, %16)::ANY
+│   %18 = (op)(%17)::ANY
+│   %19 = B::Block
+│   %20 = i::Int64
+│         Base.setindex!(%19, %18, %20)
+│         (@_4 = Base.iterate(%7, %15))
+│   %23 = @_4::UNION{NOTHING, TUPLE{INT64, INT64}}
+│   %24 = (%23 === nothing)::Bool
+│   %25 = Base.not_int(%24)::Bool
+└──       goto #4 if not %25
+3 ─       goto #2
+4 ┄ %28 = B::Block
+└──       return %28
+
+
+--- @code_warntype: broadcastf(*, mixed Block, Matrix) ---
+MethodInstance for broadcastf(::typeof(*), ::Block, ::Matrix{Float64})
+  from broadcastf(op::Function, A::Block, X::Matrix) @ ConicIP ~/Documents/projects/Software/ConicIP.jl/src/blockmatrices.jl:112
+Arguments
+  #self#::Core.Const(ConicIP.broadcastf)
+  op::Core.Const(*)
+  A::Block
+  X::Matrix{Float64}
+Locals
+  @_5::UNION{NOTHING, TUPLE{UNITRANGE{INT64}, INT64}}
+  val::Nothing
+  i::Int64
+  Y::Matrix{Float64}
+  I::UnitRange{Int64}
+  XI::SubArray{Float64, 2, Matrix{Float64}, Tuple{UnitRange{Int64}, Base.Slice{Base.OneTo{Int64}}}, false}
+Body::Matrix{Float64}
+1 ─       Core.NewvarNode(:(val))
+│   %2  = ConicIP.similar::Core.Const(similar)
+│         (Y = (%2)(X))
+│         (i = 1)
+│         nothing
+│   %6  = ConicIP.block_idx::Core.Const(ConicIP.block_idx)
+│   %7  = (%6)(A)::Vector{UnitRange{Int64}}
+│         (@_5 = Base.iterate(%7))
+│   %9  = @_5::UNION{NOTHING, TUPLE{UNITRANGE{INT64}, INT64}}
+│   %10 = (%9 === nothing)::Bool
+│   %11 = Base.not_int(%10)::Bool
+└──       goto #4 if not %11
+2 ┄ %13 = @_5::Tuple{UnitRange{Int64}, Int64}
+│         (I = Core.getfield(%13, 1))
+│   %15 = Core.getfield(%13, 2)::Int64
+│   %16 = ConicIP.view::Core.Const(view)
+│   %17 = I::UnitRange{Int64}
+│   %18 = ConicIP.:(:)::Core.Const(Colon())
+│         (XI = (%16)(X, %17, %18))
+│   %20 = Base.getproperty(A, :Blocks)::Vector{Any}
+│   %21 = i::Int64
+│   %22 = Base.getindex(%20, %21)::ANY
+│   %23 = XI::Core.PartialStruct(SubArray{Float64, 2, Matrix{Float64}, Tuple{UnitRange{Int64}, Base.Slice{Base.OneTo{Int64}}}, false}, Any[Matrix{Float64}, Tuple{UnitRange{Int64}, Base.Slice{Base.OneTo{Int64}}}, Core.Const(0), Core.Const(0)])
+│   %24 = (op)(%22, %23)::ANY
+│   %25 = Y::Matrix{Float64}
+│   %26 = I::UnitRange{Int64}
+│   %27 = ConicIP.:(:)::Core.Const(Colon())
+│         Base.setindex!(%25, %24, %26, %27)
+│   %29 = ConicIP.:+::Core.Const(+)
+│   %30 = i::Int64
+│         (i = (%29)(%30, 1))
+│         (@_5 = Base.iterate(%7, %15))
+│   %33 = @_5::UNION{NOTHING, TUPLE{UNITRANGE{INT64}, INT64}}
+│   %34 = (%33 === nothing)::Bool
+│   %35 = Base.not_int(%34)::Bool
+└──       goto #4 if not %35
+3 ─       goto #2
+4 ┄       (val = nothing)
+│         nothing
+│         val
+│   %41 = Y::Matrix{Float64}
+└──       return %41
+
+
+--- Block.Blocks field type ---
+  typeof(F.Blocks) = Vector{Any}
+  typeof(F_mixed.Blocks) = Vector{Any}
+  eltype(F_mixed.Blocks) = Any
+
+====================================================================================================
+  PROFILING COMPLETE
+====================================================================================================

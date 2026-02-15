@@ -1,7 +1,11 @@
 ConicIP.jl: A Pure Julia Conic QP Solver
 ==
 
-[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)
+[![CI](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/actions/workflows/CI.yml)
+[![codecov](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl)
+[![Documentation (stable)](https://img.shields.io/badge/docs-stable-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/)
+[![Documentation (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 
 `ConicIP` (Conic **I**nterior **P**oint) is an interior-point solver inspired by [cvxopt](http://cvxopt.org/) for optimizing quadratic objectives with linear equality constraints, and polyhedral, second-order cone constraints. (Semidefinite cone constraints are available, but only supported as an experimental feature.) Because ConicIP is written in Julia, it allows abstract input and allows callbacks for its most computationally intensive internal routines.
 
@@ -9,7 +13,7 @@ ConicIP.jl: A Pure Julia Conic QP Solver
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/MPF-Optimization-Laboratory/ConicIP.jl")
+Pkg.add("ConicIP")
 ```
 
 Requires Julia 1.10 or later.
