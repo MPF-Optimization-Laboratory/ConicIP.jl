@@ -1,15 +1,17 @@
-isdefined(Base, :__precompile__) && __precompile__()
+module ConicIP
 
-module ConicIP 
+export Id, conicIP, pivot, preprocess_conicIP,
+  Optimizer, Block
 
-export Id, conicIP, pivot, preprocess_conicIP, 
-  ConicIPSolver, Block
-
-import Base:+,*,-,\,^
-using Base.LinAlg.BLAS:axpy!,scal!
+import Base: +, *, -, \, ^
+using LinearAlgebra
+using LinearAlgebra.BLAS: axpy!, scal!
+using SparseArrays
 using WoodburyMatrices
+using Printf
 
-include("diag.jl")
+Id(n::Integer) = Diagonal(ones(n))
+
 include("blockmatrices.jl")
 include("kktsolvers.jl")
 
@@ -25,11 +27,11 @@ normsafe(x) = isempty(x) ? 0 : norm(x)
 #  3x1 block vector
 # ──────────────────────────────────────────────────────────────
 
-type v4x1; y::Matrix; w::Matrix; v::Matrix; s::Matrix; end
+mutable struct v4x1; y::Matrix; w::Matrix; v::Matrix; s::Matrix; end
 
 +(a::v4x1, b::v4x1) = v4x1(a.y + b.y, a.w + b.w, a.v + b.v, a.s + b.s)
 -(a::v4x1, b::v4x1) = v4x1(a.y - b.y, a.w - b.w, a.v - b.v, a.s - b.s)
-Base.norm(a::v4x1)  = norm(a.y) + normsafe(a.w) + normsafe(a.v) + normsafe(a.s) 
+LinearAlgebra.norm(a::v4x1) = norm(a.y) + normsafe(a.w) + normsafe(a.v) + normsafe(a.s)
 
 function axpy4!(α::Number, x::v4x1, y::v4x1)
     axpy!(α, x.y, y.y); axpy!(α, x.w, y.w)
@@ -41,26 +43,26 @@ end
 #  matrix in vectorized form
 # ──────────────────────────────────────────────────────────────
 
-type VecCongurance; R :: Matrix; end
+mutable struct VecCongurance; R :: Matrix; end
 
 *(W::VecCongurance, x::VectorTypes)    = vecm(W.R'*mat(x)*W.R)
-Base.ctranspose(W::VecCongurance)      = VecCongurance(W.R');
+Base.adjoint(W::VecCongurance)         = VecCongurance(W.R');
 Base.inv(W::VecCongurance)             = VecCongurance(inv(W.R))
 Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/2)
-Base.Ac_mul_B(W1::VecCongurance, W2::VecCongurance) = VecCongurance(W2.R*W1.R')
+*(W1::VecCongurance, W2::VecCongurance) = VecCongurance(W2.R * W1.R)
 
-function Base.full(W::VecCongurance)
+function Base.Matrix(W::VecCongurance)
   n = size(W,1)
-  I = eye(n)
+  Imat = Matrix{Float64}(LinearAlgebra.I, n, n)
   Z = zeros(n,n)
   for i = 1:n
-    Z[:,i] = W*I[:,i][:]
+    Z[:,i] = W*Imat[:,i][:]
   end
   return Z
 end
 
-function Base.sparse(W::VecCongurance)
-  return sparse(full(W))
+function SparseArrays.sparse(W::VecCongurance)
+  return sparse(Matrix(W))
 end
 
 ord(x) = begin; n = length(x); round(Int, (sqrt(1+8*n) - 1)/2); end
@@ -127,8 +129,8 @@ cum_range(x) = [i:(j-1) for (i,j) in
         zip(cumsum([1;x])[1:end-1], cumsum([1;x])[2:end])]
 QF(r) = 2*r[1]*r[1] - dot(r,r)
 Q(x::VectorTypes,y::VectorTypes) = 2*x[1]*y[1] - dot(x,y) # xᵀJy
-fts(x₁, α₁, y₁, x₂, α₂, y₂)      = vecdot(x₁,x₂) - α₂*vecdot(x₁,y₂) -
-          α₁*vecdot(y₁,x₂) + α₁*α₂*vecdot(y₁,y₂) # (x₁ - α₁*y₁)'(x₂ - α₂y₂)
+fts(x₁, α₁, y₁, x₂, α₂, y₂)      = dot(x₁,x₂) - α₂*dot(x₁,y₂) -
+          α₁*dot(y₁,x₂) + α₁*α₂*dot(y₁,y₂) # (x₁ - α₁*y₁)'(x₂ - α₂y₂)
 
 function nestod_soc(z,s)
 
@@ -144,18 +146,18 @@ function nestod_soc(z,s)
   z = z/sqrt(QF(z))
   s = s/sqrt(QF(s))
 
-  γ = sqrt((1 + vecdot(z,s))/2)
+  γ = sqrt((1 + dot(z,s))/2)
 
   # Jz = J*z;
   scal!(length(z), -1., z, 1)
   z[1] = -z[1]
 
-  w = (1./(2.*γ))*(s + z)
+  w = (1.0 ./ (2.0 .* γ)) .* (s + z)
   w[1] = w[1] + 1
   scal!(length(w), (sqrt(2*β)/sqrt(2*w[1])), w, 1)
 
-  J = Diag(Float64[β for i = 1:n])
-  J.diag[1] = -β
+  J = Diagonal(Float64[β for i = 1:n])
+  J = Diagonal([-β; fill(β, n-1)])
 
   return SymWoodbury(J, w, 1.)
 
@@ -167,46 +169,20 @@ function nestod_sdc(z,s)
   # Matrix which satisfies the properties
   # W*z = inv(W)*sb
 
-  Ls  = chol(mat(s))'; 
-  Lz  = chol(mat(z))'; 
-  (U,Λ,V) = svd(Lz'*Ls)
-  R = inv(Lz)'*U*spdiagm(sqrt(Λ))
+  Ls  = cholesky(mat(s)).L
+  Lz  = cholesky(mat(z)).L
+  F   = svd(Lz'*Ls)
+  U   = F.U
+  Λ   = F.S
+  R = inv(Lz)'*U*spdiagm(0 => sqrt.(Λ))
   return VecCongurance(R)
 
 end
-
-# function nestod_sdc_sym(z,s)
-
-#   # Symmetric Nesterov-Todd Scaling Matrix for the Semidefinite
-#   # Cone.
-
-#   Z  = mat(z); S  = mat(s); Sq = S^(0.5)
-#   (U,S,V) = svd(Sq*Z*Sq)
-#   E = U*spdiagm(1./sqrt(abs(S)))*U'
-#   R = Sq'*(E)*Sq
-#   (U,S,V) = svd(R)
-#   R = U*spdiagm(sqrt(abs(S)))*U'
-#   return VecCongurance(R)
-
-#   # (Us,Ss,Vs) = svd(S)
-#   # (Uz,Sz,Vz) = svd(Z)
-
-#   # Ss = Us*spdiagm(Ss.^(0.125))*Vs'
-#   # Zz = Uz*spdiagm(Sz.^(-0.25))*Vz'
-#   # return VecCongurance(Ss*Zz*Ss)
-# #  return VecCongurance(S^(0.125)*Z^(-0.25)*S^(0.125))
-
-# end
 
 function maxstep_rp(x,d)
 
   # Assume x in R+.
   # Returns maximum α such that x + α*d in R+.
-
-  # assert(all(x .> 0));
-
-  #I = d .>= 0;
-  #if all(!I); return 1; end # all directions unbounded
 
   minVal = Inf
   for i = 1:length(x)
@@ -218,7 +194,7 @@ function maxstep_rp(x,d)
 
 end
 
-function maxstep_rp(x, e::Void)
+function maxstep_rp(x, e::Nothing)
 
   # Let α = inf { α | -x + αe >= 0 }
   # Then this returns
@@ -238,10 +214,6 @@ function maxstep_soc(x,d)
   # Assume x in Q.
   # Returns maximum α such that x - α*d in Q.
 
-  # assert((norm(x[2:end]) <= x[1]))
-
-  # J = -speye(size(x,1)); J[1,1] = 1; # Hyperbolic Identiy
-
   d = -d;
   γ = Q(x,x)
   xbar = x/sqrt(γ)
@@ -259,7 +231,7 @@ function maxstep_soc(x,d)
 
 end
 
-function maxstep_soc(x, e::Void)
+function maxstep_soc(x, e::Nothing)
 
   # Maximum step to cone
   α = norm(x[2:end]) - x[1];
@@ -270,25 +242,31 @@ end
 function maxstep_sdc(x,d)
 
   # Maximum step to Semidefinite cone
-  X     = mat(x)^(-1/2);
+  X     = mat(x)
+  # If X is not positive definite, return Inf
+  λX    = eigvals(Symmetric(X))
+  if any(λX .<= 0)
+    return Inf
+  end
+  Xih   = X^(-1/2)
   D     = mat(d)
-  XDX   = X*D*X
+  XDX   = Xih*D*Xih
   XDX   = 0.5*(XDX + XDX')
-  (Λ,_) = eig(XDX)
+  Λ     = eigvals(XDX)
   Λn    = Λ .< 0
   if all(Λn)
     return Inf
   else
-    return 1/maximum(Λ[!Λn])
+    return 1/maximum(Λ[.!Λn])
   end
 
 end
 
-function maxstep_sdc(x,d::Void)
+function maxstep_sdc(x,d::Nothing)
 
   # Maximum step to Semidefinite cone
   X = mat(x)
-  (Λ,_) = eig(X)
+  Λ = eigvals(X)
   minΛ  = minimum(Λ)
   return all(minΛ .> 0) ? 0 : -1 + minΛ
 
@@ -314,14 +292,14 @@ function dsoc!(y,x, o)
   #     │ -yb   (αI + yb*yb')/y1  │ │ xb │
   #     └                         ┘ └    ┘
 
-  @inbounds y1 = x[1]; 
+  @inbounds y1 = x[1];
   @inbounds yb = view(x,2:length(x))
-  α = y1^2 - vecdot(yb,yb)
+  α = y1^2 - dot(yb,yb)
 
-  @inbounds x1 = y[1]; 
+  @inbounds x1 = y[1];
   @inbounds xb = view(y,2:length(x))
-  o[1] = (y1*x1 - vecdot(yb,xb) )/α  
-  β1 = ((-x1/α) + vecdot(yb,xb)/(y1*α))
+  o[1] = (y1*x1 - dot(yb,xb) )/α
+  β1 = ((-x1/α) + dot(yb,xb)/(y1*α))
   β2 = 1/y1
   @inbounds @simd for i = 2:length(o)
     o[i] = yb[i-1]*β1 + xb[i-1]*β2
@@ -355,7 +333,7 @@ end
 #  Interior Point
 # ──────────────────────────────────────────────────────────────
 
-type Solution
+mutable struct Solution
 
   y      :: Matrix  # primal
   w      :: Matrix  # dual (linear equality)
@@ -372,14 +350,14 @@ type Solution
 end
 
 """
-  conicIP(Q, c, A, b, cone_dims, G, d; 
+  conicIP(Q, c, A, b, cone_dims, G, d;
   solve3x3gen = solve3x3gen_sparse,
-  optTol = 1e-5,           
-  DTB = 0.01,             
-  verbose = true,         
-  maxRefinementSteps = 3, 
-  maxIters = 100,         
-  cache_nestodd = false,  
+  optTol = 1e-5,
+  DTB = 0.01,
+  verbose = true,
+  maxRefinementSteps = 3,
+  maxIters = 100,
+  cache_nestodd = false,
   refinementThreshold = optTol/1e7)
 
 Interior point solver for the system
@@ -403,22 +381,22 @@ e.g. [("R",2),("Q",4)] means
 SDP Cones are NOT supported and purely experimental at this
 point.
 
-The parameter solve3x3gen allows the passing of a custom solver 
+The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
 
 ```
 julia> L = solve3x3gen(F,F⁻ᵀ,Q,A,G)
 
-Then this 
+Then this
 
 julia> (a,b,c) = L(y,w,v)
 
 solves the system
 ┌             ┐ ┌   ┐   ┌   ┐
 │ Q   G'  -A' │ │ a │ = │ y │
-│ G           │ │ b │   │ w │ 
+│ G           │ │ b │   │ w │
 │ A       FᵀF │ │ c │   │ v │
-└             ┘ └   ┘   └   ┘  
+└             ┘ └   ┘   └   ┘
 ```
 
 We can also wrap a 2x2 solver using pivot3gen(solve2x2gen)
@@ -427,9 +405,9 @@ The 2x2 solves the system
 ```
 julia> L = solve2x2gen(F,F⁻ᵀ,Q,A,G)
 
-Then this 
+Then this
 
-julia> (a,b) = L(y,w) 
+julia> (a,b) = L(y,w)
 
 solves the system
 
@@ -456,13 +434,13 @@ function conicIP(
   # L(a,b,c) solves the system
   # ┌             ┐ ┌   ┐   ┌   ┐
   # │ Q   G'  -A' │ │ a │ = │ y │
-  # │ G           │ │ b │   │ w │ 
+  # │ G           │ │ b │   │ w │
   # │ A       FᵀF │ │ c │   │ v │
-  # └             ┘ └   ┘   └   ┘  
+  # └             ┘ └   ┘   └   ┘
   #
   # We can also wrap a 2x2 solver using pivot3gen(solve2x2gen)
   # The 2x2 solves the system
-  # 
+  #
   # L = solve2x2gen(F,F⁻ᵀ,Q,A,G)
   # L(a,b) solves
   # ┌                ┐ ┌   ┐   ┌   ┐
@@ -478,11 +456,11 @@ function conicIP(
   maxIters = 100,          # Maximum number of interior iterations
   cache_nestodd = false,   # Set to true if there are many small blocks
   infeasTol = optTol,      # Infeasibility threshold (this shouldn't need to be tweaked,
-                           # but set it small if the program returns infeasible/unbounded when 
+                           # but set it small if the program returns infeasible/unbounded when
                            # you are sure it isn't)
   refinementThreshold = optTol/1e7 # Accuracy of refinement steps
   )
-  
+
   # Precomputed transposition matrices
   Aᵀ = A'; Gᵀ = G'
 
@@ -496,13 +474,12 @@ function conicIP(
                      [i for i in 1:length(block_types)])
 
   normc = norm(c)
-  normd = isempty(d) ? -Inf: norm(d)
-  normb = isempty(b) ? -Inf: norm(b)
+  normd = isempty(d) ? -Inf : norm(d)
+  normb = isempty(b) ? -Inf : norm(b)
 
   # Sanity Checks
   ◂ = nothing
-  #!(m == 0 && length(block_sizes) == 0) || m != sum(block_sizes) ? error("Inconsistency in inequalities") : ◂
-  size(Q,1) != size(Q,2)? error("Q is not square") : ◂
+  size(Q,1) != size(Q,2) ? error("Q is not square") : ◂
   size(b,1) != m        ? error("Inconsistency in inequalities") : ◂
   size(c,1) != n        ? error("Inconsistency in inequalities/objective") : ◂
   size(d,1) != p        ? error("Inconsistency in equalities") : ◂
@@ -528,7 +505,7 @@ function conicIP(
     m_i = length(I)
     if btype == "R"; e[I] = ones(m_i,1);             end
     if btype == "Q"; e[I] = [1; zeros(m_i-1,1)];     end
-    if btype == "S"; e[I] = vecm(eye(ord(I)));       end
+    if btype == "S"; e[I] = vecm(Matrix{Float64}(LinearAlgebra.I, ord(I), ord(I)));  end
   end
 
   # ──────────────────────────────────────────────────────────────
@@ -562,7 +539,7 @@ function conicIP(
 
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I);
-      if btype == "R"; B[i] = Diag(sqrt(yI./xI)); end
+      if btype == "R"; B[i] = Diagonal(sqrt.(yI./xI)); end
       if btype == "Q"; B[i] = nestod_soc(xI, yI); end
       if btype == "S"; B[i] = nestod_sdc(xI, yI); end
     end
@@ -619,8 +596,8 @@ function conicIP(
     solve3x3 = solve3x3gen(F, F⁻ᵀ)
 
     function solve4x4(r)
-      
-      t1 = F'*(r.s ÷ λ) 
+
+      t1 = F'*(r.s ÷ λ)
       (Δy, Δw, Δv)  = solve3x3(r.y, r.w, r.v + t1)
       axpy!(-1, F'*(F*Δv), t1) # > Δs = t1 - F*(F*Δv)
       return v4x1(Δy,Δw,Δv,t1)
@@ -637,7 +614,7 @@ function conicIP(
   #  Initial Point
   # ────────────────────────────────────────────────────────────
 
-  I  = Block([Diag(ones(i)) for i = block_sizes])
+  I  = Block([Diagonal(ones(i)) for i = block_sizes])
   r0 = v4x1(c, d, b, zeros(m,1))
   z  = solve4x4gen(e,I,I)(r0)
 
@@ -687,27 +664,27 @@ function conicIP(
     r0 = v4x1(rleft.y - c, rleft.w - d, rleft.v - b, rleft.s);
 
     # Gap
-    μbar = vecdot(z.v,z.s)
+    μbar = dot(z.v,z.s)
     μ    = μbar/conedim
 
     # ────────────────────────────────────────────────────────────
     #  Print iterate status, save best iterate
     # ────────────────────────────────────────────────────────────
 
-    cᵀy = vecdot(c,z.y)
+    cᵀy = dot(c,z.y)
     rDu = norm(r0.y)/(1+norm(c))
     rPr = normsafe(r0.v)/(1+normsafe(b))
     rCp = normsafe(r0.s)/(1+abs(cᵀy));
 
     if max(rDu, rPr, rCp) < optBest
       sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v
-      sol.Iter = Iter; sol.Mu = μ; 
+      sol.Iter = Iter; sol.Mu = μ;
       sol.duFeas = rDu; sol.prFeas = rPr; sol.muFeas = rCp
       optBest = max(rDu, rPr, rCp)
     end
 
-    pobj = 0.5*vecdot(z.y, Q*z.y) - vecdot(c, z.y)
-    dobj = pobj + vecdot(z.w, r0.w) + vecdot(z.v, r0.v) - vecdot(z.v, z.s)  
+    pobj = 0.5*dot(z.y, Q*z.y) - dot(c, z.y)
+    dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
 
     sol.pobj = pobj
     sol.dobj = dobj
@@ -716,7 +693,7 @@ function conicIP(
     # Convergence Checks (on previous iterate)
     # ────────────────────────────────────────────────────────────
 
-    # Optimality 
+    # Optimality
     if max(rDu, rPr, rCp) < optTol
       sol.status = :Optimal
     end
@@ -724,22 +701,22 @@ function conicIP(
     if !(p == 0 && m == 0)
 
       # Primal Infeasibility
-      # 
+      #
       # Certificate: ∃w,v such that
       #   Gᵀw + Aᵀv = 0
       #   bᵀv + dᵀw < 0
-      #   w ≧ 0 
+      #   w ≧ 0
       #
-      # The program returns a certificate w,v that satisfies 
-      # 
+      # The program returns a certificate w,v that satisfies
+      #
       #  CVXOPT style         ECOS Style
-      #  -------------------------------------------   
-      #   Gᵀw + Aᵀv = 0        Gᵀw + Aᵀv = 0  
+      #  -------------------------------------------
+      #   Gᵀw + Aᵀv = 0        Gᵀw + Aᵀv = 0
       #   bᵀv + dᵀw = -1       bᵀv + dᵀw < 0
-      #   w ≧ 0                w ≧ 0        
+      #   w ≧ 0                w ≧ 0
       #                        norm(v) + norm(w) = 1
-      #                       
-      dᵀy_bᵀv  = vecdot(d,z.w) - vecdot(b,z.v)
+      #
+      dᵀy_bᵀv  = dot(d,z.w) - dot(b,z.v)
 
       p_infeas_unscaled = norm(Gᵀ*z.w - Aᵀ*z.v)
       p_infeas_cvx = dᵀy_bᵀv < 0 ? p_infeas_unscaled/(normsafe(z.y) + normsafe(z.v)) : NaN
@@ -749,7 +726,7 @@ function conicIP(
       if p_infeas < infeasTol
         sol.y[:] = 0*sol.y[:]/0; sol.w[:] = z.w/-dᵀy_bᵀv; sol.v[:] = z.v/-dᵀy_bᵀv;
         sol.status = :Infeasible
-      end 
+      end
 
       # Dual Infeasiblity
       #
@@ -759,10 +736,10 @@ function conicIP(
       #   Qy = 0       (d_infeas3)
       #   cᵀy > 0
       #   s ≧ 0
-      # 
-      # The program returns a certificate y that satisfies 
       #
-      #  CVXOPT style    ECOS style 
+      # The program returns a certificate y that satisfies
+      #
+      #  CVXOPT style    ECOS style
       #  ------------------------------
       #   Ay ≧ 0          Ay ≧ 0
       #   Gy = 0          Gy = 0
@@ -772,9 +749,9 @@ function conicIP(
       #
       d_infeas1 = isempty(A) ? -Inf : norm(A*z.y - z.s)
       d_infeas2 = isempty(G) ? -Inf : norm(G*z.y)
-      d_infeas3 = all(isfinite(z.y)) ? norm(Q*z.y) : NaN
+      d_infeas3 = all(isfinite.(z.y)) ? norm(Q*z.y) : NaN
 
-      d_infeas_cvx = cᵀy > 0 ? max(d_infeas1/max(1,normb), d_infeas2/max(1,normd), d_infeas3/max(1,normc))/abs(cᵀy) : NaN        
+      d_infeas_cvx = cᵀy > 0 ? max(d_infeas1/max(1,normb), d_infeas2/max(1,normd), d_infeas3/max(1,normc))/abs(cᵀy) : NaN
       d_infeas_ecos = cᵀy > 0 ? max(d_infeas1, d_infeas2, d_infeas3)/norm(z.y) : NaN
       d_infeas = abs(max(d_infeas_cvx, d_infeas_ecos))
 
@@ -790,18 +767,18 @@ function conicIP(
       ξ2()=@printf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %i\n",
                   Iter, rDu, rPr, rCp, pobj, dobj, p_infeas, d_infeas, rStep);ξ2()
       if rnorm > 0.001; print("\x1b[0m"); end
-    end  
+    end
 
     if verbose
       if sol.status == :Infeasible; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
       if sol.status == :Unbounded;  print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
-      if sol.status == :Optimal;    print("\n > EXIT -- Below Tolerance!\n\n"); end        
+      if sol.status == :Optimal;    print("\n > EXIT -- Below Tolerance!\n\n"); end
     end
 
     if sol.status != :None; return sol; end
 
     # Cause of Divergence Unknown
-    if !all(isfinite([μ, rDu, rPr, rCp]))
+    if !all(isfinite.([μ, rDu, rPr, rCp]))
       if verbose; print("\n > EXIT -- Error!\n\n"); end
       sol.status = :Error; return sol
     end
@@ -846,9 +823,6 @@ function conicIP(
                     λ∘(F*Δz.v) + λ∘(F⁻ᵀ*Δz.s) )    # s
       rIr = r - rkkt
       rnorm = norm(rIr)/(n + 2*m)
-      # if rnorm > 0.1
-      #   verbose ? warn("4x4 solve failed, residual norm $(rnorm)") : ◂
-      # end
       if rnorm < refinementThreshold; break; end
       Δzr = solve(rIr)
       Δz  = Δz + Δzr
@@ -872,7 +846,7 @@ function conicIP(
 
 end
 
-include("wrapper.jl")
 include("preprocessor.jl")
+include("MOI_wrapper.jl")
 
 end
