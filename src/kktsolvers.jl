@@ -337,4 +337,13 @@ function pivotgen(kktsolver_2x2,Q,A,G,cone_dims)
 
 end
 
+"""
+    pivot(kktsolver_2x2)
+
+Wrap a 2-by-2 KKT solver into a 3-by-3 solver by pivoting on the
+third component. The inner solver handles the Schur complement system;
+`pivot` reconstructs the full solution.
+
+See also [`conicIP`](@ref) for the KKT solver interface specification.
+"""
 pivot(kktsolver_2x2) = (Q,A,G,cone_dims) -> pivotgen(kktsolver_2x2,Q,A,G,cone_dims)

@@ -10,6 +10,11 @@ using SparseArrays
 using WoodburyMatrices
 using Printf
 
+"""
+    Id(n)
+
+Create an `n`-by-`n` identity matrix as `Diagonal(ones(n))`.
+"""
 Id(n::Integer) = Diagonal(ones(n))
 
 include("blockmatrices.jl")
@@ -43,6 +48,14 @@ end
 #  matrix in vectorized form
 # ──────────────────────────────────────────────────────────────
 
+"""
+    VecCongurance(R)
+
+Linear operator representing a congruence transform in vectorized form.
+The action `W * x` computes `vecm(R' * mat(x) * R)`.
+
+Used internally as the Nesterov-Todd scaling matrix for semidefinite cones.
+"""
 mutable struct VecCongurance; R :: Matrix; end
 
 *(W::VecCongurance, x::VectorTypes)    = vecm(W.R'*mat(x)*W.R)
@@ -67,6 +80,12 @@ end
 
 ord(x) = begin; n = length(x); round(Int, (sqrt(1+8*n) - 1)/2); end
 
+"""
+    mat(x)
+
+Convert a vectorized symmetric matrix (scaled lower-triangular form) back
+to a full symmetric matrix. Inverse of [`vecm`](@ref).
+"""
 function mat(x)
 
   # inverse of vecm
@@ -95,6 +114,13 @@ function mat(x)
 
 end
 
+"""
+    vecm(Z)
+
+Vectorize a symmetric matrix `Z` into scaled lower-triangular form.
+Off-diagonal entries are scaled by `√2` so that
+`dot(vecm(X), vecm(Y)) == tr(X*Y)`. Inverse of [`mat`](@ref).
+"""
 function vecm(Z)
 
   # inverse of mat
@@ -333,6 +359,24 @@ end
 #  Interior Point
 # ──────────────────────────────────────────────────────────────
 
+"""
+    Solution
+
+Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
+
+# Fields
+- `y::Matrix` -- primal variables
+- `w::Matrix` -- dual variables for equality constraints (Gy = d)
+- `v::Matrix` -- dual variables for inequality constraints (Ay ≥_K b)
+- `status::Symbol` -- `:Optimal`, `:Infeasible`, `:Unbounded`, `:Abandoned`, or `:Error`
+- `Iter::Integer` -- number of interior-point iterations
+- `Mu::Real` -- final complementarity gap parameter
+- `prFeas::Real` -- primal feasibility residual
+- `duFeas::Real` -- dual feasibility residual
+- `muFeas::Real` -- complementarity residual
+- `pobj::Real` -- primal objective value
+- `dobj::Real` -- dual objective value
+"""
 mutable struct Solution
 
   y      :: Matrix  # primal

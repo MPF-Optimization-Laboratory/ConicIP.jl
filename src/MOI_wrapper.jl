@@ -1,5 +1,21 @@
 import MathOptInterface as MOI
 
+"""
+    Optimizer(; verbose=false, optTol=1e-6, maxIters=100)
+
+MathOptInterface optimizer wrapping the ConicIP interior-point solver.
+Use as a JuMP solver via `Model(ConicIP.Optimizer)`.
+
+# Keyword Arguments
+- `verbose::Bool` -- print solver iterations (default: `false`)
+- `optTol::Float64` -- optimality tolerance (default: `1e-6`)
+- `maxIters::Int` -- maximum iterations (default: `100`)
+
+# Supported Constraints
+- **Vector:** `Zeros`, `Nonnegatives`, `Nonpositives`, `SecondOrderCone`,
+  `PositiveSemidefiniteConeTriangle`
+- **Scalar:** `EqualTo`, `GreaterThan`, `LessThan`
+"""
 mutable struct Optimizer <: MOI.AbstractOptimizer
     sol::Union{Nothing, Solution}
     max_sense::Bool

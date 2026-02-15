@@ -7,6 +7,24 @@ import Base: +, *, -, \, ^, getindex, setindex!, show, print
 export Block, size, block_idx, broadcastf,
     copy, getindex, setindex!, +, -, *, \, inv, square;
 
+"""
+    Block(size::Int)
+    Block(Blk::Vector)
+
+Block diagonal matrix type. Each diagonal block can be a different
+matrix type (`Diagonal`, `SymWoodbury`, `VecCongurance`, or dense `Matrix`).
+
+Used internally to represent the Nesterov-Todd scaling matrix, where
+each block corresponds to a cone in the cone specification.
+
+Supports arithmetic (`*`, `+`, `-`, `inv`, `adjoint`, `^`),
+conversion to `sparse` and `Matrix`, and block-wise function
+application via [`broadcastf`](@ref).
+
+# Indexing
+- `B[i]` returns the `i`-th diagonal block
+- `B[i] = M` sets the `i`-th diagonal block
+"""
 mutable struct Block <: AbstractMatrix{Real}
 
   Blocks::Vector{Any}
@@ -27,6 +45,12 @@ Base.size(A::Block, i::Integer)    = (i == 1 || i == 2) ? size(A)[1] : 1
 getindex(A::Block, i::Integer)     = A.Blocks[i]
 setindex!(A::Block, B, i::Integer) = begin; A.Blocks[i] = B; end
 
+"""
+    block_idx(A::Block)
+
+Return a vector of `UnitRange{Int}` giving the row/column index ranges
+for each diagonal block of `A`.
+"""
 function block_idx(A::Block)
 
   k = size(A.Blocks,1)
@@ -44,6 +68,14 @@ function block_idx(A::Block)
 end
 
 
+"""
+    broadcastf(op, A::Block)
+    broadcastf(op, A::Block, B::Block)
+    broadcastf(op, A::Block, x::Union{Vector,Matrix})
+
+Apply function `op` block-wise to the diagonal blocks of `A`
+(and optionally `B` or the corresponding segments of `x`).
+"""
 function broadcastf(op::Function, A::Block)
 
   B = copy(A)
