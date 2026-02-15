@@ -1,34 +1,116 @@
 # ConicIP.jl
 
-A pure-Julia conic interior-point solver for optimization problems with linear, second-order cone, and semidefinite constraints.
+**ConicIP.jl** is a pure-Julia conic interior-point solver for optimization
+problems with linear, second-order cone, and (experimental) semidefinite
+constraints.
 
-## Features
+## Why ConicIP?
 
-- **Pure Julia** — no external solver dependencies
-- **LP / QP / SOCP / SDP** — supports linear, quadratic, second-order cone, and semidefinite programming
-- **JuMP integration** — use via the MathOptInterface wrapper
-- **Custom KKT solvers** — plug in your own factorization callbacks
+- **Pure Julia** — no binary dependencies or external solver installations
+- **Custom KKT solver callbacks** — exploit problem structure for speed
+- **Extensible** — plug in your own factorization at each interior-point iteration
+- **Nesterov-Todd scaling** — symmetric primal-dual scaling for good numerical behavior
+- **Infeasibility detection** — returns certificates for infeasible/unbounded problems
+
+## Problem Formulation
+
+ConicIP solves problems of the form:
+
+```
+minimize    ½ yᵀQy - cᵀy
+subject to  Ay ≥_K b
+            Gy  = d
+```
+
+where `Q ≽ 0` and `K` is a Cartesian product of cones:
+
+| Cone | Spec | Description |
+|------|------|-------------|
+| Nonnegative orthant | `("R", n)` | Linear inequalities |
+| Second-order cone | `("Q", n)` | Norm constraints |
+| Semidefinite (experimental) | `("S", k)` | Matrix positivity |
 
 ## Quick Example
 
 ```@example quickstart
-using ConicIP
-using Random
-using SparseArrays
-using LinearAlgebra: I
+using ConicIP, SparseArrays, LinearAlgebra, Random
 Random.seed!(42)
 
+# Box-constrained QP: minimize ½ y'Qy - c'y subject to 0 ≤ y ≤ 1
 n = 5
-Q = sparse(Matrix(1.0I, n, n))
-c = randn(n, 1)
-A = sparse(Matrix(1.0I, n, n))
-b = zeros(n, 1)
-cone_dims = [("R", n)]
+Q = sparse(Diagonal(rand(n) .+ 0.1))
+c = randn(n, 1)   # ← must be n×1 Matrix, not a Vector
+
+# Constraints: [I; -I] y ≥ [0; -1]
+A = sparse([I(n); -I(n)])
+b = [zeros(n, 1); -ones(n, 1)]
+cone_dims = [("R", 2n)]
 
 sol = conicIP(Q, c, A, b, cone_dims; verbose=false)
 sol.status
 ```
 
-## Next Steps
+```@example quickstart
+round.(sol.y, digits=4)
+```
 
-- API reference and tutorials coming soon.
+## Two Ways to Use ConicIP
+
+**Direct API** — full control, supports quadratic objectives:
+
+```julia
+sol = conicIP(Q, c, A, b, cone_dims; verbose=false)
+```
+
+**JuMP/MOI** — algebraic modeling, linear objectives only:
+
+```julia
+using JuMP, ConicIP
+model = Model(ConicIP.Optimizer)
+@variable(model, x[1:n] >= 0)
+@objective(model, Min, sum(x))
+optimize!(model)
+```
+
+See the [JuMP Integration](@ref) guide for details.
+
+!!! note "Column matrix convention"
+    ConicIP expects `c`, `b`, and `d` to be **n × 1 matrices** (two-dimensional),
+    not Julia `Vector`s. Use `reshape(v, :, 1)` to convert a vector.
+
+## Choosing a Solver
+
+ConicIP is a good fit when you need:
+
+- A **pure-Julia** solver with no binary dependencies
+- **Custom KKT solver callbacks** to exploit problem structure
+- A solver for **moderate-size** LP/QP/SOCP problems
+
+For large-scale production use, consider:
+
+| Solver | Pure Julia | QP | SOCP | SDP | Custom KKT |
+|--------|-----------|-----|------|-----|------------|
+| **ConicIP** | ✓ | ✓ | ✓ | experimental | ✓ |
+| [COSMO.jl](https://github.com/oxfordcontrol/COSMO.jl) | ✓ | ✓ | ✓ | ✓ | ✗ |
+| [Hypatia.jl](https://github.com/chriscoey/Hypatia.jl) | ✓ | ✓ | ✓ | ✓ | ✗ |
+| [SCS](https://github.com/jump-dev/SCS.jl) | ✗ (C) | ✗ | ✓ | ✓ | ✗ |
+| [ECOS](https://github.com/jump-dev/ECOS.jl) | ✗ (C) | ✗ | ✓ | ✗ | ✗ |
+
+## Contents
+
+```@contents
+Pages = [
+    "installation.md",
+    "tutorials/generated/getting_started.md",
+    "tutorials/generated/lp.md",
+    "tutorials/generated/qp.md",
+    "tutorials/generated/socp.md",
+    "tutorials/generated/sdp.md",
+    "guides/jump.md",
+    "guides/kkt_solvers.md",
+    "guides/preprocessing.md",
+    "background.md",
+    "api.md",
+]
+Depth = 2
+```
