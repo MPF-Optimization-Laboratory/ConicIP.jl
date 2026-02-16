@@ -5,27 +5,27 @@ subject to   Ay ≥ b
 
 n = 5
 Q = sparse(1.0I, n, n)
-p = reshape(collect(1.0:n), :, 1)
+p = collect(1.0:n)
 
 # Nonnegativity constraints: y ≥ 0
 A = sparse(1.0I, n, n)
-b = zeros(n, 1)
+b = zeros(n)
 cone_dims = [(&quot;R&quot;, n)]
 
 # Simplex constraint: sum(y) = 1
 G = ones(1, n)
-d = ones(1, 1)
+d = [1.0]
 
 # Note: we pass Q*p as the linear term c = Qp = Ip = p
 sol = conicIP(Q, Q * p, A, b, cone_dims, G, d;
               verbose=false, optTol=1e-7)
-sol.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">5×1 Matrix{Float64}:
+sol.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">5-element Vector{Float64}:
  0.0
  0.0
  0.0
  0.0005
  0.9995</code></pre><p>The solution concentrates weight on the largest components of <code>p</code>, as expected for the nearest point on the simplex.</p><h2 id="Convergence-Diagnostics"><a class="docs-heading-anchor" href="#Convergence-Diagnostics">Convergence Diagnostics</a><a id="Convergence-Diagnostics-1"></a><a class="docs-heading-anchor-permalink" href="#Convergence-Diagnostics" title="Permalink"></a></h2><p>The <a href="../../../api/#ConicIP.Solution"><code>Solution</code></a> struct reports convergence diagnostics:</p><ul><li><code>prFeas</code> – primal feasibility residual</li><li><code>duFeas</code> – dual feasibility (KKT stationarity) residual</li><li><code>muFeas</code> – complementarity residual</li><li><code>pobj</code>, <code>dobj</code> – primal and dual objective values</li></ul><pre><code class="language-julia hljs">(prFeas=sol.prFeas, duFeas=sol.duFeas, muFeas=sol.muFeas,
- pobj=round(sol.pobj, digits=6), dobj=round(sol.dobj, digits=6))</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">(prFeas = 0.0, duFeas = 1.49244812711217e-16, muFeas = 9.532282634397204e-8, pobj = -4.5, dobj = -4.5)</code></pre><p>At optimality, <code>pobj ≈ dobj</code> and all residuals are below <code>optTol</code>.</p><h2 id="Example:-Portfolio-Optimization"><a class="docs-heading-anchor" href="#Example:-Portfolio-Optimization">Example: Portfolio Optimization</a><a id="Example:-Portfolio-Optimization-1"></a><a class="docs-heading-anchor-permalink" href="#Example:-Portfolio-Optimization" title="Permalink"></a></h2><p>A classic application of QP is mean-variance portfolio optimization. Given expected returns <code>μ</code> and a covariance matrix <code>Σ</code>, find the minimum-variance portfolio with expected return at least <code>r_min</code>:</p><pre><code class="nohighlight hljs">minimize    ½ yᵀΣy
+ pobj=round(sol.pobj, digits=6), dobj=round(sol.dobj, digits=6))</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">(prFeas = 0.0, duFeas = 1.49244812711217e-16, muFeas = 9.532282634397393e-8, pobj = -4.5, dobj = -4.5)</code></pre><p>At optimality, <code>pobj ≈ dobj</code> and all residuals are below <code>optTol</code>.</p><h2 id="Example:-Portfolio-Optimization"><a class="docs-heading-anchor" href="#Example:-Portfolio-Optimization">Example: Portfolio Optimization</a><a id="Example:-Portfolio-Optimization-1"></a><a class="docs-heading-anchor-permalink" href="#Example:-Portfolio-Optimization" title="Permalink"></a></h2><p>A classic application of QP is mean-variance portfolio optimization. Given expected returns <code>μ</code> and a covariance matrix <code>Σ</code>, find the minimum-variance portfolio with expected return at least <code>r_min</code>:</p><pre><code class="nohighlight hljs">minimize    ½ yᵀΣy
 subject to  μᵀy ≥ r_min
             1ᵀy = 1
             y ≥ 0</code></pre><pre><code class="language-julia hljs">using Random
@@ -42,20 +42,20 @@ r_min = 0.05  # target minimum return
 
 # Q = Sigma, c = 0 (pure quadratic objective)
 Q_port = Sigma
-c_port = zeros(nassets, 1)
+c_port = zeros(nassets)
 
 # Inequality constraints: [μᵀ; I] y ≥ [r_min; 0]
 A_port = sparse([returns&#39;; I(nassets)])
-b_port = [reshape([r_min], 1, 1); zeros(nassets, 1)]
+b_port = [r_min; zeros(nassets)]
 cone_dims_port = [(&quot;R&quot;, 1 + nassets)]
 
 # Equality constraint: sum(y) = 1
 G_port = ones(1, nassets)
-d_port = ones(1, 1)
+d_port = [1.0]
 
 sol_port = conicIP(Q_port, c_port, A_port, b_port, cone_dims_port,
                    G_port, d_port; verbose=false, optTol=1e-7)
-sol_port.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">weights = round.(sol_port.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">8×1 Matrix{Float64}:
+sol_port.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">weights = round.(sol_port.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">8-element Vector{Float64}:
  0.0
  0.0472
  0.0
@@ -65,4 +65,4 @@ sol_port.status</code></pre><pre class="documenter-example-output"><code class="
  0.1701
  0.3371</code></pre><p>Portfolio expected return and variance:</p><pre><code class="language-julia hljs">port_return = round(dot(returns, sol_port.y), digits=6)
 port_variance = round((sol_port.y&#39; * Sigma * sol_port.y)[1], digits=6)
-(expected_return=port_return, variance=port_variance)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">(expected_return = 0.05, variance = 0.00146)</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../lp/">« Linear Programs</a><a class="docs-footer-nextpage" href="../socp/">Second-Order Cone »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Monday 16 February 2026 03:54">Monday 16 February 2026</span>. Using Julia version 1.12.5.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+(expected_return=port_return, variance=port_variance)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">(expected_return = 0.05, variance = 0.00146)</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../lp/">« Linear Programs</a><a class="docs-footer-nextpage" href="../socp/">Second-Order Cone »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Monday 16 February 2026 05:18">Monday 16 February 2026</span>. Using Julia version 1.12.5.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>

@@ -3,21 +3,21 @@
 
 n = 3
 Q = sparse(1.0I, n, n)
-a = ones(n, 1)  # point to project
+a = ones(n)  # point to project
 
 # SOC constraint: (t, y) ∈ Q with t = 1
 # Encode as: [0ᵀ; I] y - [-1; 0] ∈ Q
 # i.e., the SOC vector is (1, y₁, y₂, y₃) and we need ‖y‖ ≤ 1
 A = [spzeros(1, n); sparse(1.0I, n, n)]
-b = [-ones(1, 1); zeros(n, 1)]
+b = [-1.0; zeros(n)]
 cone_dims = [(&quot;Q&quot;, n + 1)]
 
 sol = conicIP(Q, Q * a, A, b, cone_dims;
               verbose=false, optTol=1e-7)
-sol.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">3×1 Matrix{Float64}:
+sol.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">3-element Vector{Float64}:
  0.5774
  0.5774
- 0.5774</code></pre><p>Compare to the expected answer <code>a / ‖a‖</code>:</p><pre><code class="language-julia hljs">round.(a ./ norm(a), digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">3×1 Matrix{Float64}:
+ 0.5774</code></pre><p>Compare to the expected answer <code>a / ‖a‖</code>:</p><pre><code class="language-julia hljs">round.(a ./ norm(a), digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">3-element Vector{Float64}:
  0.5774
  0.5774
  0.5774</code></pre><h2 id="Example:-Mixed-Cones-(Nonnegative-SOC)"><a class="docs-heading-anchor" href="#Example:-Mixed-Cones-(Nonnegative-SOC)">Example: Mixed Cones (Nonnegative + SOC)</a><a id="Example:-Mixed-Cones-(Nonnegative-SOC)-1"></a><a class="docs-heading-anchor-permalink" href="#Example:-Mixed-Cones-(Nonnegative-SOC)" title="Permalink"></a></h2><p>Combine nonnegative (<code>&quot;R&quot;</code>) and second-order cone (<code>&quot;Q&quot;</code>) constraints. Here we minimize a linear objective subject to both <code>y ≥ 0</code> and <code>‖y‖ ≤ 1</code>:</p><pre><code class="language-julia hljs">using Random
@@ -25,20 +25,20 @@ Random.seed!(42)
 
 n = 5
 Q = sparse(1.0I, n, n)
-c = randn(n, 1)
+c = randn(n)
 
 # Stack constraints: first n rows are R+ (y ≥ 0),
 # next n+1 rows are SOC (‖y‖ ≤ 1)
 A = [sparse(1.0I, n, n);          # y ≥ 0
      spzeros(1, n);                # t placeholder for SOC bound
      sparse(1.0I, n, n)]           # y components in SOC
-b = [zeros(n, 1);                  # R+ bound
-     -ones(1, 1);                  # t ≥ 1
-     zeros(n, 1)]                  # SOC body
+b = [zeros(n);                     # R+ bound
+     -1.0;                         # t ≥ 1
+     zeros(n)]                     # SOC body
 cone_dims = [(&quot;R&quot;, n), (&quot;Q&quot;, n + 1)]
 
 sol2 = conicIP(Q, c, A, b, cone_dims; verbose=false)
-sol2.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol2.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">5×1 Matrix{Float64}:
+sol2.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol2.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">5-element Vector{Float64}:
  0.7884
  0.0
  0.0
@@ -56,7 +56,7 @@ nz = n_var + 2
 Qz = spzeros(nz, nz)
 
 # Objective: minimize t₁ + ρ t₂  →  c = -[0; 1; ρ] (ConicIP minimizes -c&#39;z)
-cz = zeros(nz, 1)
+cz = zeros(nz)
 cz[n_var+1] = 1.0
 cz[n_var+2] = ρ
 
@@ -65,14 +65,14 @@ cz[n_var+2] = ρ
 #   Rows for residual: [A₀  0  0] z ≥ b₀
 A_soc1_t = spzeros(1, nz); A_soc1_t[1, n_var+1] = 1.0
 A_soc1_r = [sparse(A0) spzeros(m, 2)]
-b_soc1 = [zeros(1, 1); reshape(b0, :, 1)]
+b_soc1 = [0.0; b0]
 
 # SOC 2: (t₂, y) ∈ Q^{n_var+1}
 #   Row for t₂: [0...0  0  1] z ≥ 0
 #   Rows for y: [I  0  0] z ≥ 0
 A_soc2_t = spzeros(1, nz); A_soc2_t[1, n_var+2] = 1.0
 A_soc2_y = [sparse(1.0I, n_var, n_var) spzeros(n_var, 2)]
-b_soc2 = zeros(1 + n_var, 1)
+b_soc2 = zeros(1 + n_var)
 
 A_all = [A_soc1_t; A_soc1_r; A_soc2_t; A_soc2_y]
 b_all = [b_soc1; b_soc2]
@@ -84,4 +84,4 @@ sol3.status</code></pre><pre class="documenter-example-output"><code class="nohi
   0.0
   0.0
   0.0
-  0.0</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../qp/">« Quadratic Programs</a><a class="docs-footer-nextpage" href="../sdp/">Semidefinite (Experimental) »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Monday 16 February 2026 03:54">Monday 16 February 2026</span>. Using Julia version 1.12.5.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+  0.0</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../qp/">« Quadratic Programs</a><a class="docs-footer-nextpage" href="../sdp/">Semidefinite (Experimental) »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Monday 16 February 2026 05:18">Monday 16 February 2026</span>. Using Julia version 1.12.5.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>

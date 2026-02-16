@@ -31,10 +31,10 @@ using ConicIP, SparseArrays, LinearAlgebra
 k = 21
 Q = sparse(1.0I, k, k)
 target = diagm(0 => [1.0, 1, 1, -1, -1, -1])
-c = reshape(ConicIP.vecm(target), :, 1)
+c = ConicIP.vecm(target)
 
 A = sparse(1.0I, k, k)
-b = zeros(k, 1)
+b = zeros(k)
 cone_dims = [("S", k)]
 
 sol = conicIP(Q, c, A, b, cone_dims; verbose=false, optTol=1e-7)
@@ -64,5 +64,5 @@ round.(v, digits=4)
 
 # Reconstruct the original matrix:
 
-X_recovered = ConicIP.mat(reshape(v, :, 1))
+X_recovered = ConicIP.mat(v)
 round.(X_recovered, digits=4)
