@@ -551,6 +551,8 @@ end
 
     end
 
+    include("sdp_tests.jl")
+
     @testset "SOC Cone (direct API)" begin
 
         Random.seed!(0)
