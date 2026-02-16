@@ -31,13 +31,13 @@ using ConicIP, SparseArrays, LinearAlgebra
 
 n = 3
 Q = sparse(1.0I, n, n)
-a = ones(n, 1)  # point to project
+a = ones(n)  # point to project
 
 ## SOC constraint: (t, y) ∈ Q with t = 1
 ## Encode as: [0ᵀ; I] y - [-1; 0] ∈ Q
 ## i.e., the SOC vector is (1, y₁, y₂, y₃) and we need ‖y‖ ≤ 1
 A = [spzeros(1, n); sparse(1.0I, n, n)]
-b = [-ones(1, 1); zeros(n, 1)]
+b = [-1.0; zeros(n)]
 cone_dims = [("Q", n + 1)]
 
 sol = conicIP(Q, Q * a, A, b, cone_dims;
@@ -62,16 +62,16 @@ Random.seed!(42)
 
 n = 5
 Q = sparse(1.0I, n, n)
-c = randn(n, 1)
+c = randn(n)
 
 ## Stack constraints: first n rows are R+ (y ≥ 0),
 ## next n+1 rows are SOC (‖y‖ ≤ 1)
 A = [sparse(1.0I, n, n);          # y ≥ 0
      spzeros(1, n);                # t placeholder for SOC bound
      sparse(1.0I, n, n)]           # y components in SOC
-b = [zeros(n, 1);                  # R+ bound
-     -ones(1, 1);                  # t ≥ 1
-     zeros(n, 1)]                  # SOC body
+b = [zeros(n);                     # R+ bound
+     -1.0;                         # t ≥ 1
+     zeros(n)]                     # SOC body
 cone_dims = [("R", n), ("Q", n + 1)]
 
 sol2 = conicIP(Q, c, A, b, cone_dims; verbose=false)
@@ -109,7 +109,7 @@ nz = n_var + 2
 Qz = spzeros(nz, nz)
 
 ## Objective: minimize t₁ + ρ t₂  →  c = -[0; 1; ρ] (ConicIP minimizes -c'z)
-cz = zeros(nz, 1)
+cz = zeros(nz)
 cz[n_var+1] = 1.0
 cz[n_var+2] = ρ
 
@@ -118,14 +118,14 @@ cz[n_var+2] = ρ
 ##   Rows for residual: [A₀  0  0] z ≥ b₀
 A_soc1_t = spzeros(1, nz); A_soc1_t[1, n_var+1] = 1.0
 A_soc1_r = [sparse(A0) spzeros(m, 2)]
-b_soc1 = [zeros(1, 1); reshape(b0, :, 1)]
+b_soc1 = [0.0; b0]
 
 ## SOC 2: (t₂, y) ∈ Q^{n_var+1}
 ##   Row for t₂: [0...0  0  1] z ≥ 0
 ##   Rows for y: [I  0  0] z ≥ 0
 A_soc2_t = spzeros(1, nz); A_soc2_t[1, n_var+2] = 1.0
 A_soc2_y = [sparse(1.0I, n_var, n_var) spzeros(n_var, 2)]
-b_soc2 = zeros(1 + n_var, 1)
+b_soc2 = zeros(1 + n_var)
 
 A_all = [A_soc1_t; A_soc1_r; A_soc2_t; A_soc2_y]
 b_all = [b_soc1; b_soc2]

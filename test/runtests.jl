@@ -70,9 +70,9 @@ end
         A = rand(3, 3)
         Z = ConicIP.VecCongurance(A)
 
-        @test Z * ones(6, 1) ≈ Matrix(Z) * ones(6, 1)
+        @test Z * ones(6) ≈ Matrix(Z) * ones(6)
         @test Matrix(Z' * Z) ≈ Matrix(Z)' * Matrix(Z)
-        @test inv(Z) * ones(6, 1) ≈ Matrix(Z) \ ones(6, 1)
+        @test inv(Z) * ones(6) ≈ Matrix(Z) \ ones(6)
         @test size(Z, 1) == 6
         @test sparse(Z) ≈ Matrix(Z)
 
@@ -93,10 +93,10 @@ end
 
         n = 1000
         H = 0.5 * Id(n)
-        c = reshape(collect(1.0:n), :, 1)
+        c = collect(1.0:n)
 
         A = [sparse(1.0I, n, n); -sparse(1.0I, n, n)]
-        b = -ones(2 * n, 1)
+        b = -ones(2 * n)
         ∇f = x -> H * (x - c)
 
         function kktsolver_2x2_box(Q, A, G, cone_dims)
@@ -104,7 +104,7 @@ end
                 v = inv(F[1] * F[1]).diag
                 D = Diagonal(v[1:n] + v[n+1:end])
                 invHD = inv(Diagonal(H.diag + D.diag))
-                return (rhs, rhs2) -> (invHD * rhs, zeros(0, 1))
+                return (rhs, rhs2) -> (invHD * rhs, zeros(0))
             end
             return solve2x2gen
         end
@@ -140,9 +140,9 @@ end
 
             n = 2
             H = Id(n)
-            a = ones(n, 1)
+            a = ones(n)
             A = [spzeros(1, n); sparse(1.0I, n, n)]
-            b = [-1; zeros(n, 1)]
+            b = [-1; zeros(n)]
 
             sol = conicIP(H, H * a, A, b, [("Q", n + 1)],
                           optTol = optTol,
@@ -171,15 +171,15 @@ end
 
             n = 10
             H = Id(n)
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = [sparse(1.0I, n, n);      # R
                  spzeros(1, n);            # Q
                  sparse(1.0I, n, n)]       #
 
-            b = [zeros(n, 1);
+            b = [zeros(n);
                  -1.0;
-                 zeros(n, 1)]
+                 zeros(n)]
 
             sol = conicIP(H, H * c, A, b, [("R", n), ("Q", n + 1)],
                           optTol = optTol,
@@ -211,13 +211,13 @@ end
 
             n = 10
             H = Matrix{Float64}(I, n, n)
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = ones(1, n)
-            d = ones(1, 1)
+            d = [1.0]
 
             sol = conicIP(H, H * c,
                           A, b, [("R", n)],
@@ -227,7 +227,7 @@ end
 
             ystar = sol.y
 
-            ysol = zeros(n, 1)
+            ysol = zeros(n)
             ysol[n] = 1
 
             @test norm(ystar - ysol) < tol
@@ -249,13 +249,13 @@ end
 
             n = 10
             H = Matrix{Float64}(I, n, n)
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = ones(1, n)
-            d = ones(1, 1)
+            d = [1.0]
 
             sol = conicIP(H, H * c,
                           A, b, [("R", n)],
@@ -275,13 +275,13 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = ones(1, n)
-            d = ones(1, 1)
+            d = [1.0]
 
             sol = ConicIP.conicIP(H, H * c,
                                   A, b, [("R", n)],
@@ -309,13 +309,13 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = rand(6, n)
-            d = zeros(6, 1)
+            d = zeros(6)
 
             ystar = conicIP(H, H * c,
                             A, b, [("R", n)],
@@ -332,13 +332,13 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = rand(6, n)
-            d = zeros(6, 1)
+            d = zeros(6)
 
             ystar1 = conicIP(H, H * c,
                              A, b, [("R", n)],
@@ -362,14 +362,14 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = rand(6, n)
             G = [G; G]
-            d = zeros(6, 1)
+            d = zeros(6)
             d = [d; d]
 
             ystar1 = preprocess_conicIP(H, H * c,
@@ -395,11 +395,11 @@ end
 
             n = 10
             Q = zeros(2 * n, 2 * n)
-            c = -ones(2 * n, 1)
+            c = -ones(2 * n)
 
             A = sparse(1.0I, n, n)
             A = [A A]
-            d = zeros(n, 1)
+            d = zeros(n)
 
             sol = preprocess_conicIP(Q, c,
                                      A, d, [("R", n)],
@@ -418,15 +418,15 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = zeros(1, n)
             G[1, 1] = 1
             G = [G; G]
-            d = reshape([1; -1], :, 1)
+            d = [1.0; -1.0]
 
             ystatus = preprocess_conicIP(H, H * c,
                                          A, b, [("R", n)],
@@ -445,10 +445,10 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = [sparse(1.0I, n, n); -sparse(1.0I, n, n)]
-            b = [ones(n, 1); ones(n, 1)]
+            b = [ones(n); ones(n)]
 
             sol = conicIP(H, H * c,
                           A, b, [("R", 2 * n)],
@@ -466,13 +466,13 @@ end
             n = 10
             H = randn(n)
             H = H * H'
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             G = [1 zeros(1, 9)]
-            d = -ones(1, 1)
+            d = [-1.0]
 
             sol = conicIP(H, H * c,
                           A, b, [("R", n)],
@@ -490,10 +490,10 @@ end
 
             n = 10
             H = zeros(n, n)
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n, n)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             sol = conicIP(H, c,
                           A, b, [("R", n)],
@@ -510,10 +510,10 @@ end
 
             n = 10
             H = zeros(n, n)
-            c = reshape(collect(1.0:n), :, 1)
+            c = collect(1.0:n)
 
             A = sparse(1.0I, n + 2, n + 2)
-            b = zeros(n, 1)
+            b = zeros(n)
 
             @test_throws Exception conicIP(H, c,
                                            A, b, [("R", n)],
@@ -530,10 +530,10 @@ end
 
         n = 21
         H = Matrix{Float64}(I, n, n)
-        c = reshape(ConicIP.vecm(diagm(0 => [1.0; 1; 1; -1; -1; -1])), :, 1)
+        c = ConicIP.vecm(diagm(0 => [1.0; 1; 1; -1; -1; -1]))
 
         A = sparse(1.0I, 21, 21)
-        b = zeros(21, 1)
+        b = zeros(21)
 
         sol = conicIP(H, c,
                       A, b, [("S", n)],
@@ -561,15 +561,15 @@ end
             # Solver minimizes (1/2)y'Qy - c'y, so c = -1 gives +1'x
             n = 4
             Q = sparse(1.0I, n, n)
-            c_obj = -ones(n, 1)
+            c_obj = -ones(n)
 
             # SOC constraint: [1; x₁; x₂; x₃] ∈ SOC → ||x[1:3]|| ≤ 1
             A_soc = [spzeros(1, n); sparse(1.0I, 3, n)[1:3, :]]
-            b_soc = [-1.0; zeros(3, 1)]
+            b_soc = [-1.0; zeros(3)]
 
             # NonNeg variable cone: x ≥ 0
             A_nn = sparse(1.0I, n, n)
-            b_nn = zeros(n, 1)
+            b_nn = zeros(n)
 
             A_full = sparse([A_soc; A_nn])
             b_full = [b_soc; b_nn]
@@ -655,21 +655,21 @@ end
 
         # Well-conditioned full-rank
         A = randn(5, 10)
-        b = randn(5, 1)
+        b = randn(5)
         R, consistent = ConicIP.imcols(A, b)
         @test length(R) == rank(A)
         @test consistent
 
         # Redundant rows
         A2 = [A; A[1:1, :] + A[2:2, :]]
-        b2 = [b; b[1:1, :] + b[2:2, :]]
+        b2 = [b; b[1:1] + b[2:2]]
         R2, consistent2 = ConicIP.imcols(A2, b2)
         @test length(R2) == rank(Matrix(A2))
         @test consistent2
 
         # Inconsistent system
         A3 = [A; A[1:1, :]]
-        b3 = [b; b[1:1, :] .+ 100]
+        b3 = [b; b[1:1] .+ 100]
         R3, consistent3 = ConicIP.imcols(A3, b3)
         @test !consistent3
     end

@@ -43,7 +43,7 @@ include("blockmatrices.jl")
 include("kktsolvers.jl")
 
 ViewTypes   = Union{SubArray}
-VectorTypes = Union{Matrix, Vector, ViewTypes}
+VectorTypes = Union{Vector, ViewTypes}
 MatrixTypes = Union{Matrix, Array{Real,2},
                     SparseMatrixCSC{Real,Integer}}
 
@@ -54,7 +54,7 @@ normsafe(x) = isempty(x) ? 0 : norm(x)
 #  3x1 block vector
 # ──────────────────────────────────────────────────────────────
 
-mutable struct v4x1; y::Matrix; w::Matrix; v::Matrix; s::Matrix; end
+mutable struct v4x1; y::Vector{Float64}; w::Vector{Float64}; v::Vector{Float64}; s::Vector{Float64}; end
 
 +(a::v4x1, b::v4x1) = v4x1(a.y + b.y, a.w + b.w, a.v + b.v, a.s + b.s)
 -(a::v4x1, b::v4x1) = v4x1(a.y - b.y, a.w - b.w, a.v - b.v, a.s - b.s)
@@ -132,7 +132,7 @@ function vecm(Z)
   # [1 2√2 3√2 4 5√2 6]
 
   n = size(Z,1)
-  x = zeros(round(Int, n*(n+1)/2),1)
+  x = zeros(round(Int, n*(n+1)/2))
   c = 1
   for i = 1:n
     for j = 1:n
@@ -189,9 +189,7 @@ function nestod_soc(z,s)
   J = Diagonal(Float64[β for i = 1:n])
   J = Diagonal([-β; fill(β, n-1)])
 
-  # Ensure w is a Vector so SymWoodbury stores Vector B (not Matrix).
-  # This guarantees inv(SymWoodbury) returns SymWoodbury (not Woodbury).
-  return SymWoodbury(J, vec(collect(w)), 1.)
+  return SymWoodbury(J, vec(w), 1.)
 
 end
 
@@ -252,7 +250,7 @@ function maxstep_soc(x,d)
   β = Q(xbar,d)
 
   ρ1 = β /sqrt(γ)
-  μ  = ((β + d[1])/(xbar[1] + 1))[1]
+  μ  = (β + d[1])/(xbar[1] + 1)
   ρ2 = (d[2:end] - μ*xbar[2:end])
   alpha = norm(ρ2)/sqrt(γ) - ρ1
   if alpha < 0
@@ -371,9 +369,9 @@ end
 Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 
 # Fields
-- `y::Matrix` -- primal variables
-- `w::Matrix` -- dual variables for equality constraints (Gy = d)
-- `v::Matrix` -- dual variables for inequality constraints (Ay ≥_K b)
+- `y::Vector{Float64}` -- primal variables
+- `w::Vector{Float64}` -- dual variables for equality constraints (Gy = d)
+- `v::Vector{Float64}` -- dual variables for inequality constraints (Ay ≥_K b)
 - `status::Symbol` -- `:Optimal`, `:Infeasible`, `:Unbounded`, `:Abandoned`, or `:Error`
 - `Iter::Integer` -- number of interior-point iterations
 - `Mu::Real` -- final complementarity gap parameter
@@ -385,9 +383,9 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 """
 mutable struct Solution
 
-  y      :: Matrix  # primal
-  w      :: Matrix  # dual (linear equality)
-  v      :: Matrix  # dual (linear inequality)
+  y      :: Vector{Float64}  # primal
+  w      :: Vector{Float64}  # dual (linear equality)
+  v      :: Vector{Float64}  # dual (linear inequality)
   status :: Symbol  # :Optimal, :Infeasible
   Iter   :: Integer # number of iterations
   Mu     :: Real    # optimality conditions
@@ -418,7 +416,7 @@ s.t         Ay >= b
             Gy  = d
 ```
 
-Q,c,A,b,G,d are matrices (c,b,d are NOT vectors)
+c, b, d are vectors (or any AbstractVector)
 
 cone_dims is an array of tuples (Cone Type, Dimension)
 
@@ -470,13 +468,13 @@ solves the system
 function conicIP(
 
   # ½xᵀQx - cᵀx
-  Q, c::Matrix,
+  Q, c::AbstractVector,
 
   # Ax ≧ b
-  A, b::Matrix, cone_dims,
+  A, b::AbstractVector, cone_dims,
 
   # Gx = d
-  G = spzeros(0,length(c)), d = zeros(0,1);
+  G = spzeros(0,length(c)), d = zeros(0);
 
   # Solver Parameters
 
@@ -523,10 +521,10 @@ function conicIP(
   block_data   = zip(block_types, cum_range(block_sizes),
                      [i for i in 1:length(block_types)])
 
-  # Pre-allocated buffers for in-place ÷! and ∘! (avoids zeros(m,1) per call)
-  _div_buf   = zeros(m, 1)
-  _prod_buf1 = zeros(m, 1)
-  _prod_buf2 = zeros(m, 1)
+  # Pre-allocated buffers for in-place ÷! and ∘! (avoids zeros(m) per call)
+  _div_buf   = zeros(m)
+  _prod_buf1 = zeros(m)
+  _prod_buf2 = zeros(m)
 
   # Pre-allocated Block for inv(F)' — reused each iteration
   F⁻ᵀ_cache = Block(size(block_sizes, 1))
@@ -558,11 +556,11 @@ function conicIP(
   # [1, 1, … , 1] for R_+
   # [1, 0, … , 0] for Q
   # vecm(I)       for S
-  e = zeros(m,1)
+  e = zeros(m)
   for (btype, I, i) = block_data
     m_i = length(I)
-    if btype == "R"; e[I] = ones(m_i,1);             end
-    if btype == "Q"; e[I] = [1; zeros(m_i-1,1)];     end
+    if btype == "R"; e[I] = ones(m_i);             end
+    if btype == "Q"; e[I] = [1; zeros(m_i-1)];     end
     if btype == "S"; e[I] = vecm(Matrix{Float64}(LinearAlgebra.I, ord(I), ord(I)));  end
   end
 
@@ -610,7 +608,7 @@ function conicIP(
 
     # Group division x ○\ y
 
-    o = zeros(length(x),1)
+    o = zeros(length(x))
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; drp!(xI, yI, oI);  end
@@ -640,7 +638,7 @@ function conicIP(
 
     # Group product x ○ y
 
-    o = zeros(length(x),1)
+    o = zeros(length(x))
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; xrp!(xI, yI, oI);  end
@@ -704,7 +702,7 @@ function conicIP(
   # ────────────────────────────────────────────────────────────
 
   I  = Block([Diagonal(ones(i)) for i = block_sizes])
-  r0 = v4x1(c, d, b, zeros(m,1))
+  r0 = v4x1(c, d, b, zeros(m))
   z  = solve4x4gen(e,I,I)(r0)
 
   α_v = maxstep(z.v, nothing)
@@ -897,7 +895,7 @@ function conicIP(
 
     # >> lc = -(F⁻ᵀdfs ∘ Fdfs) + (σ*μ)[1]*e;
     cone_prod!(_prod_buf2, F⁻ᵀdfs, Fdfs); lc = _prod_buf2
-    axpy!(-(σ*μ)[1], e, lc);
+    axpy!(-σ*μ, e, lc);
     scal!(length(e), -1., lc, 1)
 
     r  =  v4x1(r0.y, r0.w, r0.v, rleft.s - lc)

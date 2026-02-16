@@ -21,16 +21,12 @@
 # | Argument | Size | Description |
 # |----------|------|-------------|
 # | `Q` | n × n | Positive semidefinite Hessian (use `spzeros(n,n)` for LPs) |
-# | `c` | n × 1 **Matrix** | Linear objective term |
+# | `c` | n | Linear objective term (vector) |
 # | `A` | m × n | Inequality constraint matrix |
-# | `b` | m × 1 **Matrix** | Inequality right-hand side |
+# | `b` | m | Inequality right-hand side (vector) |
 # | `cone_dims` | `Vector` of `(String,Int)` | Cone specification for rows of `A` |
 # | `G` | p × n | Equality constraint matrix (optional) |
-# | `d` | p × 1 **Matrix** | Equality right-hand side (optional) |
-#
-# !!! note "Column matrices"
-#     ConicIP expects `c`, `b`, and `d` to be **n × 1 matrices** (two-dimensional),
-#     not Julia `Vector`s. Use `reshape(v, :, 1)` to convert a vector `v`.
+# | `d` | p | Equality right-hand side (vector, optional) |
 #
 # ## Cone Specification
 #
@@ -58,11 +54,11 @@ Random.seed!(42)
 
 n = 10
 Q = sparse(Diagonal(rand(n) .+ 0.1))
-c = randn(n, 1)   # note: n × 1 Matrix, not a Vector
+c = randn(n)
 
 ## Encode 0 ≤ y ≤ 1 as [I; -I] y ≥ [0; -1]
 A = sparse([I(n); -I(n)])
-b = [zeros(n, 1); -ones(n, 1)]
+b = [zeros(n); -ones(n)]
 cone_dims = [("R", 2n)]
 
 sol = conicIP(Q, c, A, b, cone_dims; verbose=false)
@@ -78,7 +74,7 @@ round.(sol.y, digits=4)
 #
 # | Field | Description |
 # |-------|-------------|
-# | `sol.y` | Primal variables (n × 1 Matrix) |
+# | `sol.y` | Primal variables (vector) |
 # | `sol.v` | Dual variables for inequality constraints |
 # | `sol.w` | Dual variables for equality constraints |
 # | `sol.status` | `:Optimal`, `:Infeasible`, `:Unbounded`, `:Abandoned`, or `:Error` |

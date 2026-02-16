@@ -23,16 +23,16 @@ using ConicIP, SparseArrays, LinearAlgebra
 
 n = 5
 Q = spzeros(n, n)
-c = reshape([2.0, 3.0, 1.0, 1.0, 1.0], :, 1)
+c = [2.0, 3.0, 1.0, 1.0, 1.0]
 
 ## Nonnegativity: y ≥ 0
 A = sparse(1.0I, n, n)
-b = zeros(n, 1)
+b = zeros(n)
 cone_dims = [("R", n)]
 
 ## Equality constraint: sum(y) = 4
 G = ones(1, n)
-d = reshape([4.0], 1, 1)
+d = [4.0]
 
 sol = conicIP(Q, c, A, b, cone_dims, G, d; verbose=false)
 sol.status
@@ -81,12 +81,12 @@ cost = rand(nsupply, ndemand) .+ 0.1
 ## Decision variables: x[i,j] = amount shipped from i to j
 nvar = nsupply * ndemand
 Q = spzeros(nvar, nvar)
-c = reshape(cost, :, 1)         # minimize (note: conicIP minimizes -c'y, so negate)
+c = vec(cost)                   # minimize (note: conicIP minimizes -c'y, so negate)
 c = -c                           # we want to minimize cost'y, so set c = -cost
 
 ## Nonnegativity
 A = sparse(1.0I, nvar, nvar)
-b_ineq = zeros(nvar, 1)
+b_ineq = zeros(nvar)
 cone_dims = [("R", nvar)]
 
 ## Supply constraints: sum_j x[i,j] = supply[i]
@@ -109,7 +109,7 @@ for j in 1:ndemand
 end
 
 G = [G_supply; G_demand]
-d = reshape([supply; demand], :, 1)
+d = [supply; demand]
 
 sol2 = conicIP(Q, c, A, b_ineq, cone_dims, G, d; verbose=false)
 sol2.status

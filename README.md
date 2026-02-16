@@ -38,8 +38,6 @@ s.t         Ay ≧𝐾 b,  𝐾 = 𝐾₁  × ⋯ × 𝐾ⱼ
 𝐾 = [ ("R",2) , ("Q",3),  ("R",2) ]
 ```
 
-**Note:** `c`, `b`, and `d` must be **n×1 matrices** (not vectors). Use `reshape(v, :, 1)` to convert.
-
 ConicIP returns `sol`, a structure containing the status (`sol.status`), primal variables (`sol.y`), dual variables (`sol.v`, `sol.w`), objective values (`sol.pobj`, `sol.dobj`), and convergence residuals (`sol.prFeas`, `sol.duFeas`, `sol.muFeas`).
 
 To solve the problem
@@ -59,9 +57,9 @@ n = 1000
 
 Q = sprandn(n, n, 0.1)
 Q = Q'*Q
-c = ones(n, 1)
+c = ones(n)
 A = sparse(1.0I, n, n)
-b = zeros(n, 1)
+b = zeros(n)
 𝐾 = [("R", n)]
 
 sol = conicIP(Q, c, A, b, 𝐾, verbose=true);

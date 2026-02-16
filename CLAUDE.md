@@ -18,12 +18,12 @@ Pure-Julia conic interior-point solver for quadratic programs with linear, secon
 
 ## Key Design Patterns
 
-- The solver works with `Matrix` (n×1) columns rather than `Vector` for `c`, `b`, `d`
+- The solver accepts `c`, `b`, `d` as vectors (`AbstractVector`)
 - Cone dimensions specified as `[("R", n), ("Q", m), ("S", k)]` tuples
 - Block diagonal matrices (`Block`) hold per-cone scaling matrices (Diagonal, SymWoodbury, VecCongurance)
 - Nesterov-Todd scaling computed per cone block
 - `Id(n)` creates n×n identity as `Diagonal(ones(n))`
-- `v4x1` struct fields alias passed matrices (no copy) — buffer reuse requires lifetime analysis
+- `v4x1` struct fields alias passed vectors (no copy) — buffer reuse requires lifetime analysis
 - Local closures `÷(x,y)` and `∘(x,y)` are cone group division/product; in-place variants are `cone_div!`/`cone_prod!`
 - Julia gotcha: Unicode operators (`÷`, `∘`) cannot have `!` appended — `÷!` is a parse error
 
@@ -38,10 +38,12 @@ julia --project -e 'using Pkg; Pkg.test()'
 
 ## Documentation
 
-- Built with Documenter.jl: `docs/make.jl`
-- Docs worktree at `.worktrees/docs` (branch `docs/documenter-setup`)
+- Built with Documenter.jl + Literate.jl: `docs/make.jl`
 - Build locally: `julia --project=docs docs/make.jl`
 - CI deploys to GitHub Pages via `.github/workflows/Documentation.yml`
+- Tutorials are runnable `.jl` scripts in `docs/src/tutorials/`; Literate.jl generates markdown into `tutorials/generated/` at build time
+- Docs structure follows Diátaxis: tutorials / how-to guides / reference / explanation
+- Documenter.jl gotcha: `@ref` links fail if a header slug matches a page title slug (e.g., "KKT Solvers" as both header and nav entry) — rename one to disambiguate
 
 ## Benchmarking
 

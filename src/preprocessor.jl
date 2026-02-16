@@ -23,7 +23,7 @@ function imcols(A, b, ϵ = 1e-8)
 
   if isempty(R); return ([], true); end
 
-  return (norm(A*(A[R,:]\b[R,:]) - b, Inf) < ϵ) ? (R, true) : ([], false)
+  return (norm(A*(A[R,:]\b[R]) - b, Inf) < ϵ) ? (R, true) : ([], false)
 
 end
 
@@ -37,9 +37,9 @@ Rank condition              : rank(G) = size(G,1)
 Dual equality constraints   : [ Q A' G'] = c
 Rank condition              : rank([Q A' G']) = size(Q,1)
 """
-function preprocess_conicIP(Q, c::Matrix,
-  A, b::Matrix, cone_dims,
-  G = spzeros(0,length(c)), d = zeros(0,1);
+function preprocess_conicIP(Q, c::AbstractVector,
+  A, b::AbstractVector, cone_dims,
+  G = spzeros(0,length(c)), d = zeros(0);
   verbose = false,
   options...)
 
@@ -59,7 +59,7 @@ function preprocess_conicIP(Q, c::Matrix,
   (ID, dconsistent) = imcols([Q A' G[IP,:]'], c)
 
   if !(pconsistent && dconsistent)
-    return ConicIP.Solution(zeros(n,1)/0, zeros(p,1)/0,zeros(m,1)/0,
+    return ConicIP.Solution(zeros(n)/0, zeros(p)/0,zeros(m)/0,
       :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN)
   end
 
@@ -79,7 +79,7 @@ function preprocess_conicIP(Q, c::Matrix,
 
        # Augmented constraints
        #             |
-  sol = conicIP(Q + Z, c, A, b, cone_dims, G[IP,:], d[IP,: ];
+  sol = conicIP(Q + Z, c, A, b, cone_dims, G[IP,:], d[IP];
     verbose = verbose,         #                   |
     options...)                # Removed redundant linear constraints
                                # TODO : (use view?)
@@ -88,7 +88,7 @@ function preprocess_conicIP(Q, c::Matrix,
   # Argument the dual variables with 0's corresponding to the redundant
   # constraints
 
-  w = zeros(size(G,1),1); w[IP] = sol.w; sol.w = w
+  w = zeros(size(G,1)); w[IP] = sol.w; sol.w = w
 
   return sol
 
