@@ -43,9 +43,9 @@ end
         Random.seed!(200 + n)
         M = randn(n, n)
         X = M' * M + I  # PSD
-        x = reshape(ConicIP.vecm(X), :, 1)
-        e_col = reshape(e, :, 1)
-        o = zeros(length(x), 1)
+        x = ConicIP.vecm(X)
+        e_col = e
+        o = zeros(length(x))
         ConicIP.xsdc!(x, e_col, o)
         # X ∘ I = X*I + I*X = 2X
         @test ConicIP.mat(o) ≈ 2 * X atol=1e-10
@@ -71,7 +71,7 @@ end
         R = randn(n, n) + n * I  # well-conditioned
         W = ConicIP.VecCongurance(R)
 
-        x = randn(k, 1)
+        x = randn(k)
         X = ConicIP.mat(x)
 
         # W*x should equal vecm(R'*X*R)
@@ -101,7 +101,7 @@ end
         # Composition: W1 * W2
         R2 = randn(n, n) + n * I
         W2 = ConicIP.VecCongurance(R2)
-        x_comp = randn(k, 1)
+        x_comp = randn(k)
         @test (W * W2) * x_comp ≈ W * (W2 * x_comp) atol=1e-9
     end
 end
@@ -121,8 +121,8 @@ end
         M2 = randn(n, n)
         S = M2' * M2 + I   # strictly PSD
 
-        z = reshape(ConicIP.vecm(Z), :, 1)
-        s = reshape(ConicIP.vecm(S), :, 1)
+        z = ConicIP.vecm(Z)
+        s = ConicIP.vecm(S)
 
         F = ConicIP.nestod_sdc(z, s)
 
@@ -138,8 +138,8 @@ end
         Random.seed!(400 + n)
         M1 = randn(n, n); Z = M1' * M1 + I
         M2 = randn(n, n); S = M2' * M2 + I
-        z = reshape(ConicIP.vecm(Z), :, 1)
-        s = reshape(ConicIP.vecm(S), :, 1)
+        z = ConicIP.vecm(Z)
+        s = ConicIP.vecm(S)
 
         F = ConicIP.nestod_sdc(z, s)
         λ = F * z
@@ -163,9 +163,9 @@ end
         X = randn(n, n); X = (X + X') / 2
         Y = randn(n, n); Y = (Y + Y') / 2
 
-        x = reshape(ConicIP.vecm(X), :, 1)
-        y = reshape(ConicIP.vecm(Y), :, 1)
-        o = zeros(k, 1)
+        x = ConicIP.vecm(X)
+        y = ConicIP.vecm(Y)
+        o = zeros(k)
 
         ConicIP.xsdc!(x, y, o)
 
@@ -185,9 +185,9 @@ end
         Y = M' * M + I  # strictly PSD
         X = randn(n, n); X = (X + X') / 2
 
-        x = reshape(ConicIP.vecm(X), :, 1)
-        y = reshape(ConicIP.vecm(Y), :, 1)
-        o = zeros(k, 1)
+        x = ConicIP.vecm(X)
+        y = ConicIP.vecm(Y)
+        o = zeros(k)
 
         ConicIP.dsdc!(x, y, o)
         O_mat = ConicIP.mat(o)
@@ -207,10 +207,10 @@ end
         M = randn(n, n); Y = M' * M + I
         X = randn(n, n); X = (X + X') / 2
 
-        x = reshape(ConicIP.vecm(X), :, 1)
-        y = reshape(ConicIP.vecm(Y), :, 1)
-        o_div = zeros(k, 1)
-        o_prod = zeros(k, 1)
+        x = ConicIP.vecm(X)
+        y = ConicIP.vecm(Y)
+        o_div = zeros(k)
+        o_prod = zeros(k)
 
         # Z = X ÷ Y, then Y ∘ Z should ≈ X
         ConicIP.dsdc!(x, y, o_div)
@@ -230,8 +230,8 @@ end
     D = -0.5 * I + 0.1 * randn(n, n)
     D = (D + D') / 2
 
-    x = reshape(ConicIP.vecm(X), :, 1)
-    d = reshape(ConicIP.vecm(D), :, 1)
+    x = ConicIP.vecm(X)
+    d = ConicIP.vecm(D)
 
     α = ConicIP.maxstep_sdc(x, d)
     @test isfinite(α)
@@ -276,7 +276,7 @@ end
     B = Block(1); B[1] = W
 
     x = randn(k)
-    @test B * x ≈ vec(W * reshape(x, :, 1)) atol=1e-10
+    @test B * x ≈ W * x atol=1e-10
     @test Matrix(B) ≈ Matrix(W) atol=1e-10
 end
 
@@ -295,7 +295,7 @@ end
     y = B * x
 
     @test y[1:n_r] ≈ D * x[1:n_r] atol=1e-10
-    @test y[n_r+1:end] ≈ vec(W * reshape(x[n_r+1:end], :, 1)) atol=1e-10
+    @test y[n_r+1:end] ≈ W * x[n_r+1:end] atol=1e-10
 
     # inv and adjoint
     Binv = inv(B)
@@ -452,12 +452,12 @@ end
     # 1×1 PSD = nonnegative scalar
     k = 1
     Q = ones(1, 1)
-    c = reshape([-2.0], :, 1)   # min ½x² + 2x s.t. x ≥ 0 → x* = 0...
+    c = [-2.0]   # min ½x² + 2x s.t. x ≥ 0 → x* = 0...
     # Actually: min ½x² - (-2)x = ½x² + 2x → x* = 0 since x ≥ 0 (PSD for 1x1)
     # Wait: ConicIP minimizes ½y'Qy - c'y. With c = [-2], minimizes ½x² + 2x.
     # Subject to x ∈ S(1) means x ≥ 0. Minimum at x=0.
     A = sparse([1.0], [1], [1.0], 1, 1)
-    b = zeros(1, 1)
+    b = zeros(1)
     sol = conicIP(Q, c, A, b, [("S", 1)]; optTol=optTol, verbose=false)
     @test sol.status == :Optimal
     @test abs(sol.y[1]) < tol
@@ -472,9 +472,9 @@ end
     expected = V * diagm(0 => max.(λ, 0.0)) * V'
 
     Q = Matrix{Float64}(I, k, k)
-    c = reshape(ConicIP.vecm(target), :, 1)
+    c = ConicIP.vecm(target)
     A = sparse(1.0I, k, k)
-    b = zeros(k, 1)
+    b = zeros(k)
 
     sol = conicIP(Q, c, A, b, [("S", k)]; optTol=optTol, verbose=false)
     @test sol.status == :Optimal
@@ -487,9 +487,9 @@ end
     target = Matrix{Float64}(I, n, n)  # already PSD
 
     Q = Matrix{Float64}(I, k, k)
-    c = reshape(ConicIP.vecm(target), :, 1)
+    c = ConicIP.vecm(target)
     A = sparse(1.0I, k, k)
-    b = zeros(k, 1)
+    b = zeros(k)
 
     sol = conicIP(Q, c, A, b, [("S", k)]; optTol=optTol, verbose=false)
     @test sol.status == :Optimal
@@ -501,9 +501,9 @@ end
     # Project zero matrix onto PSD cone → stays at zero
     n = 3; k = _vdim(n)
     Q = Matrix{Float64}(I, k, k)
-    c = zeros(k, 1)  # target = zero matrix
+    c = zeros(k)  # target = zero matrix
     A = sparse(1.0I, k, k)
-    b = zeros(k, 1)
+    b = zeros(k)
 
     sol = conicIP(Q, c, A, b, [("S", k)]; optTol=optTol, verbose=false)
     @test sol.status == :Optimal
@@ -516,9 +516,9 @@ end
     n = 3; k = _vdim(n)
     target = -10.0 * Matrix{Float64}(I, n, n)
     Q = Matrix{Float64}(I, k, k)
-    c = reshape(ConicIP.vecm(target), :, 1)
+    c = ConicIP.vecm(target)
     A = sparse(1.0I, k, k)
-    b = zeros(k, 1)
+    b = zeros(k)
 
     sol = conicIP(Q, c, A, b, [("S", k)]; optTol=optTol, verbose=false)
     @test sol.status == :Optimal
