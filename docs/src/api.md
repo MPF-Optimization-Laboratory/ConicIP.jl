@@ -91,6 +91,7 @@ ConicIP.imcols
 These functions are implementation details and not part of the public API.
 
 ```@docs
+ConicIP.inv_adjoint!
 ConicIP.pivotgen
 ConicIP.placeholder
 ConicIP.identical_sparse_structure
