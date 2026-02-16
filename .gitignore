@@ -3,4 +3,5 @@
 *.jl.mem
 .worktrees/
 docs/build/
+docs/src/tutorials/generated/
 /Manifest.toml
