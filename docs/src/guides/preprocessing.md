@@ -52,7 +52,7 @@ A = sparse([1.0 2.0 3.0;
 b = [1.0; 2.0; 1.0]
 
 # imcols returns indices of independent rows
-idx = ConicIP.imcols(A', reshape(b, :, 1))
+idx = ConicIP.imcols(A', b)
 ```
 
 ## Example
@@ -63,10 +63,10 @@ Random.seed!(42)
 
 n = 5
 Q = sparse(1.0I, n, n)
-c = randn(n, 1)
+c = randn(n)
 
 A = sparse(1.0I, n, n)
-b = zeros(n, 1)
+b = zeros(n)
 cone_dims = [("R", n)]
 
 # Redundant equality constraints: row 3 = row 1 + row 2
@@ -74,7 +74,6 @@ G = [1.0 1.0 0.0 0.0 0.0;
      0.0 0.0 1.0 1.0 0.0;
      1.0 1.0 1.0 1.0 0.0]   # redundant!
 d = [1.0; 1.0; 2.0]
-d = reshape(d, :, 1)
 
 # preprocess_conicIP handles the redundancy automatically
 sol = preprocess_conicIP(Q, c, A, b, cone_dims, G, d; verbose=false)

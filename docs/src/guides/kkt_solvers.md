@@ -135,9 +135,9 @@ Random.seed!(42)
 
 n = 50
 Q = sprandn(n, n, 0.3); Q = Q'Q + 0.1I  # make positive definite
-c = ones(n, 1)
+c = ones(n)
 A = sparse(1.0I, n, n)
-b = zeros(n, 1)
+b = zeros(n)
 cone_dims = [("R", n)]
 
 function my_kktsolver(Q, A, G, cone_dims)
@@ -148,7 +148,7 @@ function my_kktsolver(Q, A, G, cone_dims)
         function solve3x3(x, y, z)
             a = QpD \ (x + A' * (invFᵀF * z))
             c = invFᵀF * (z - A * a)
-            b = zeros(0, 1)
+            b = zeros(0)
             return (a, b, c)
         end
     end
@@ -186,7 +186,7 @@ diagonal QP using `pivot`:
 function my_2x2_solver(Q, A, G, cone_dims)
     function solve2x2gen(F, F⁻ᵀ)
         QpD = cholesky(Q + spdiagm(0 => (F[1].diag).^(-2)))
-        return (y, w) -> (QpD \ y, zeros(0, 1))
+        return (y, w) -> (QpD \ y, zeros(0))
     end
 end
 

@@ -39,11 +39,11 @@ Random.seed!(42)
 # Box-constrained QP: minimize ½ y'Qy - c'y subject to 0 ≤ y ≤ 1
 n = 5
 Q = sparse(Diagonal(rand(n) .+ 0.1))
-c = randn(n, 1)   # ← must be n×1 Matrix, not a Vector
+c = randn(n)
 
 # Constraints: [I; -I] y ≥ [0; -1]
 A = sparse([I(n); -I(n)])
-b = [zeros(n, 1); -ones(n, 1)]
+b = [zeros(n); -ones(n)]
 cone_dims = [("R", 2n)]
 
 sol = conicIP(Q, c, A, b, cone_dims; verbose=false)
@@ -73,10 +73,6 @@ optimize!(model)
 ```
 
 See the [JuMP Integration](@ref) guide for details.
-
-!!! note "Column matrix convention"
-    ConicIP expects `c`, `b`, and `d` to be **n × 1 matrices** (two-dimensional),
-    not Julia `Vector`s. Use `reshape(v, :, 1)` to convert a vector.
 
 ## Choosing a Solver
 
