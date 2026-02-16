@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Second-Order Cone · ConicIP.jl</title><meta name="title" content="Second-Order Cone · ConicIP.jl"/><meta property="og:title" content="Second-Order Cone · ConicIP.jl"/><meta property="twitter:title" content="Second-Order Cone · ConicIP.jl"/><meta name="description" content="Documentation for ConicIP.jl."/><meta property="og:description" content="Documentation for ConicIP.jl."/><meta property="twitter:description" content="Documentation for ConicIP.jl."/><meta property="og:url" content="https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/tutorials/generated/socp/"/><meta property="twitter:url" content="https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/tutorials/generated/socp/"/><link rel="canonical" href="https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/tutorials/generated/socp/"/><script data-outdated-warner src="../../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../../assets/documenter.js"></script><script src="../../../search_index.js"></script><script src="../../../siteinfo.js"></script><script src="../../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../../">ConicIP.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../../">Home</a></li><li><a class="tocitem" href="../../../installation/">Installation</a></li><li><span class="tocitem">Tutorials</span><ul><li><a class="tocitem" href="../getting_started/">Getting Started</a></li><li><a class="tocitem" href="../lp/">Linear Programs</a></li><li><a class="tocitem" href="../qp/">Quadratic Programs</a></li><li class="is-active"><a class="tocitem" href>Second-Order Cone</a><ul class="internal"><li><a class="tocitem" href="#Encoding-SOC-Constraints"><span>Encoding SOC Constraints</span></a></li><li><a class="tocitem" href="#Example:-Projection-onto-the-Unit-Ball"><span>Example: Projection onto the Unit Ball</span></a></li><li><a class="tocitem" href="#Example:-Mixed-Cones-(Nonnegative-SOC)"><span>Example: Mixed Cones (Nonnegative + SOC)</span></a></li><li><a class="tocitem" href="#Example:-Robust-Least-Squares"><span>Example: Robust Least-Squares</span></a></li></ul></li><li><a class="tocitem" href="../sdp/">Semidefinite (Experimental)</a></li></ul></li><li><span class="tocitem">How-To Guides</span><ul><li><a class="tocitem" href="../../../guides/jump/">JuMP Integration</a></li><li><a class="tocitem" href="../../../guides/kkt_solvers/">KKT Solvers</a></li><li><a class="tocitem" href="../../../guides/preprocessing/">Preprocessing</a></li></ul></li><li><a class="tocitem" href="../../../background/">Mathematical Background</a></li><li><a class="tocitem" href="../../../api/">API Reference</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">Tutorials</a></li><li class="is-active"><a href>Second-Order Cone</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Second-Order Cone</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/MPF-Optimization-Laboratory/ConicIP.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/blob/master/docs/src/tutorials/socp.jl" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Second-Order-Cone-Programs"><a class="docs-heading-anchor" href="#Second-Order-Cone-Programs">Second-Order Cone Programs</a><a id="Second-Order-Cone-Programs-1"></a><a class="docs-heading-anchor-permalink" href="#Second-Order-Cone-Programs" title="Permalink"></a></h1><p>A second-order cone (SOC) constraint has the form</p><pre><code class="nohighlight hljs">‖x‖ ≤ t</code></pre><p>or equivalently <code>(t, x) ∈ Q</code>, where <code>Q</code> is the second-order (Lorentz) cone. In ConicIP, this is specified as <code>(&quot;Q&quot;, dim)</code> where <code>dim = 1 + length(x)</code>. The <strong>first</strong> component of the cone block is the scalar bound <code>t</code>.</p><p>SOC constraints appear naturally in robust optimization, norm minimization, and chance-constrained programming.</p><h2 id="Encoding-SOC-Constraints"><a class="docs-heading-anchor" href="#Encoding-SOC-Constraints">Encoding SOC Constraints</a><a id="Encoding-SOC-Constraints-1"></a><a class="docs-heading-anchor-permalink" href="#Encoding-SOC-Constraints" title="Permalink"></a></h2><p>To enforce <code>‖y‖ ≤ t</code>, arrange the constraint rows so that:</p><ul><li>Row 1 of the SOC block gives <code>t</code> (the bound)</li><li>Rows 2:end give the components of <code>y</code></li></ul><p>Concretely, if <code>Ay - b</code> restricted to the SOC block yields a vector <code>[t; x₁; x₂; ...]</code>, then the constraint is <code>‖[x₁, x₂, ...]‖ ≤ t</code>.</p><h2 id="Example:-Projection-onto-the-Unit-Ball"><a class="docs-heading-anchor" href="#Example:-Projection-onto-the-Unit-Ball">Example: Projection onto the Unit Ball</a><a id="Example:-Projection-onto-the-Unit-Ball-1"></a><a class="docs-heading-anchor-permalink" href="#Example:-Projection-onto-the-Unit-Ball" title="Permalink"></a></h2><p>Project a point onto the unit Euclidean ball <code>{y : ‖y‖ ≤ 1}</code>. The expected result is the normalized vector <code>a / ‖a‖</code>.</p><pre><code class="language-julia hljs">using ConicIP, SparseArrays, LinearAlgebra
+
+n = 3
+Q = sparse(1.0I, n, n)
+a = ones(n, 1)  # point to project
+
+# SOC constraint: (t, y) ∈ Q with t = 1
+# Encode as: [0ᵀ; I] y - [-1; 0] ∈ Q
+# i.e., the SOC vector is (1, y₁, y₂, y₃) and we need ‖y‖ ≤ 1
+A = [spzeros(1, n); sparse(1.0I, n, n)]
+b = [-ones(1, 1); zeros(n, 1)]
+cone_dims = [(&quot;Q&quot;, n + 1)]
+
+sol = conicIP(Q, Q * a, A, b, cone_dims;
+              verbose=false, optTol=1e-7)
+sol.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">3×1 Matrix{Float64}:
+ 0.5774
+ 0.5774
+ 0.5774</code></pre><p>Compare to the expected answer <code>a / ‖a‖</code>:</p><pre><code class="language-julia hljs">round.(a ./ norm(a), digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">3×1 Matrix{Float64}:
+ 0.5774
+ 0.5774
+ 0.5774</code></pre><h2 id="Example:-Mixed-Cones-(Nonnegative-SOC)"><a class="docs-heading-anchor" href="#Example:-Mixed-Cones-(Nonnegative-SOC)">Example: Mixed Cones (Nonnegative + SOC)</a><a id="Example:-Mixed-Cones-(Nonnegative-SOC)-1"></a><a class="docs-heading-anchor-permalink" href="#Example:-Mixed-Cones-(Nonnegative-SOC)" title="Permalink"></a></h2><p>Combine nonnegative (<code>&quot;R&quot;</code>) and second-order cone (<code>&quot;Q&quot;</code>) constraints. Here we minimize a linear objective subject to both <code>y ≥ 0</code> and <code>‖y‖ ≤ 1</code>:</p><pre><code class="language-julia hljs">using Random
+Random.seed!(42)
+
+n = 5
+Q = sparse(1.0I, n, n)
+c = randn(n, 1)
+
+# Stack constraints: first n rows are R+ (y ≥ 0),
+# next n+1 rows are SOC (‖y‖ ≤ 1)
+A = [sparse(1.0I, n, n);          # y ≥ 0
+     spzeros(1, n);                # t placeholder for SOC bound
+     sparse(1.0I, n, n)]           # y components in SOC
+b = [zeros(n, 1);                  # R+ bound
+     -ones(1, 1);                  # t ≥ 1
+     zeros(n, 1)]                  # SOC body
+cone_dims = [(&quot;R&quot;, n), (&quot;Q&quot;, n + 1)]
+
+sol2 = conicIP(Q, c, A, b, cone_dims; verbose=false)
+sol2.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Optimal</code></pre><pre><code class="language-julia hljs">round.(sol2.y, digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">5×1 Matrix{Float64}:
+ 0.7884
+ 0.0
+ 0.0
+ 0.0
+ 0.0</code></pre><p>The solution lies in the intersection of the nonnegative orthant and the unit ball — the nonnegative part of the unit sphere.</p><h2 id="Example:-Robust-Least-Squares"><a class="docs-heading-anchor" href="#Example:-Robust-Least-Squares">Example: Robust Least-Squares</a><a id="Example:-Robust-Least-Squares-1"></a><a class="docs-heading-anchor-permalink" href="#Example:-Robust-Least-Squares" title="Permalink"></a></h2><p>Given an uncertain measurement matrix <code>A₀ + δA</code> and observations <code>b₀</code>, robust least-squares minimizes the worst-case residual:</p><pre><code class="nohighlight hljs">minimize  ‖A₀ y - b₀‖ + ρ ‖y‖</code></pre><p>This can be reformulated as an SOCP. We introduce auxiliary variables <code>t₁ ≥ ‖A₀ y - b₀‖</code> and <code>t₂ ≥ ‖y‖</code> and minimize <code>t₁ + ρ t₂</code>.</p><pre><code class="language-julia hljs">Random.seed!(99)
+
+m, n_var = 10, 5
+A0 = randn(m, n_var)
+y_true = randn(n_var)
+b0 = A0 * y_true + 0.1 * randn(m)
+ρ = 0.5  # regularization weight
+
+# Decision variables: [y; t₁; t₂] of length n_var + 2
+nz = n_var + 2
+Qz = spzeros(nz, nz)
+
+# Objective: minimize t₁ + ρ t₂  →  c = -[0; 1; ρ] (ConicIP minimizes -c&#39;z)
+cz = zeros(nz, 1)
+cz[n_var+1] = 1.0
+cz[n_var+2] = ρ
+
+# SOC 1: (t₁, A₀ y - b₀) ∈ Q^{m+1}
+#   Row for t₁: [0...0  1  0] z ≥ 0  (extracts t₁)
+#   Rows for residual: [A₀  0  0] z ≥ b₀
+A_soc1_t = spzeros(1, nz); A_soc1_t[1, n_var+1] = 1.0
+A_soc1_r = [sparse(A0) spzeros(m, 2)]
+b_soc1 = [zeros(1, 1); reshape(b0, :, 1)]
+
+# SOC 2: (t₂, y) ∈ Q^{n_var+1}
+#   Row for t₂: [0...0  0  1] z ≥ 0
+#   Rows for y: [I  0  0] z ≥ 0
+A_soc2_t = spzeros(1, nz); A_soc2_t[1, n_var+2] = 1.0
+A_soc2_y = [sparse(1.0I, n_var, n_var) spzeros(n_var, 2)]
+b_soc2 = zeros(1 + n_var, 1)
+
+A_all = [A_soc1_t; A_soc1_r; A_soc2_t; A_soc2_y]
+b_all = [b_soc1; b_soc2]
+cone_dims_robust = [(&quot;Q&quot;, m + 1), (&quot;Q&quot;, n_var + 1)]
+
+sol3 = conicIP(Qz, cz, sparse(A_all), b_all, cone_dims_robust; verbose=false)
+sol3.status</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">:Unbounded</code></pre><p>The robust solution:</p><pre><code class="language-julia hljs">round.(sol3.y[1:n_var], digits=4)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">5-element Vector{Float64}:
+ -0.0
+  0.0
+  0.0
+  0.0
+  0.0</code></pre></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../qp/">« Quadratic Programs</a><a class="docs-footer-nextpage" href="../sdp/">Semidefinite (Experimental) »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Monday 16 February 2026 03:54">Monday 16 February 2026</span>. Using Julia version 1.12.5.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
