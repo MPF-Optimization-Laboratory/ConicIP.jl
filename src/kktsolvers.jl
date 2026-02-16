@@ -216,7 +216,7 @@ function kktsolver_sparse(Q, A, G, cone_dims)
         Z₀ᶠ = lu(Z₀)
         function solve3x3I(Δy, Δw, Δv)
           z = Z₀ᶠ\[Δy; Δw; Δv]
-          return (z[1:n,:], z[n+1:n+p,:], z[n+p+1:end,:])
+          return (z[1:n], z[n+1:n+p], z[n+p+1:end])
         end
         return solve3x3I
       else
@@ -230,8 +230,8 @@ function kktsolver_sparse(Q, A, G, cone_dims)
                   spzeros(r,n)  spzeros(r,p)   FᵀFB'         invFᵀFD        ]
         Zᶠ_lu = lu(Z_new)
         function solve3x3lift(Δy, Δw, Δv)
-          z = Zᶠ_lu\[Δy; Δw; Δv; zeros(r,1)]
-          return (z[1:n,:], z[n+1:n+p,:], z[(n+p+1):(n+m+p),:])
+          z = Zᶠ_lu\[Δy; Δw; Δv; zeros(r)]
+          return (z[1:n], z[n+1:n+p], z[(n+p+1):(n+m+p)])
         end
         return solve3x3lift
       end
@@ -257,7 +257,7 @@ function kktsolver_sparse(Q, A, G, cone_dims)
       Z₀ᶠ = lu(Z₀)
       function solve3x3_nolift(Δy, Δw, Δv)
         z = Z₀ᶠ\[Δy; Δw; Δv]
-        return (z[1:n,:], z[n+1:n+p,:], z[n+p+1:end,:])
+        return (z[1:n], z[n+1:n+p], z[n+p+1:end])
       end
       return solve3x3_nolift
 
@@ -297,7 +297,7 @@ function kktsolver_2x2(Q, A, G, cone_dims)
     function solve2x2(Δy, Δw)
 
       z = Z\[Δy; Δw]
-      return (z[1:n,:], z[n+1:end,:])
+      return (z[1:n], z[n+1:end])
 
     end
 

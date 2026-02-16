@@ -170,7 +170,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     # ConicIP minimizes (1/2)y'Qy - c'y
     # For min c_moi'x: set c_int = -c_moi  → minimizes -(-c_moi)'x = c_moi'x
     # For max c_moi'x: set c_int = c_moi   → minimizes -(c_moi)'x = -c_moi'x
-    c_int = dest.max_sense ? reshape(c_moi, :, 1) : reshape(-c_moi, :, 1)
+    c_int = dest.max_sense ? c_moi : -c_moi
     Q = spzeros(n, n)
 
     # ── Constraints ──
@@ -260,18 +260,18 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     # ── Assemble matrices ──
     if isempty(G_rows)
         G = spzeros(0, n)
-        d = zeros(0, 1)
+        d = zeros(0)
     else
         G = sparse(vcat(G_rows...))
-        d = reshape(Float64.(d_vals), :, 1)
+        d = Float64.(d_vals)
     end
 
     if isempty(A_rows)
         A = spzeros(0, n)
-        b = zeros(0, 1)
+        b = zeros(0)
     else
         A = sparse(vcat(A_rows...))
-        b = reshape(Float64.(b_vals), :, 1)
+        b = Float64.(b_vals)
     end
 
     # ── Solve ──
@@ -381,13 +381,13 @@ function MOI.get(
     # Check equality constraints
     for (ci_stored, rows) in model.eq_ci_map
         if ci_stored == ci
-            return vec(model.sol.w[rows, :])
+            return model.sol.w[rows]
         end
     end
     # Check inequality constraints
     for (ci_stored, rows) in model.ineq_ci_map
         if ci_stored == ci
-            return vec(model.sol.v[rows, :])
+            return model.sol.v[rows]
         end
     end
     error("Constraint index $ci not found")

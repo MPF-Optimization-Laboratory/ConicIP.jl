@@ -20,16 +20,16 @@ using ConicIP, SparseArrays, LinearAlgebra
 
 n = 5
 Q = sparse(1.0I, n, n)
-p = reshape(collect(1.0:n), :, 1)
+p = collect(1.0:n)
 
 ## Nonnegativity constraints: y ≥ 0
 A = sparse(1.0I, n, n)
-b = zeros(n, 1)
+b = zeros(n)
 cone_dims = [("R", n)]
 
 ## Simplex constraint: sum(y) = 1
 G = ones(1, n)
-d = ones(1, 1)
+d = [1.0]
 
 ## Note: we pass Q*p as the linear term c = Qp = Ip = p
 sol = conicIP(Q, Q * p, A, b, cone_dims, G, d;
@@ -84,16 +84,16 @@ r_min = 0.05  # target minimum return
 
 ## Q = Sigma, c = 0 (pure quadratic objective)
 Q_port = Sigma
-c_port = zeros(nassets, 1)
+c_port = zeros(nassets)
 
 ## Inequality constraints: [μᵀ; I] y ≥ [r_min; 0]
 A_port = sparse([returns'; I(nassets)])
-b_port = [reshape([r_min], 1, 1); zeros(nassets, 1)]
+b_port = [r_min; zeros(nassets)]
 cone_dims_port = [("R", 1 + nassets)]
 
 ## Equality constraint: sum(y) = 1
 G_port = ones(1, nassets)
-d_port = ones(1, 1)
+d_port = [1.0]
 
 sol_port = conicIP(Q_port, c_port, A_port, b_port, cone_dims_port,
                    G_port, d_port; verbose=false, optTol=1e-7)

@@ -42,10 +42,10 @@ function mpb_to_conicip(c_mpb, A_mpb, b_mpb, con_cones, var_cones)
     # Build equality constraints from Zero constraint cones
     if !isempty(eq_rows)
         G = A_mpb[eq_rows, :]
-        d = reshape(b_mpb[eq_rows], :, 1)
+        d = b_mpb[eq_rows]
     else
         G = spzeros(0, n)
-        d = zeros(0, 1)
+        d = zeros(0)
     end
 
     # Build inequality A rows and b from constraint cones
@@ -90,14 +90,14 @@ function mpb_to_conicip(c_mpb, A_mpb, b_mpb, con_cones, var_cones)
     # Assemble
     if isempty(A_rows)
         A_internal = spzeros(0, n)
-        b_internal = zeros(0, 1)
+        b_internal = zeros(0)
     else
         A_internal = vcat(A_rows...)
-        b_internal = reshape(vcat(b_vals...), :, 1)
+        b_internal = vcat(b_vals...)
     end
 
     Q = spzeros(n, n)
-    c_col = reshape(Float64.(-c_mpb), :, 1)  # negate c (solver minimizes -c'y)
+    c_col = Float64.(-c_mpb)  # negate c (solver minimizes -c'y)
 
     return (Q=Q, c=c_col, A=sparse(A_internal), b=Float64.(b_internal),
             cone_dims=cone_dims, G=sparse(G), d=Float64.(d))
