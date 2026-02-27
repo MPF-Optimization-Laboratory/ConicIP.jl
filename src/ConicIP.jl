@@ -372,6 +372,7 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 - `y::Vector{Float64}` -- primal variables
 - `w::Vector{Float64}` -- dual variables for equality constraints (Gy = d)
 - `v::Vector{Float64}` -- dual variables for inequality constraints (Ay ≥_K b)
+- `s::Vector{Float64}` -- cone slack variables (Ay - s = b, s ∈ K)
 - `status::Symbol` -- `:Optimal`, `:Infeasible`, `:Unbounded`, `:Abandoned`, or `:Error`
 - `Iter::Integer` -- number of interior-point iterations
 - `Mu::Real` -- final complementarity gap parameter
@@ -386,6 +387,7 @@ mutable struct Solution
   y      :: Vector{Float64}  # primal
   w      :: Vector{Float64}  # dual (linear equality)
   v      :: Vector{Float64}  # dual (linear inequality)
+  s      :: Vector{Float64}  # cone slack (Ay - s = b, s ∈ K)
   status :: Symbol  # :Optimal, :Infeasible
   Iter   :: Integer # number of iterations
   Mu     :: Real    # optimality conditions
@@ -723,7 +725,7 @@ function conicIP(
   #  Iterate Loop
   # ────────────────────────────────────────────────────────────
 
-  sol     = Solution(z.y, z.w, z.v, :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
+  sol     = Solution(z.y, z.w, z.v, z.s, :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
   optBest = Inf
   rStep   = 0
   rnorm   = 0

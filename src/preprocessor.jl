@@ -59,7 +59,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   (ID, dconsistent) = imcols([Q A' G[IP,:]'], c)
 
   if !(pconsistent && dconsistent)
-    return ConicIP.Solution(zeros(n)/0, zeros(p)/0,zeros(m)/0,
+    return ConicIP.Solution(zeros(n)/0, zeros(p)/0, zeros(m)/0, zeros(m)/0,
       :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN)
   end
 

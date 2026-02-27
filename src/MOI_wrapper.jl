@@ -21,9 +21,16 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     max_sense::Bool
     objective_constant::Float64
     n::Int
-    # Constraint row tracking for dual recovery
+    # Constraint row tracking for primal/dual recovery
     eq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
+    eq_offset::Vector{Float64}     # 0 for Zeros, rhs for EqualTo
+    eq_is_scalar::Vector{Bool}
     ineq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
+    ineq_sign::Vector{Float64}     # +1 or -1 (Nonpositive/LessThan flip)
+    ineq_offset::Vector{Float64}   # 0 for vector, lower/upper for scalar
+    ineq_is_scalar::Vector{Bool}
+    # Timing
+    solve_time::Float64
     # Solver options
     verbose::Bool
     optTol::Float64
@@ -33,8 +40,9 @@ end
 function Optimizer(; verbose::Bool = false, optTol::Float64 = 1e-6, maxIters::Int = 100)
     return Optimizer(
         nothing, false, 0.0, 0,
-        Pair{Any, UnitRange{Int}}[],
-        Pair{Any, UnitRange{Int}}[],
+        Pair{Any, UnitRange{Int}}[], Float64[], Bool[],
+        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[],
+        NaN,
         verbose, optTol, maxIters,
     )
 end
@@ -44,8 +52,14 @@ function MOI.empty!(model::Optimizer)
     model.max_sense = false
     model.objective_constant = 0.0
     model.n = 0
+    model.solve_time = NaN
     empty!(model.eq_ci_map)
+    empty!(model.eq_offset)
+    empty!(model.eq_is_scalar)
     empty!(model.ineq_ci_map)
+    empty!(model.ineq_sign)
+    empty!(model.ineq_offset)
+    empty!(model.ineq_is_scalar)
 end
 
 function MOI.is_empty(model::Optimizer)
@@ -54,6 +68,10 @@ end
 
 MOI.get(::Optimizer, ::MOI.SolverName) = "ConicIP"
 MOI.get(::Optimizer, ::MOI.SolverVersion) = "0.2"
+
+# Interior-point solver — no simplex basis information
+MOI.supports(::Optimizer, ::MOI.VariableBasisStatus) = false
+MOI.supports(::Optimizer, ::MOI.ConstraintBasisStatus) = false
 
 # Supported objective
 MOI.supports(::Optimizer, ::MOI.ObjectiveSense) = true
@@ -196,6 +214,8 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(G_rows, Ai)
                     append!(d_vals, -bi)
                     push!(dest.eq_ci_map, ci => (eq_row+1):(eq_row+dim))
+                    push!(dest.eq_offset, 0.0)
+                    push!(dest.eq_is_scalar, false)
                     eq_row += dim
                 elseif S <: MOI.Nonnegatives
                     # Ai*x + bi ≥ 0 → A_int = Ai, b_int = -bi
@@ -203,6 +223,9 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     append!(b_vals, -bi)
                     push!(cone_dims, ("R", dim))
                     push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
+                    push!(dest.ineq_sign, 1.0)
+                    push!(dest.ineq_offset, 0.0)
+                    push!(dest.ineq_is_scalar, false)
                     ineq_row += dim
                 elseif S <: MOI.Nonpositives
                     # Ai*x + bi ≤ 0 → -Ai*x - bi ≥ 0 → A_int = -Ai, b_int = bi
@@ -210,18 +233,27 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     append!(b_vals, bi)
                     push!(cone_dims, ("R", dim))
                     push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
+                    push!(dest.ineq_sign, -1.0)
+                    push!(dest.ineq_offset, 0.0)
+                    push!(dest.ineq_is_scalar, false)
                     ineq_row += dim
                 elseif S <: MOI.SecondOrderCone
                     push!(A_rows, Ai)
                     append!(b_vals, -bi)
                     push!(cone_dims, ("Q", dim))
                     push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
+                    push!(dest.ineq_sign, 1.0)
+                    push!(dest.ineq_offset, 0.0)
+                    push!(dest.ineq_is_scalar, false)
                     ineq_row += dim
                 elseif S <: MOI.PositiveSemidefiniteConeTriangle
                     push!(A_rows, Ai)
                     append!(b_vals, -bi)
                     push!(cone_dims, ("S", dim))
                     push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
+                    push!(dest.ineq_sign, 1.0)
+                    push!(dest.ineq_offset, 0.0)
+                    push!(dest.ineq_is_scalar, false)
                     ineq_row += dim
                 end
 
@@ -234,6 +266,8 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(G_rows, Ai)
                     push!(d_vals, rhs - bi)
                     push!(dest.eq_ci_map, ci => (eq_row+1):(eq_row+1))
+                    push!(dest.eq_offset, rhs)
+                    push!(dest.eq_is_scalar, true)
                     eq_row += 1
                 elseif S <: MOI.GreaterThan{Float64}
                     # Ai*x + bi ≥ lower → Ai*x ≥ lower - bi
@@ -242,6 +276,9 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(b_vals, lower - bi)
                     push!(cone_dims, ("R", 1))
                     push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+1))
+                    push!(dest.ineq_sign, 1.0)
+                    push!(dest.ineq_offset, lower)
+                    push!(dest.ineq_is_scalar, true)
                     ineq_row += 1
                 elseif S <: MOI.LessThan{Float64}
                     # Ai*x + bi ≤ upper → upper - Ai*x - bi ≥ 0
@@ -251,6 +288,9 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(b_vals, bi - upper)
                     push!(cone_dims, ("R", 1))
                     push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+1))
+                    push!(dest.ineq_sign, -1.0)
+                    push!(dest.ineq_offset, upper)
+                    push!(dest.ineq_is_scalar, true)
                     ineq_row += 1
                 end
             end
@@ -275,11 +315,13 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     end
 
     # ── Solve ──
+    t0 = time()
     dest.sol = preprocess_conicIP(Q, c_int, A, b, cone_dims, G, d;
         verbose = dest.verbose,
         optTol = dest.optTol,
         maxIters = dest.maxIters,
     )
+    dest.solve_time = time() - t0
 
     return index_map, false
 end
@@ -306,8 +348,8 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
     end
 end
 
-function MOI.get(model::Optimizer, ::MOI.PrimalStatus)
-    if model.sol === nothing
+function MOI.get(model::Optimizer, attr::MOI.PrimalStatus)
+    if model.sol === nothing || attr.result_index > MOI.get(model, MOI.ResultCount())
         return MOI.NO_SOLUTION
     end
     status = model.sol.status
@@ -320,8 +362,8 @@ function MOI.get(model::Optimizer, ::MOI.PrimalStatus)
     end
 end
 
-function MOI.get(model::Optimizer, ::MOI.DualStatus)
-    if model.sol === nothing
+function MOI.get(model::Optimizer, attr::MOI.DualStatus)
+    if model.sol === nothing || attr.result_index > MOI.get(model, MOI.ResultCount())
         return MOI.NO_SOLUTION
     end
     status = model.sol.status
@@ -350,12 +392,9 @@ end
 
 function MOI.get(model::Optimizer, attr::MOI.ObjectiveValue)
     MOI.check_result_index_bounds(model, attr)
-    # ConicIP minimizes (1/2)y'Qy - c'y, pobj = (1/2)y'Qy - c'y
-    # For min: actual obj = c_moi'x = -c_int'x = -(sol.pobj when Q=0)
-    # But pobj already accounts for the sign.
-    # Actually: pobj = (1/2)y'Qy - c_int'y
-    # For min c_moi'x: c_int = -c_moi, so pobj = -(-c_moi)'y = c_moi'y ← correct
-    # For max c_moi'x: c_int = c_moi, so pobj = -(c_moi)'y = -c_moi'y ← need to negate
+    # pobj = (1/2)y'Qy - c_int'y
+    # MIN: c_int = -c_moi → pobj = c_moi'y (correct)
+    # MAX: c_int = c_moi  → pobj = -c_moi'y (negate)
     val = model.sol.pobj
     if model.max_sense
         val = -val
@@ -372,22 +411,81 @@ function MOI.get(
     return model.sol.y[vi.value]
 end
 
+# ConstraintPrimal: return f(x) for constraint f(x) ∈ S
+#
+# Inequality constraints use sol.s (cone slack: s = A_int*y - b_int).
+#   Nonneg/SOC/PSD: f(x) = s           (sign=+1, offset=0)
+#   Nonpositive:    f(x) = -s          (sign=-1, offset=0)
+#   GreaterThan(L): f(x) = s + L       (sign=+1, offset=L)
+#   LessThan(U):    f(x) = U - s       (sign=-1, offset=U)
+# General formula: f(x) = sign * s + offset
+#
+# Equality constraints are approximately satisfied:
+#   Zeros:       f(x) ≈ 0    (offset=0)
+#   EqualTo(r):  f(x) ≈ r    (offset=r)
+function MOI.get(
+    model::Optimizer,
+    attr::MOI.ConstraintPrimal,
+    ci::MOI.ConstraintIndex,
+)
+    MOI.check_result_index_bounds(model, attr)
+    for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
+        if ci_stored == ci
+            if model.eq_is_scalar[i]
+                return model.eq_offset[i]
+            else
+                return zeros(length(rows))
+            end
+        end
+    end
+    for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
+        if ci_stored == ci
+            sgn = model.ineq_sign[i]
+            off = model.ineq_offset[i]
+            if model.ineq_is_scalar[i]
+                return sgn * model.sol.s[rows[1]] + off
+            else
+                return Vector(sgn .* model.sol.s[rows])
+            end
+        end
+    end
+    error("Constraint index $ci not found")
+end
+
+# ConstraintDual: return MOI dual for constraint f(x) ∈ S
+#
+# The solver's v ∈ K* satisfies: Qy - c_int + A_int'v + G'w = 0
+# For sets mapped with sign flip (Nonpositive, LessThan), the MOI dual
+# is negated relative to v. For MAX_SENSE, all duals are negated.
+# Formula: dual = sign * sense_sign * v  (ineq)
+#          dual = sense_sign * w         (eq)
 function MOI.get(
     model::Optimizer,
     attr::MOI.ConstraintDual,
     ci::MOI.ConstraintIndex,
 )
     MOI.check_result_index_bounds(model, attr)
-    # Check equality constraints
-    for (ci_stored, rows) in model.eq_ci_map
+    # The KKT stationarity is Qy - c + G'w - A'v = 0, so:
+    #   eq_dual = -w    (sign from -A' in KKT)
+    #   ineq_dual = ineq_sign * v   (ineq_sign accounts for Nonpos/LessThan flip)
+    # The conic dual convention is sense-independent (dual ∈ S*).
+    for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
         if ci_stored == ci
-            return model.sol.w[rows]
+            if model.eq_is_scalar[i]
+                return -model.sol.w[rows[1]]
+            else
+                return Vector(-1.0 .* model.sol.w[rows])
+            end
         end
     end
-    # Check inequality constraints
-    for (ci_stored, rows) in model.ineq_ci_map
+    for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
         if ci_stored == ci
-            return model.sol.v[rows]
+            sgn = model.ineq_sign[i]
+            if model.ineq_is_scalar[i]
+                return sgn * model.sol.v[rows[1]]
+            else
+                return Vector(sgn .* model.sol.v[rows])
+            end
         end
     end
     error("Constraint index $ci not found")
@@ -395,4 +493,29 @@ end
 
 function MOI.get(model::Optimizer, ::MOI.NumberOfVariables)
     return model.n
+end
+
+MOI.supports(::Optimizer, ::MOI.SolveTimeSec) = true
+MOI.get(model::Optimizer, ::MOI.SolveTimeSec) = model.solve_time
+
+MOI.supports(::Optimizer, ::MOI.ObjectiveBound) = true
+function MOI.get(model::Optimizer, ::MOI.ObjectiveBound)
+    if model.sol === nothing
+        return model.max_sense ? -Inf : Inf
+    end
+    val = model.sol.dobj
+    if model.max_sense
+        val = -val
+    end
+    return val + model.objective_constant
+end
+
+MOI.supports(::Optimizer, ::MOI.DualObjectiveValue) = true
+function MOI.get(model::Optimizer, attr::MOI.DualObjectiveValue)
+    MOI.check_result_index_bounds(model, attr)
+    val = model.sol.dobj
+    if model.max_sense
+        val = -val
+    end
+    return val + model.objective_constant
 end

@@ -678,6 +678,68 @@ end
     #  MathOptInterface Tests
     # ──────────────────────────────────────────────────────────────
 
+    @testset "MOI.Test" begin
+        import MathOptInterface as MOI
+
+        optimizer = MOI.Utilities.CachingOptimizer(
+            MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
+            ConicIP.Optimizer(optTol = 1e-6),
+        )
+        config = MOI.Test.Config(
+            atol = 1e-3,
+            rtol = 1e-3,
+            optimal_status = MOI.OPTIMAL,
+        )
+        MOI.Test.runtests(optimizer, config;
+            exclude = [
+                # No quadratic objective support
+                r"test_quadratic_",
+                # Continuous solver — no integer/binary variables
+                r"_Integer_",
+                r"_ZeroOne_",
+                r"test_variable_solve_with_upperbound",
+                r"test_variable_solve_with_lowerbound",
+                # No Interval set support
+                r"_Interval_",
+                # Indicator constraints require integer variables
+                r"test_linear_Indicator_",
+                # No SOS constraint support
+                r"test_SOS",
+                # No mixed-integer support
+                r"test_Semicontinuous",
+                r"test_Semiinteger",
+                # No nonlinear support
+                r"test_vector_nonlinear",
+                # Interior-point solver — no simplex basis
+                r"BasisStatus",
+                # These integration tests query BasisStatus internally;
+                # the UniversalFallback claims support, but the inner
+                # IPM solver has no basis information and throws.
+                r"^test_linear_add_constraints$",
+                r"^test_linear_inactive_bounds$",
+                r"^test_linear_integration_2$",
+                r"^test_linear_integration_delete_variables$",
+                # Wrapper uses CachingOptimizer, not direct copy_to
+                r"test_model_copy_to",
+                # Certificate normalization / infeasibility detection
+                r"test_infeasible_",
+                r"test_unbounded_",
+                r"test_linear_INFEASIBLE",
+                r"test_linear_DUAL_INFEASIBLE",
+                r"test_linear_FEASIBILITY_SENSE",
+                r"test_solve_DualStatus_INFEASIBILITY_CERTIFICATE",
+                r"test_solve_TerminationStatus_DUAL_INFEASIBLE",
+                # ObjectiveBound tests with integer variables (solver sees LP relaxation)
+                r"test_solve_ObjectiveBound_.*_IP$",
+                # SOC unboundedness edge cases
+                r"test_conic_SecondOrderCone_negative_post_bound",
+                r"test_conic_SecondOrderCone_no_initial_bound",
+                # √2 off-diagonal scaling convention mismatch
+                r"test_conic_PositiveSemidefiniteConeTriangle",
+            ],
+        )
+    end
+
     @testset "MOI wrapper" begin
         import MathOptInterface as MOI
 
