@@ -25,10 +25,13 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     eq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
     eq_offset::Vector{Float64}     # 0 for Zeros, rhs for EqualTo
     eq_is_scalar::Vector{Bool}
+    eq_G::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # equality constraint matrix
+    eq_d::Vector{Float64}                                 # equality constraint RHS
     ineq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
     ineq_sign::Vector{Float64}     # +1 or -1 (Nonpositive/LessThan flip)
     ineq_offset::Vector{Float64}   # 0 for vector, lower/upper for scalar
     ineq_is_scalar::Vector{Bool}
+    ineq_is_psd::Vector{Bool}     # true for PSD constraints (√2 scaling)
     # Timing
     solve_time::Float64
     # Solver options
@@ -40,8 +43,8 @@ end
 function Optimizer(; verbose::Bool = false, optTol::Float64 = 1e-6, maxIters::Int = 100)
     return Optimizer(
         nothing, false, 0.0, 0,
-        Pair{Any, UnitRange{Int}}[], Float64[], Bool[],
-        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[],
+        Pair{Any, UnitRange{Int}}[], Float64[], Bool[], nothing, Float64[],
+        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[], Bool[],
         NaN,
         verbose, optTol, maxIters,
     )
@@ -56,10 +59,13 @@ function MOI.empty!(model::Optimizer)
     empty!(model.eq_ci_map)
     empty!(model.eq_offset)
     empty!(model.eq_is_scalar)
+    model.eq_G = nothing
+    empty!(model.eq_d)
     empty!(model.ineq_ci_map)
     empty!(model.ineq_sign)
     empty!(model.ineq_offset)
     empty!(model.ineq_is_scalar)
+    empty!(model.ineq_is_psd)
 end
 
 function MOI.is_empty(model::Optimizer)
@@ -154,6 +160,70 @@ function _extract_scalar_constraint(f, n)
 end
 
 # ──────────────────────────────────────────────────────────────
+#  PSD triangle reordering + √2 scaling helpers
+#
+#  MOI uses column-major upper triangle:  (1,1),(1,2),(2,2),(1,3),(2,3),(3,3),…
+#  ConicIP vecm uses row-major upper triangle: (1,1),(1,2),(1,3),(2,2),(2,3),(3,3),…
+#  Additionally, vecm scales off-diagonal entries by √2.
+# ──────────────────────────────────────────────────────────────
+
+"""
+Return `(perm, is_offdiag)` where `perm[moi_k]` is the vecm position
+for MOI triangle position `moi_k`, and `is_offdiag[moi_k]` is true
+when position `moi_k` corresponds to an off-diagonal entry.
+"""
+function _psd_moi_vecm_info(d::Int)
+    n = round(Int, (sqrt(1 + 8*d) - 1) / 2)
+    perm = zeros(Int, d)
+    is_offdiag = falses(d)
+    moi_k = 0
+    for j in 1:n          # MOI: column-major
+        for i in 1:j
+            moi_k += 1
+            # vecm position for (i,j) in row-major upper triangle
+            before_i = (i - 1) * n - (i - 1) * (i - 2) ÷ 2
+            vecm_k = before_i + (j - i + 1)
+            perm[moi_k] = vecm_k
+            is_offdiag[moi_k] = (i != j)
+        end
+    end
+    return perm, is_offdiag
+end
+
+"""
+Reorder rows of `Ai` and entries of `bi` from MOI triangle order to vecm
+order, and scale off-diagonal rows by √2.
+"""
+function _psd_scale_input!(Ai::SparseMatrixCSC, bi::Vector{Float64}, dim::Int)
+    perm, is_offdiag = _psd_moi_vecm_info(dim)
+    Ai_copy = copy(Ai)
+    bi_copy = copy(bi)
+    s2 = √2
+    for moi_k in 1:dim
+        vecm_k = perm[moi_k]
+        scale = is_offdiag[moi_k] ? s2 : 1.0
+        Ai[vecm_k, :] = scale * Ai_copy[moi_k, :]
+        bi[vecm_k] = scale * bi_copy[moi_k]
+    end
+end
+
+"""
+Convert a vector from vecm order (solver convention) to MOI triangle order,
+dividing off-diagonal entries by √2.
+"""
+function _psd_vecm_to_moi(x::AbstractVector)
+    d = length(x)
+    perm, is_offdiag = _psd_moi_vecm_info(d)
+    out = similar(x, Float64)
+    s2inv = 1 / √2
+    for moi_k in 1:d
+        vecm_k = perm[moi_k]
+        out[moi_k] = is_offdiag[moi_k] ? s2inv * x[vecm_k] : x[vecm_k]
+    end
+    return out
+end
+
+# ──────────────────────────────────────────────────────────────
 #  optimize!
 # ──────────────────────────────────────────────────────────────
 
@@ -226,6 +296,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(dest.ineq_sign, 1.0)
                     push!(dest.ineq_offset, 0.0)
                     push!(dest.ineq_is_scalar, false)
+                    push!(dest.ineq_is_psd, false)
                     ineq_row += dim
                 elseif S <: MOI.Nonpositives
                     # Ai*x + bi ≤ 0 → -Ai*x - bi ≥ 0 → A_int = -Ai, b_int = bi
@@ -236,6 +307,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(dest.ineq_sign, -1.0)
                     push!(dest.ineq_offset, 0.0)
                     push!(dest.ineq_is_scalar, false)
+                    push!(dest.ineq_is_psd, false)
                     ineq_row += dim
                 elseif S <: MOI.SecondOrderCone
                     push!(A_rows, Ai)
@@ -245,8 +317,11 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(dest.ineq_sign, 1.0)
                     push!(dest.ineq_offset, 0.0)
                     push!(dest.ineq_is_scalar, false)
+                    push!(dest.ineq_is_psd, false)
                     ineq_row += dim
                 elseif S <: MOI.PositiveSemidefiniteConeTriangle
+                    # MOI uses unscaled triangle; solver uses vecm (√2 off-diag)
+                    _psd_scale_input!(Ai, bi, dim)
                     push!(A_rows, Ai)
                     append!(b_vals, -bi)
                     push!(cone_dims, ("S", dim))
@@ -254,6 +329,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(dest.ineq_sign, 1.0)
                     push!(dest.ineq_offset, 0.0)
                     push!(dest.ineq_is_scalar, false)
+                    push!(dest.ineq_is_psd, true)
                     ineq_row += dim
                 end
 
@@ -279,6 +355,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(dest.ineq_sign, 1.0)
                     push!(dest.ineq_offset, lower)
                     push!(dest.ineq_is_scalar, true)
+                    push!(dest.ineq_is_psd, false)
                     ineq_row += 1
                 elseif S <: MOI.LessThan{Float64}
                     # Ai*x + bi ≤ upper → upper - Ai*x - bi ≥ 0
@@ -291,6 +368,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     push!(dest.ineq_sign, -1.0)
                     push!(dest.ineq_offset, upper)
                     push!(dest.ineq_is_scalar, true)
+                    push!(dest.ineq_is_psd, false)
                     ineq_row += 1
                 end
             end
@@ -305,6 +383,8 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         G = sparse(vcat(G_rows...))
         d = Float64.(d_vals)
     end
+    dest.eq_G = G
+    dest.eq_d = d
 
     if isempty(A_rows)
         A = spzeros(0, n)
@@ -431,10 +511,12 @@ function MOI.get(
     MOI.check_result_index_bounds(model, attr)
     for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
         if ci_stored == ci
+            # f(x) = G[rows,:]*y - d[rows] + offset
+            residual = model.eq_G[rows, :] * model.sol.y - model.eq_d[rows]
             if model.eq_is_scalar[i]
-                return model.eq_offset[i]
+                return residual[1] + model.eq_offset[i]
             else
-                return zeros(length(rows))
+                return Vector(residual)
             end
         end
     end
@@ -445,7 +527,11 @@ function MOI.get(
             if model.ineq_is_scalar[i]
                 return sgn * model.sol.s[rows[1]] + off
             else
-                return Vector(sgn .* model.sol.s[rows])
+                val = Vector(sgn .* model.sol.s[rows])
+                if model.ineq_is_psd[i]
+                    return _psd_vecm_to_moi(val)
+                end
+                return val
             end
         end
     end
@@ -484,7 +570,11 @@ function MOI.get(
             if model.ineq_is_scalar[i]
                 return sgn * model.sol.v[rows[1]]
             else
-                return Vector(sgn .* model.sol.v[rows])
+                val = Vector(sgn .* model.sol.v[rows])
+                if model.ineq_is_psd[i]
+                    return _psd_vecm_to_moi(val)
+                end
+                return val
             end
         end
     end

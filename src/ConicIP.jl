@@ -725,7 +725,7 @@ function conicIP(
   #  Iterate Loop
   # ────────────────────────────────────────────────────────────
 
-  sol     = Solution(z.y, z.w, z.v, z.s, :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
+  sol     = Solution(copy(z.y), copy(z.w), copy(z.v), copy(z.s), :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
   optBest = Inf
   rStep   = 0
   rnorm   = 0
@@ -767,18 +767,16 @@ function conicIP(
     rPr = normsafe(r0.v)/(1+normb)
     rCp = normsafe(r0.s)/(1+abs(cᵀy));
 
-    if max(rDu, rPr, rCp) < optBest
-      sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v
-      sol.Iter = Iter; sol.Mu = μ;
-      sol.duFeas = rDu; sol.prFeas = rPr; sol.muFeas = rCp
-      optBest = max(rDu, rPr, rCp)
-    end
-
     pobj = 0.5*dot(z.y, Q*z.y) - dot(c, z.y)
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
 
-    sol.pobj = pobj
-    sol.dobj = dobj
+    if max(rDu, rPr, rCp) < optBest
+      sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v; sol.s[:] = z.s
+      sol.Iter = Iter; sol.Mu = μ;
+      sol.duFeas = rDu; sol.prFeas = rPr; sol.muFeas = rCp
+      sol.pobj = pobj; sol.dobj = dobj
+      optBest = max(rDu, rPr, rCp)
+    end
 
     # ────────────────────────────────────────────────────────────
     # Convergence Checks (on previous iterate)
