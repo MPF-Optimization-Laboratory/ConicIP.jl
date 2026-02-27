@@ -681,14 +681,21 @@ end
     @testset "MOI.Test" begin
         import MathOptInterface as MOI
 
-        optimizer = MOI.Utilities.CachingOptimizer(
-            MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
-            ConicIP.Optimizer(optTol = 1e-6),
+        optimizer = MOI.Bridges.full_bridge_optimizer(
+            MOI.Utilities.CachingOptimizer(
+                MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
+                ConicIP.Optimizer(optTol = 1e-8),
+            ),
+            Float64,
         )
         config = MOI.Test.Config(
-            atol = 1e-3,
-            rtol = 1e-3,
+            atol = 1e-4,
+            rtol = 1e-4,
             optimal_status = MOI.OPTIMAL,
+            exclude = Any[
+                MOI.VariableBasisStatus,
+                MOI.ConstraintBasisStatus,
+            ],
         )
         MOI.Test.runtests(optimizer, config;
             exclude = [
@@ -699,8 +706,6 @@ end
                 r"_ZeroOne_",
                 r"test_variable_solve_with_upperbound",
                 r"test_variable_solve_with_lowerbound",
-                # No Interval set support
-                r"_Interval_",
                 # Indicator constraints require integer variables
                 r"test_linear_Indicator_",
                 # No SOS constraint support
@@ -710,15 +715,6 @@ end
                 r"test_Semiinteger",
                 # No nonlinear support
                 r"test_vector_nonlinear",
-                # Interior-point solver — no simplex basis
-                r"BasisStatus",
-                # These integration tests query BasisStatus internally;
-                # the UniversalFallback claims support, but the inner
-                # IPM solver has no basis information and throws.
-                r"^test_linear_add_constraints$",
-                r"^test_linear_inactive_bounds$",
-                r"^test_linear_integration_2$",
-                r"^test_linear_integration_delete_variables$",
                 # Wrapper uses CachingOptimizer, not direct copy_to
                 r"test_model_copy_to",
                 # Certificate normalization / infeasibility detection
@@ -729,14 +725,14 @@ end
                 r"test_linear_FEASIBILITY_SENSE",
                 r"test_solve_DualStatus_INFEASIBILITY_CERTIFICATE",
                 r"test_solve_TerminationStatus_DUAL_INFEASIBLE",
-                # ObjectiveBound tests with integer variables (solver sees LP relaxation)
+                # ObjectiveBound tests with integer variables
                 r"test_solve_ObjectiveBound_.*_IP$",
-                # SOC unboundedness edge cases
+                # SOC/conic unboundedness/infeasibility edge cases
                 r"test_conic_SecondOrderCone_negative_post_bound",
                 r"test_conic_SecondOrderCone_no_initial_bound",
-                # √2 off-diagonal scaling convention mismatch
-                r"test_conic_PositiveSemidefiniteConeTriangle",
+                r"test_conic_RotatedSecondOrderCone_INFEASIBLE_2",
             ],
+            exclude_tests_after = v"1.49.0",
         )
     end
 
