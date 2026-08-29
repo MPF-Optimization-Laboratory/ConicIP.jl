@@ -428,13 +428,22 @@ end
             G = [G; G]
             d = [1.0; -1.0]
 
-            ystatus = preprocess_conicIP(H, H * c,
-                                         A, b, [("R", n)],
-                                         G, d,
-                                         kktsolver = kktsolver,
-                                         optTol = optTol).status
+            sol = preprocess_conicIP(H, H * c,
+                                     A, b, [("R", n)],
+                                     G, d,
+                                     kktsolver = kktsolver,
+                                     optTol = optTol)
 
-            @test ystatus == :Infeasible
+            @test sol.status == :Infeasible
+
+            # The preprocessor trims G to an independent row set, but the ray
+            # it returns must certify the ORIGINAL system.
+            @test sol.has_certificate
+            chk, _, _ = ConicIP.validate_infeasibility_certificate(
+                H, H * c, A, b, [("R", n)], G, d, sol.w, sol.v;
+                abstol = 1e-9, reltol = 1e-7)
+            @test chk.valid
+            @test abs(dot(d, sol.w) - dot(b, sol.v) + 1) < 1e-6
 
         end
 
@@ -456,6 +465,16 @@ end
                           optTol = optTol)
 
             @test sol.status == :Infeasible
+
+            # No equality block here: G/d are empty, so dᵀw̄ drops out and the
+            # normalization identity reduces to -bᵀv̄ = -1.
+            G = zeros(0, n); d = zeros(0)
+            @test sol.has_certificate
+            chk, _, _ = ConicIP.validate_infeasibility_certificate(
+                H, H * c, A, b, [("R", 2 * n)], G, d, sol.w, sol.v;
+                abstol = 1e-9, reltol = 1e-7)
+            @test chk.valid
+            @test abs(dot(d, sol.w) - dot(b, sol.v) + 1) < 1e-6
 
         end
 
@@ -482,6 +501,13 @@ end
 
             @test sol.status == :Infeasible
 
+            @test sol.has_certificate
+            chk, _, _ = ConicIP.validate_infeasibility_certificate(
+                H, H * c, A, b, [("R", n)], G, d, sol.w, sol.v;
+                abstol = 1e-9, reltol = 1e-7)
+            @test chk.valid
+            @test abs(dot(d, sol.w) - dot(b, sol.v) + 1) < 1e-6
+
         end
 
         @testset "Unbounded ($(nameof(typeof(kktsolver))))" begin
@@ -501,6 +527,15 @@ end
                           optTol = optTol)
 
             @test sol.status == :Unbounded
+
+            # Recession ray: Qȳ ≈ 0, Gȳ ≈ 0 (G empty), Aȳ ∈ K, cᵀȳ = +1.
+            G = zeros(0, n); d = zeros(0)
+            @test sol.has_certificate
+            chk, _ = ConicIP.validate_unboundedness_certificate(
+                H, c, A, b, [("R", n)], G, d, sol.y;
+                abstol = 1e-9, reltol = 1e-7)
+            @test chk.valid
+            @test abs(dot(c, sol.y) - 1) < 1e-6
 
         end
 
@@ -613,6 +648,14 @@ end
                               data.G, data.d,
                               verbose = true, kktsolver = kktsolver)
                 @test sol.status == :Infeasible
+
+                @test sol.has_certificate
+                chk, _, _ = ConicIP.validate_infeasibility_certificate(
+                    data.Q, data.c, data.A, data.b, data.cone_dims,
+                    data.G, data.d, sol.w, sol.v;
+                    abstol = 1e-9, reltol = 1e-7)
+                @test chk.valid
+                @test abs(dot(data.d, sol.w) - dot(data.b, sol.v) + 1) < 1e-6
             end
 
             @testset "Miles Problem 3 - Scaling" begin
@@ -1000,6 +1043,317 @@ end
     end
 
     # ──────────────────────────────────────────────────────────────
+    #  Infeasibility soundness (adversarial)
+    #
+    #  A sound solver never claims :Infeasible or :Unbounded on a
+    #  problem that is neither. These cases sit *deliberately* close to
+    #  the boundary: nearly-empty feasible sets, nearly-flat objectives,
+    #  degenerate constraint blocks, and poisoned data. Each asserts the
+    #  claim that must NOT be made, and — where a claim is legitimately
+    #  made — re-validates the ray against the original data.
+    # ──────────────────────────────────────────────────────────────
+
+    @testset "Infeasibility soundness" begin
+
+        no_eq(n) = (zeros(0, n), zeros(0))
+
+        @testset "(a) ε-feasible box is Optimal, never Infeasible" begin
+            # 0 ≤ x ≤ ε with ε = 1e-9. The feasible set is a sliver, and the
+            # Farkas screen is *almost* satisfied — but the set is nonempty,
+            # so :Infeasible would be unsound.
+            ε = 1e-9
+            for n in (1, 5)
+                A = [sparse(1.0I, n, n); -sparse(1.0I, n, n)]
+                b = [zeros(n); fill(-ε, n)]
+                K = [("R", 2n)]
+                for c in (ones(n), zeros(n))
+                    sol = conicIP(zeros(n, n), c, A, b, K, verbose = false)
+                    @test sol.status == :Optimal
+                    @test !sol.has_certificate
+                    # Recovered point really is in the sliver
+                    @test minimum(sol.y) > -1e-7
+                    @test maximum(sol.y) < ε + 1e-7
+                end
+            end
+
+            # And no Farkas ray exists for it: the fallback must decline.
+            A = sparse([1.0; -1.0][:, :]); b = [0.0, -ε]
+            @test ConicIP.fallback_infeasibility_ray(
+                zeros(1, 1), [1.0], A, b, [("R", 2)], no_eq(1)...) === nothing
+        end
+
+        @testset "(b) tiny-Q recession-like problem" begin
+            # min ½εx² - x  s.t.  x ≥ 0.  Bounded for every ε > 0 (optimum
+            # x* = 1/ε), but as ε ↓ 0 the problem tends to an unbounded LP.
+            #
+            # FINDING: the recession validator's residual test is
+            #   ‖Qȳ‖ ≤ abstol + reltol·(1 + ‖ȳ‖),
+            # which is absolute in the data scale, *not* relative to ‖Q‖. So a
+            # curvature below ≈ infeasTol reads as flat and the ray is accepted.
+            # The flip is exactly at ε ≈ infeasTol = 1e-7, verified by sweep.
+            mk(ε) = (reshape([ε], 1, 1), [1.0],
+                     sparse(reshape([1.0], 1, 1)), [0.0], [("R", 1)])
+
+            # Above the tolerance the solver must NOT claim a ray.
+            for ε in (1e-6, 1e-4, 1e-2)
+                (Q, c, A, b, K) = mk(ε)
+                sol = conicIP(Q, c, A, b, K, verbose = false)
+                @test sol.status == :Optimal
+                @test !sol.has_certificate
+                @test sol.y[1] ≈ 1/ε rtol=1e-4
+            end
+
+            # At ε = 1e-12 the claim IS made. Two things must still hold:
+            # the claim is never :Unbounded-without-a-ray, and the ray it
+            # carries genuinely satisfies the validator's own contract
+            # against the original data — i.e. the tolerance is the only
+            # thing being traded, not the soundness argument.
+            (Q, c, A, b, K) = mk(1e-12)
+            sol = conicIP(Q, c, A, b, K, verbose = false)
+            @test sol.status == :Unbounded
+            @test sol.has_certificate
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                Q, c, A, b, K, no_eq(1)..., sol.y;
+                abstol = 1e-9, reltol = 1e-7)
+            @test chk.valid
+            @test abs(dot(c, sol.y) - 1) < 1e-6
+            @test norm(Q * sol.y) <= 1e-9 + 1e-7 * (1 + norm(sol.y))
+
+            # Tightening infeasTol below the curvature restores :Optimal,
+            # which pins the cause to the tolerance rather than to a bug.
+            sol = conicIP(Q, c, A, b, K, verbose = false,
+                          infeasTol = 1e-14, infeasAbsTol = 1e-16)
+            @test sol.status == :Optimal
+            @test !sol.has_certificate
+            @test sol.y[1] ≈ 1e12 rtol=1e-4
+        end
+
+        @testset "(c) degenerate constraint blocks" begin
+            # Empty A (no cone rows): infeasibility lives entirely in the
+            # equalities, x = 1 and x = 2. G has more rows than columns, so
+            # the raw KKT factorization cannot be formed — this is the
+            # preprocessor's path, and it must still produce a ray.
+            Q = zeros(1, 1); c = [0.0]
+            A = spzeros(0, 1); b = zeros(0)
+            G = reshape([1.0; 1.0], 2, 1); d = [1.0, 2.0]
+            K = Tuple{String,Int}[]
+
+            for kktsolver = (ConicIP.kktsolver_qr,
+                             ConicIP.kktsolver_sparse,
+                             pivot(ConicIP.kktsolver_2x2))
+                sol = preprocess_conicIP(Q, c, A, b, K, G, d;
+                                         verbose = false, kktsolver = kktsolver)
+                @test sol.status == :Infeasible
+                @test sol.has_certificate
+                (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                    Q, c, A, b, K, G, d, sol.w, sol.v;
+                    abstol = 1e-9, reltol = 1e-7)
+                @test chk.valid
+                @test abs(dot(d, sol.w) - dot(b, sol.v) + 1) < 1e-6
+                @test isempty(sol.v)
+            end
+
+            # Empty G (no equalities): infeasibility lives entirely in the
+            # cone rows, x ≥ 1 and -x ≥ 1.
+            A2 = sparse([1.0; -1.0][:, :]); b2 = [1.0, 1.0]; K2 = [("R", 2)]
+            sol = conicIP(Q, c, A2, b2, K2, verbose = false)
+            @test sol.status == :Infeasible
+            @test sol.has_certificate
+            @test isempty(sol.w)
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Q, c, A2, b2, K2, no_eq(1)..., sol.w, sol.v;
+                abstol = 1e-9, reltol = 1e-7)
+            @test chk.valid
+            @test abs(-dot(b2, sol.v) + 1) < 1e-6
+            @test ConicIP.cone_margin(sol.v, K2) >= -1e-6
+        end
+
+        @testset "(d) NaN/Inf data never yields a certificate" begin
+            # Poisoned data must not be laundered into a verdict. Which of
+            # the two failure modes fires depends on the KKT solver: the
+            # dense/sparse paths propagate NaN into the residuals and exit
+            # :Error, while the 2x2 pivot path raises SingularException from
+            # the factorization. Both are acceptable; a certificate is not.
+            A = sparse(1.0I, 2, 2); K = [("R", 2)]
+            poisoned = [([NaN, 0.0], [1.0, 1.0]),
+                        ([Inf, 0.0], [1.0, 1.0]),
+                        ([0.0, 0.0], [NaN, 1.0]),
+                        ([0.0, 0.0], [Inf, 1.0])]
+
+            for kktsolver = (ConicIP.kktsolver_qr,
+                             ConicIP.kktsolver_sparse,
+                             pivot(ConicIP.kktsolver_2x2))
+                for (b, c) in poisoned
+                    local sol = nothing
+                    threw = false
+                    try
+                        sol = conicIP(zeros(2, 2), c, A, b, K;
+                                      verbose = false, maxIters = 20,
+                                      kktsolver = kktsolver)
+                    catch
+                        threw = true
+                    end
+                    @test threw || sol.status ∉ (:Optimal, :Infeasible, :Unbounded)
+                    @test threw || !sol.has_certificate
+                end
+            end
+
+            # The validators themselves reject nonfinite candidates outright.
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                zeros(1, 1), [0.0], sparse(reshape([1.0], 1, 1)), [1.0],
+                [("R", 1)], no_eq(1)..., Float64[], [NaN];
+                abstol = 1e-9, reltol = 1e-7)
+            @test !chk.valid
+            @test !chk.finite
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                zeros(1, 1), [1.0], sparse(reshape([1.0], 1, 1)), [0.0],
+                [("R", 1)], no_eq(1)..., [Inf];
+                abstol = 1e-9, reltol = 1e-7)
+            @test !chk.valid
+            @test !chk.finite
+        end
+
+        @testset "(e) SOC infeasible — ray lies in the cone" begin
+            # Variables (t, x, y): ‖(x,y)‖ ≤ t together with t ≤ -1.
+            # The Farkas ray v must itself be in K = Q³ × R₊, so its
+            # cone margin is the thing to check.
+            Q = zeros(3, 3); c = zeros(3)
+            A = sparse([1.0 0.0 0.0
+                        0.0 1.0 0.0
+                        0.0 0.0 1.0
+                       -1.0 0.0 0.0])
+            b = [0.0, 0.0, 0.0, 1.0]
+            K = [("Q", 3), ("R", 1)]
+
+            for kktsolver = (ConicIP.kktsolver_qr,
+                             ConicIP.kktsolver_sparse,
+                             pivot(ConicIP.kktsolver_2x2))
+                sol = conicIP(Q, c, A, b, K; verbose = false, kktsolver = kktsolver)
+                @test sol.status == :Infeasible
+                @test sol.has_certificate
+                @test ConicIP.cone_margin(sol.v, K) >= -1e-6
+                (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                    Q, c, A, b, K, no_eq(3)..., sol.w, sol.v;
+                    abstol = 1e-9, reltol = 1e-7)
+                @test chk.valid
+                @test abs(-dot(b, sol.v) + 1) < 1e-6
+            end
+
+            # Boundary-hugging variant: (t,x) ∈ Q², t ≤ 0, x ≥ 1 forces the
+            # ray onto the SOC boundary, where cone_margin ≈ 0 from above.
+            A2 = sparse([1.0 0.0; 0.0 1.0; -1.0 0.0; 0.0 1.0])
+            b2 = [0.0, 0.0, 0.0, 1.0]
+            K2 = [("Q", 2), ("R", 2)]
+            sol = conicIP(zeros(2, 2), zeros(2), A2, b2, K2, verbose = false)
+            @test sol.status == :Infeasible
+            @test sol.has_certificate
+            @test ConicIP.cone_margin(sol.v, K2) >= -1e-6
+            @test ConicIP.cone_margin(sol.v, K2) < 1e-3   # genuinely on the boundary
+        end
+
+        @testset "(f) near-optimal and near-certificate — Optimal wins" begin
+            # c = 0 makes every feasible point optimal, so the recession
+            # screen (cᵀy > 0) can never fire; meanwhile the feasible set
+            # collapses to a point, so the Farkas screen is nearly satisfied.
+            # Precedence in the termination block puts optimality first.
+
+            # Feasible set is exactly {0}: x ≥ 0 and -x ≥ 0.
+            A = sparse([1.0; -1.0][:, :]); K = [("R", 2)]
+            sol = conicIP(zeros(1, 1), [0.0], A, [0.0, 0.0], K, verbose = false)
+            @test sol.status == :Optimal
+            @test !sol.has_certificate
+            @test abs(sol.y[1]) < 1e-6
+
+            # Feasible set shrinks to a 1e-10 interval.
+            sol = conicIP(zeros(1, 1), [0.0], A, [0.0, -1e-10], K, verbose = false)
+            @test sol.status == :Optimal
+            @test !sol.has_certificate
+
+            # Same, pinned by equalities instead of a cone.
+            G = Matrix(1.0I, 2, 2); d = zeros(2)
+            sol = conicIP(zeros(2, 2), zeros(2), sparse(1.0I, 2, 2), zeros(2),
+                          [("R", 2)], G, d, verbose = false)
+            @test sol.status == :Optimal
+            @test !sol.has_certificate
+            @test norm(sol.y) < 1e-6
+        end
+
+        @testset "(g) MOI ray getters ignore constants" begin
+            import MathOptInterface as MOI
+            saf(terms, k) = MOI.ScalarAffineFunction(
+                [MOI.ScalarAffineTerm(a, v) for (a, v) in terms], k)
+
+            # ── Infeasible variant ──
+            # min x + 11  s.t.  x + 3 ≥ 4,  x + 3 ≤ 2.
+            # The objective constant 11 and the offsets 3 must not appear in
+            # DualObjectiveValue / ObjectiveBound: a ray is a direction.
+            for (sense, want) in ((MOI.MIN_SENSE, 1.0), (MOI.MAX_SENSE, -1.0))
+                src = MOI.Utilities.Model{Float64}()
+                x = MOI.add_variable(src)
+                MOI.set(src, MOI.ObjectiveSense(), sense)
+                MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                    saf([(1.0, x)], 11.0))
+                c_lo = MOI.add_constraint(src, saf([(1.0, x)], 3.0), MOI.GreaterThan(4.0))
+                c_hi = MOI.add_constraint(src, saf([(1.0, x)], 3.0), MOI.LessThan(2.0))
+
+                opt = ConicIP.Optimizer()
+                index_map, _ = MOI.optimize!(opt, src)
+
+                @test MOI.get(opt, MOI.TerminationStatus()) == MOI.INFEASIBLE
+                @test opt.sol.has_certificate
+                @test opt.objective_constant == 11.0
+                @test MOI.get(opt, MOI.ResultCount()) == 1
+                @test MOI.get(opt, MOI.DualStatus()) == MOI.INFEASIBILITY_CERTIFICATE
+                @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
+
+                # Homogeneous: exactly ±1, with no trace of 11 or 3.
+                @test MOI.get(opt, MOI.DualObjectiveValue()) ≈ want atol=1e-6
+                @test MOI.get(opt, MOI.ObjectiveBound()) ≈ want atol=1e-6
+
+                # Duals are the ray components, summing to zero on x.
+                dl = MOI.get(opt, MOI.ConstraintDual(), index_map[c_lo])
+                dh = MOI.get(opt, MOI.ConstraintDual(), index_map[c_hi])
+                @test dl > 0 && dh < 0
+                @test abs(dl + dh) < 1e-6
+            end
+
+            # ── Unbounded variant ──
+            # min x₁ + 13  s.t.  x₁ + 4 ≤ 9,  x₂ + 6 = 10.
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variables(src, 2)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x[1])], 13.0))
+            c_le = MOI.add_constraint(src, saf([(1.0, x[1])], 4.0), MOI.LessThan(9.0))
+            c_eq = MOI.add_constraint(src, saf([(1.0, x[2])], 6.0), MOI.EqualTo(10.0))
+
+            opt = ConicIP.Optimizer()
+            index_map, _ = MOI.optimize!(opt, src)
+
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.DUAL_INFEASIBLE
+            @test opt.sol.has_certificate
+            @test opt.objective_constant == 13.0
+            @test MOI.get(opt, MOI.ResultCount()) == 1
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.INFEASIBILITY_CERTIFICATE
+            @test MOI.get(opt, MOI.DualStatus()) == MOI.NO_SOLUTION
+
+            # ObjectiveValue drops the constant: -1, not 12.
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ -1.0 atol=1e-6
+
+            # ConstraintPrimal drops both the eq rhs (eq_d = 4) and the
+            # LessThan offset (ineq_offset = 9): the homogeneous part only.
+            @test MOI.get(opt, MOI.ConstraintPrimal(), index_map[c_le]) ≈ -1.0 atol=1e-6
+            @test abs(MOI.get(opt, MOI.ConstraintPrimal(), index_map[c_eq])) < 1e-6
+
+            # The ray itself: c_intᵀȳ = +1, Gȳ ≈ 0, Aȳ ∈ K.
+            @test dot(opt.c_int, opt.sol.y) ≈ 1.0 atol=1e-6
+            @test norm(opt.eq_G * opt.sol.y) < 1e-6
+            @test minimum(opt.ineq_A * opt.sol.y) > -1e-6
+        end
+
+    end
+
+    # ──────────────────────────────────────────────────────────────
     #  MathOptInterface Tests
     # ──────────────────────────────────────────────────────────────
 
@@ -1042,20 +1396,17 @@ end
                 r"test_vector_nonlinear",
                 # Wrapper uses CachingOptimizer, not direct copy_to
                 r"test_model_copy_to",
-                # Certificate normalization / infeasibility detection
-                r"test_infeasible_",
-                r"test_unbounded_",
-                r"test_linear_INFEASIBLE",
-                r"test_linear_DUAL_INFEASIBLE",
-                r"test_linear_FEASIBILITY_SENSE",
-                r"test_solve_DualStatus_INFEASIBILITY_CERTIFICATE",
-                r"test_solve_TerminationStatus_DUAL_INFEASIBLE",
                 # ObjectiveBound tests with integer variables
                 r"test_solve_ObjectiveBound_.*_IP$",
-                # SOC/conic unboundedness/infeasibility edge cases
-                r"test_conic_SecondOrderCone_negative_post_bound",
-                r"test_conic_SecondOrderCone_no_initial_bound",
-                r"test_conic_RotatedSecondOrderCone_INFEASIBLE_2",
+                #
+                # NOTE (WP6): the ten infeasibility/unboundedness exclusions
+                # that used to live here are gone. With validated certificates
+                # (WP3), ray-aware MOI getters (WP4) and the fallback certificate
+                # solve (WP5), MOI.Test's INFEASIBLE / DUAL_INFEASIBLE /
+                # INFEASIBILITY_CERTIFICATE / FEASIBILITY_SENSE families and the
+                # SOC edge cases all pass unmodified. Do not re-add without a
+                # test-name-specific reason comment.
+                #
                 # ConicIP has no native Interval support, so the bridge
                 # splits Interval bounds and the inner model reports
                 # LowerBoundAlreadySet{GreaterThan,...} instead of
