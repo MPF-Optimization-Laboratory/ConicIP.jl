@@ -62,6 +62,14 @@ ConicIP.validate_infeasibility_certificate
 ConicIP.validate_unboundedness_certificate
 ```
 
+When the iterate loop exhausts with evidence of a ray, the solver can
+recover a certificate by solving an auxiliary min-norm QP:
+
+```@docs
+ConicIP.fallback_infeasibility_ray
+ConicIP.fallback_unbounded_ray
+```
+
 ## JuMP / MathOptInterface
 
 ```@docs
