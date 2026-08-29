@@ -674,6 +674,195 @@ end
         @test !consistent3
     end
 
+    @testset "Certificate validator" begin
+
+        atol = 1e-8; rtol = 1e-8
+
+        @testset "cone_margin" begin
+            # No blocks
+            @test ConicIP.cone_margin(Float64[], Tuple{String,Int}[]) == Inf
+
+            # Nonnegative orthant
+            @test ConicIP.cone_margin([1.0, 2.0], [("R",2)]) ≈ 1.0
+            @test ConicIP.cone_margin([1.0, -0.5], [("R",2)]) ≈ -0.5
+
+            # Second order cone: boundary and just outside
+            @test ConicIP.cone_margin([1.0, 1.0, 0.0], [("Q",3)]) ≈ 0.0 atol=1e-12
+            @test ConicIP.cone_margin([1.0 - 1e-6, 1.0, 0.0], [("Q",3)]) ≈ -1e-6 atol=1e-12
+
+            # PSD cone: vecm of [1 2; 2 1] has eigmin = -1
+            xs = ConicIP.vecm([1.0 2.0; 2.0 1.0])
+            @test length(xs) == 3
+            @test ConicIP.cone_margin(xs, [("S",3)]) ≈ -1.0
+
+            # Mixed blocks take the blockwise minimum
+            @test ConicIP.cone_margin([3.0; 1.0; 1.0; 0.0], [("R",1),("Q",3)]) ≈ 0.0 atol=1e-12
+        end
+
+        @testset "Infeasibility certificate" begin
+            # x >= 1 and -x >= 0  (i.e. x <= 0) is infeasible
+            A = reshape([1.0, -1.0], 2, 1)
+            b = [1.0, 0.0]
+            K = [("R",2)]
+            G = spzeros(0,1); d = Float64[]
+            Qm = zeros(1,1); c = [0.0]
+
+            # Known-good Farkas ray
+            w = Float64[]; v = [1.0, 1.0]
+            (chk, w̄, v̄) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, b, K, G, d, w, v; abstol = atol, reltol = rtol)
+            @test chk.valid
+            @test chk.finite
+            @test chk.separation ≈ 1.0
+            @test chk.farkas_residual ≈ 0.0 atol=1e-12
+            @test chk.cone_margin ≈ 1.0
+            @test v̄ ≈ v
+            @test isempty(w̄)
+
+            # Nonfinite candidate
+            for bad in ([NaN, 1.0], [Inf, 1.0])
+                (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                    Qm, c, A, b, K, G, d, w, bad; abstol = atol, reltol = rtol)
+                @test !chk.finite
+                @test !chk.valid
+            end
+
+            # Nonpositive separation: candidates returned unmodified
+            (chk, w2, v2) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, b, K, G, d, w, -v; abstol = atol, reltol = rtol)
+            @test chk.separation ≈ -1.0
+            @test !chk.valid
+            @test v2 == -v
+
+            # Feasible problem (0 <= x <= 1), Farkas-like candidate: separation < 0
+            bf = [0.0, -1.0]
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, bf, K, G, d, w, [1.0, 1.0]; abstol = atol, reltol = rtol)
+            @test chk.separation < 0
+            @test !chk.valid
+
+            # Small positive separation, residual blows up under normalization
+            bs = [1e-8, 0.0]
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, bs, K, G, d, w, [1.0, 1.0 + 1e-6]; abstol = atol, reltol = rtol)
+            @test chk.separation > 0
+            @test chk.cone_margin > 0          # not a cone violation
+            @test chk.farkas_residual > 1.0    # the linear residual is what fails
+            @test !chk.valid
+        end
+
+        @testset "Infeasibility certificate - cone violation only" begin
+            # A'v = 0 exactly, separation = 1, but v has a negative entry
+            A = reshape([1.0, 1.0], 2, 1)
+            b = [1.0, 0.0]
+            K = [("R",2)]
+            G = spzeros(0,1); d = Float64[]
+            Qm = zeros(1,1); c = [0.0]
+
+            (chk, _, v̄) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, b, K, G, d, Float64[], [1.0, -1.0];
+                abstol = atol, reltol = rtol)
+            @test chk.finite
+            @test chk.separation ≈ 1.0
+            @test chk.farkas_residual ≈ 0.0 atol=1e-12   # residual alone would pass
+            @test chk.cone_margin ≈ -1.0                 # sole failure
+            @test chk.cone_margin < -(atol + rtol)
+            @test !chk.valid
+            @test v̄ ≈ [1.0, -1.0]
+        end
+
+        @testset "Infeasibility certificate - SOC tolerance flip" begin
+            A = zeros(3,3); G = spzeros(0,3); d = Float64[]
+            Qm = zeros(3,3); c = zeros(3)
+            b = [1.0, 0.0, 0.0]
+            K = [("Q",3)]
+
+            # On the boundary of Q: valid
+            (chk1, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, b, K, G, d, Float64[], [1.0, 1.0, 0.0];
+                abstol = atol, reltol = rtol)
+            @test chk1.cone_margin ≈ 0.0 atol=1e-12
+            @test chk1.valid
+
+            # 1e-6 outside Q: verdict flips
+            (chk2, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, b, K, G, d, Float64[], [1.0 - 1e-6, 1.0, 0.0];
+                abstol = atol, reltol = rtol)
+            @test chk2.cone_margin < -(atol + rtol)
+            @test !chk2.valid
+        end
+
+        @testset "Infeasibility certificate - PSD block" begin
+            # v = vecm([1 2; 2 1]) is not PSD (eigmin = -1)
+            A = zeros(3,1); G = spzeros(0,1); d = Float64[]
+            Qm = zeros(1,1); c = [0.0]
+            b = [1.0, 0.0, 0.0]
+            K = [("S",3)]
+            v = ConicIP.vecm([1.0 2.0; 2.0 1.0])
+
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qm, c, A, b, K, G, d, Float64[], v; abstol = atol, reltol = rtol)
+            @test chk.separation ≈ 1.0
+            @test chk.farkas_residual ≈ 0.0 atol=1e-12
+            @test chk.cone_margin ≈ -1.0
+            @test !chk.valid
+        end
+
+        @testset "Unboundedness certificate" begin
+            # min -x  s.t.  x >= 0  is unbounded below
+            Qm = zeros(1,1); c = [1.0]
+            A = ones(1,1); b = [0.0]
+            K = [("R",1)]
+            G = spzeros(0,1); d = Float64[]
+
+            (chk, ȳ) = ConicIP.validate_unboundedness_certificate(
+                Qm, c, A, b, K, G, d, [2.0]; abstol = atol, reltol = rtol)
+            @test chk.valid
+            @test chk.finite
+            @test chk.separation ≈ 2.0
+            @test ȳ ≈ [1.0]
+            @test chk.farkas_residual ≈ 0.0 atol=1e-12
+            @test chk.cone_margin ≈ 1.0
+
+            # Ray leaves the cone
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                Qm, c, -A, b, K, G, d, [2.0]; abstol = atol, reltol = rtol)
+            @test chk.cone_margin ≈ -1.0
+            @test !chk.valid
+
+            # Q*ȳ != 0 : not a recession direction of the objective
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                ones(1,1), c, A, b, K, G, d, [2.0]; abstol = atol, reltol = rtol)
+            @test chk.farkas_residual ≈ 1.0
+            @test !chk.valid
+
+            # Nonpositive separation, candidate returned unmodified
+            (chk, y2) = ConicIP.validate_unboundedness_certificate(
+                Qm, c, A, b, K, G, d, [-2.0]; abstol = atol, reltol = rtol)
+            @test chk.separation ≈ -2.0
+            @test !chk.valid
+            @test y2 == [-2.0]
+
+            # Nonfinite candidate
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                Qm, c, A, b, K, G, d, [NaN]; abstol = atol, reltol = rtol)
+            @test !chk.finite
+            @test !chk.valid
+        end
+
+        @testset "Solution has_certificate" begin
+            args12 = (zeros(1), Float64[], zeros(1), zeros(1), :Optimal,
+                      3, 1e-9, 1e-9, 1e-9, 1e-9, 0.0, 0.0)
+            sol = ConicIP.Solution(args12...)
+            @test fieldnames(ConicIP.Solution)[end] == :has_certificate
+            @test sol.has_certificate == false
+
+            sol2 = ConicIP.Solution(args12..., true)
+            @test sol2.has_certificate == true
+        end
+
+    end
+
     # ──────────────────────────────────────────────────────────────
     #  MathOptInterface Tests
     # ──────────────────────────────────────────────────────────────

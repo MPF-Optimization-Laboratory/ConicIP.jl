@@ -381,6 +381,27 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 - `muFeas::Real` -- complementarity residual
 - `pobj::Real` -- primal objective value
 - `dobj::Real` -- dual objective value
+- `has_certificate::Bool` -- the returned vectors carry a *verified* ray
+  certifying infeasibility or unboundedness (see the table below)
+
+# Field conventions by status
+
+| status | y | w | v | s | pobj/dobj | has_certificate |
+|:--|:--|:--|:--|:--|:--|:--|
+| `:Optimal` | solution | dual (eq) | dual (ineq), ∈ K | slack, ∈ K | real | `false` |
+| `:Infeasible` *with ray* | all `NaN` | ray `w̄` | ray `v̄` ∈ K | all `NaN` | `NaN` | `true` |
+| `:Unbounded` *with ray* | ray `ȳ` | all `NaN` | all `NaN` | `A*ȳ` | `NaN` | `true` |
+| `:Infeasible`/`:Unbounded` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
+| `:Abandoned`, `:AlmostInfeasible`, `:AlmostUnbounded`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
+
+The infeasibility ray is normalized so that `dᵀw̄ - bᵀv̄ = -1` with
+`Gᵀw̄ - Aᵀv̄ ≈ 0`; the unboundedness ray is normalized so that `cᵀȳ = +1`
+with `Qȳ ≈ 0`, `Gȳ ≈ 0` and `Aȳ ∈ K`. See
+[`validate_infeasibility_certificate`](@ref) and
+[`validate_unboundedness_certificate`](@ref).
+
+A 12-argument constructor is provided which defaults `has_certificate` to
+`false`.
 """
 mutable struct Solution
 
@@ -396,8 +417,13 @@ mutable struct Solution
   muFeas :: Real
   pobj   :: Real
   dobj   :: Real
+  has_certificate :: Bool  # y/w/v carry a verified ray
 
 end
+
+# 12-argument constructor: no certificate by default
+Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj) =
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false)
 
 """
   conicIP(Q, c, A, b, cone_dims, G, d;
@@ -938,6 +964,7 @@ function conicIP(
 
 end
 
+include("certificates.jl")
 include("preprocessor.jl")
 include("MOI_wrapper.jl")
 
