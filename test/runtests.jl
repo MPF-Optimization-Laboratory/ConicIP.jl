@@ -863,6 +863,142 @@ end
 
     end
 
+    @testset "Certificate fallback" begin
+
+        atol = 1e-9; rtol = 1e-7
+
+        # Infeasible QP:  min ½‖x‖²  s.t.  x ≥ 0,  -(x₁+x₂) ≥ 1/100
+        # (i.e. x₁ + x₂ ≤ -0.01 with x ≥ 0 — empty).
+        # At maxIters = 7 the in-loop screen has not fired yet, but μ has
+        # collapsed, so the WP5 gate opens and the auxiliary Farkas QP
+        # recovers an exact ray.
+        Qi = Matrix(1.0I, 2, 2); ci = zeros(2)
+        Ai = [sparse(1.0I, 2, 2); sparse(-ones(1, 2))]
+        bi = [0.0, 0.0, 0.01]
+        Ki = [("R", 3)]
+        Gi = spzeros(0, 2); di = Float64[]
+
+        @testset "Infeasible — fallback certifies a stalled solve" begin
+            s = conicIP(Qi, ci, Ai, bi, Ki, Gi, di;
+                        verbose = false, maxIters = 7, certFallback = true)
+            @test s.status == :Infeasible
+            @test s.has_certificate
+
+            # the ray must validate against the ORIGINAL problem data
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qi, ci, Ai, bi, Ki, Gi, di, s.w, s.v; abstol = atol, reltol = rtol)
+            @test chk.valid
+        end
+
+        @testset "Infeasible — certFallback = false does not claim" begin
+            s = conicIP(Qi, ci, Ai, bi, Ki, Gi, di;
+                        verbose = false, maxIters = 7, certFallback = false)
+            @test s.status == :Abandoned
+            @test !s.has_certificate
+            @test !(s.status == :Infeasible && s.has_certificate)
+        end
+
+        # Unbounded QP:  min ¼(y₁-y₂)² - y₁ - 2y₂  s.t.  y ≥ 0.
+        # Q is singular with null direction (1,1), along which the objective
+        # decreases without bound.
+        Qu = [0.5 -0.5; -0.5 0.5]; cu = [1.0, 2.0]
+        Au = sparse(1.0I, 2, 2); bu = zeros(2); Ku = [("R", 2)]
+        Gu = spzeros(0, 2); du = Float64[]
+
+        @testset "Unbounded — fallback certifies a stalled solve" begin
+            s = conicIP(Qu, cu, Au, bu, Ku, Gu, du;
+                        verbose = false, maxIters = 5, certFallback = true)
+            @test s.status == :Unbounded
+            @test s.has_certificate
+
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                Qu, cu, Au, bu, Ku, Gu, du, s.y; abstol = atol, reltol = rtol)
+            @test chk.valid
+        end
+
+        @testset "Unbounded — certFallback = false does not claim" begin
+            s = conicIP(Qu, cu, Au, bu, Ku, Gu, du;
+                        verbose = false, maxIters = 5, certFallback = false)
+            @test s.status == :Abandoned
+            @test !s.has_certificate
+        end
+
+        @testset "Feasible problem never gains a certificate" begin
+            # min ½‖x‖² - 1ᵀx  s.t. x ≥ 0.  μ collapses by iteration 4, so the
+            # gate opens and BOTH auxiliary QPs actually run — and both must
+            # come back empty.
+            n = 5
+            Qf = Matrix(1.0I, n, n); cf = ones(n)
+            Af = sparse(1.0I, n, n); bf = zeros(n); Kf = [("R", n)]
+            s = conicIP(Qf, cf, Af, bf, Kf; verbose = false, maxIters = 4,
+                        certFallback = true)
+            @test s.status ∉ (:Infeasible, :Unbounded)
+            @test !s.has_certificate
+        end
+
+        @testset "fallback_infeasibility_ray" begin
+            # x ≥ 1 and -x ≥ 0 is infeasible
+            A1 = sparse(reshape([1.0, -1.0], 2, 1)); K1 = [("R", 2)]
+            Q1 = zeros(1, 1); c1 = [0.0]
+            G1 = spzeros(0, 1); d1 = Float64[]
+
+            r = ConicIP.fallback_infeasibility_ray(Q1, c1, A1, [1.0, 0.0], K1, G1, d1)
+            @test r !== nothing
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Q1, c1, A1, [1.0, 0.0], K1, G1, d1, r[1], r[2];
+                abstol = atol, reltol = rtol)
+            @test chk.valid
+
+            # 0 ≤ x ≤ 1 is feasible — no Farkas ray exists
+            @test ConicIP.fallback_infeasibility_ray(
+                Q1, c1, A1, [0.0, -1.0], K1, G1, d1) === nothing
+
+            # and on the stalled QP above it recovers a valid ray outright
+            r2 = ConicIP.fallback_infeasibility_ray(Qi, ci, Ai, bi, Ki, Gi, di)
+            @test r2 !== nothing
+            (chk2, _, _) = ConicIP.validate_infeasibility_certificate(
+                Qi, ci, Ai, bi, Ki, Gi, di, r2[1], r2[2];
+                abstol = atol, reltol = rtol)
+            @test chk2.valid
+        end
+
+        @testset "fallback_unbounded_ray" begin
+            # min -x s.t. x ≥ 0  (conicIP form: Q = 0, c = [1])
+            Q1 = zeros(1, 1); A1 = sparse(1.0I, 1, 1); b1 = [0.0]
+            K1 = [("R", 1)]; G1 = spzeros(0, 1); d1 = Float64[]
+
+            y = ConicIP.fallback_unbounded_ray(Q1, [1.0], A1, b1, K1, G1, d1)
+            @test y !== nothing
+            (chk, _) = ConicIP.validate_unboundedness_certificate(
+                Q1, [1.0], A1, b1, K1, G1, d1, y; abstol = atol, reltol = rtol)
+            @test chk.valid
+
+            # min +x s.t. x ≥ 0 is bounded — no recession ray
+            @test ConicIP.fallback_unbounded_ray(
+                Q1, [-1.0], A1, b1, K1, G1, d1) === nothing
+
+            # singular Q: the Qy = 0 rows make the auxiliary equalities wider
+            # than they are tall, which is the case that needs row reduction
+            y2 = ConicIP.fallback_unbounded_ray(Qu, cu, Au, bu, Ku, Gu, du)
+            @test y2 !== nothing
+            (chk2, _) = ConicIP.validate_unboundedness_certificate(
+                Qu, cu, Au, bu, Ku, Gu, du, y2; abstol = atol, reltol = rtol)
+            @test chk2.valid
+        end
+
+        @testset "Recursion guard — fallback solves terminate" begin
+            # certFallback = false inside the auxiliary solves means a fallback
+            # can never spawn a fallback; the call must simply return.
+            s = conicIP(Qi, ci, Ai, bi, Ki, Gi, di;
+                        verbose = false, maxIters = 1, certFallback = true)
+            @test s isa ConicIP.Solution
+            @test s.status ∈ (:Optimal, :Infeasible, :Unbounded,
+                              :AlmostInfeasible, :AlmostUnbounded,
+                              :Abandoned, :Error)
+        end
+
+    end
+
     # ──────────────────────────────────────────────────────────────
     #  MathOptInterface Tests
     # ──────────────────────────────────────────────────────────────

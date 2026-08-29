@@ -1078,7 +1078,53 @@ function conicIP(
   μ_collapsed = length(μ_history) > 1 && isfinite(μ_history[end]) &&
                 μ_history[end] <= 1e-3*maximum(μ_history)
 
-  # WP5 fallback hook
+  # Diverging complementarity is the classic infeasible-start signature of
+  # an infeasible or unbounded problem (measured: μ can blow up by 1e38 on
+  # an infeasible box). Either extreme — collapse or divergence — is
+  # evidence that no interior optimum exists.
+  μ_diverged = length(μ_history) > 1 && (!isfinite(μ_history[end]) ||
+                μ_history[end] >= 1e3*minimum(μ_history))
+
+  # ── WP5 fallback: recover a ray by an auxiliary min-norm QP ──
+  #  Only when both 1× validations failed AND there is evidence a ray
+  #  exists (a relaxed validation passed, or complementarity collapsed).
+  #  A clean :Abandoned with no such signal does not earn a solve.
+  #  At most one attempt of each kind, and the auxiliary problems get
+  #  kktsolver_qr rather than the caller's solver: they have a different
+  #  structure (min-norm, wide equalities, regularized) and qr is the
+  #  robust default there.
+  if certFallback && !pchk.valid && !dchk.valid &&
+     (pchk100.valid || dchk100.valid || μ_collapsed || μ_diverged)
+
+    # The auxiliary solves use their own iteration budget: the outer
+    # maxIters is small in exactly the regime the fallback exists for.
+    if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0
+      ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d)
+      if ray !== nothing
+        (fchk, fw̄, fv̄) = validate_infeasibility_certificate(
+                            Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
+                            abstol = infeasAbsTol, reltol = infeasTol)
+        if fchk.valid
+          if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+          return claim_infeasible!(sol, fw̄, fv̄)
+        end
+      end
+    end
+
+    if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0
+      ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d)
+      if ray !== nothing
+        (fchk, fȳ) = validate_unboundedness_certificate(
+                       Q, c, A, b, cone_dims, G, d, ray;
+                       abstol = infeasAbsTol, reltol = infeasTol)
+        if fchk.valid
+          if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+          return claim_unbounded!(sol, fȳ, A)
+        end
+      end
+    end
+
+  end
 
   if pchk.valid
     if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
@@ -1099,6 +1145,7 @@ function conicIP(
 end
 
 include("certificates.jl")
+include("fallback.jl")
 include("preprocessor.jl")
 include("MOI_wrapper.jl")
 
