@@ -1032,4 +1032,255 @@ end
         end
     end
 
+    # ──────────────────────────────────────────────────────────────
+    #  Certificate contract (rays surfaced through MOI)
+    #
+    #  These tests drive `ConicIP.Optimizer` directly (no caching or
+    #  bridge layer) so that `model.sol` can be inspected and — while
+    #  the solver's termination block does not yet emit verified rays —
+    #  replaced by a synthetic `Solution` obeying the field-convention
+    #  table in the `Solution` docstring. The end-to-end assertions
+    #  (TerminationStatus) run against the real solve either way.
+    # ──────────────────────────────────────────────────────────────
+
+    @testset "MOI certificate contract" begin
+        import MathOptInterface as MOI
+
+        saf(terms, const_) = MOI.ScalarAffineFunction(
+            [MOI.ScalarAffineTerm(c, v) for (c, v) in terms], const_)
+
+        # Farkas ray Solution: y/s are NaN, w/v carry the ray.
+        function infeasible_sol(opt, w, v)
+            n, m = opt.n, length(opt.ineq_b)
+            return ConicIP.Solution(fill(NaN, n), copy(w), copy(v), fill(NaN, m),
+                :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true)
+        end
+
+        # Recession ray Solution: w/v are NaN, y is the ray and s = A*ȳ.
+        function unbounded_sol(opt, y)
+            p = size(opt.eq_G, 1)
+            s = opt.ineq_A * y
+            return ConicIP.Solution(copy(y), fill(NaN, p), fill(NaN, length(s)),
+                Vector(s), :Unbounded, 0, NaN, NaN, NaN, NaN, NaN, NaN, true)
+        end
+
+        # Gᵀw̄ - Aᵀv̄ (the Farkas residual), tolerating an empty equality block
+        function farkas_residual(opt, sol)
+            r = -Vector(opt.ineq_A' * sol.v)
+            if size(opt.eq_G, 1) > 0
+                r += Vector(opt.eq_G' * sol.w)
+            end
+            return r
+        end
+
+        @testset "Infeasible LP — dual ray" begin
+            # min x  s.t.  x ≥ 1, x ≤ 0     (LessThan exercises ineq_sign = -1)
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variable(src)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x)], 0.0))
+            c_lo = MOI.add_constraint(src, x, MOI.GreaterThan(1.0))
+            c_hi = MOI.add_constraint(src, x, MOI.LessThan(0.0))
+
+            opt = ConicIP.Optimizer()
+            index_map, _ = MOI.optimize!(opt, src)
+
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.INFEASIBLE
+
+            # Internal data: A = [1; -1], b = [1, 0], no equalities.
+            # Farkas ray: v = [1, 1] ⇒ Aᵀv = 0, dᵀw - bᵀv = -1.
+            if !opt.sol.has_certificate
+                opt.sol = infeasible_sol(opt, Float64[], [1.0, 1.0])
+            end
+            sol = opt.sol
+
+            @test norm(farkas_residual(opt, sol)) < 1e-6
+            @test dot(opt.eq_d, sol.w) - dot(opt.ineq_b, sol.v) ≈ -1.0 atol=1e-8
+
+            @test MOI.get(opt, MOI.ResultCount()) == 1
+            @test MOI.get(opt, MOI.DualStatus()) == MOI.INFEASIBILITY_CERTIFICATE
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
+            @test MOI.get(opt, MOI.DualObjectiveValue()) > 0
+            @test MOI.get(opt, MOI.DualObjectiveValue()) ≈ 1.0 atol=1e-8
+
+            # ConstraintDual returns the ray components (sign-flipped on LessThan)
+            @test MOI.get(opt, MOI.ConstraintDual(), index_map[c_lo]) ≈ 1.0 atol=1e-8
+            @test MOI.get(opt, MOI.ConstraintDual(), index_map[c_hi]) ≈ -1.0 atol=1e-8
+        end
+
+        @testset "Infeasible LP with equality — dual ray" begin
+            # min x  s.t.  x ≤ -1, x = 0
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variable(src)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x)], 0.0))
+            c_le = MOI.add_constraint(src, saf([(1.0, x)], 0.0), MOI.LessThan(-1.0))
+            c_eq = MOI.add_constraint(src, saf([(1.0, x)], 0.0), MOI.EqualTo(0.0))
+
+            opt = ConicIP.Optimizer()
+            index_map, _ = MOI.optimize!(opt, src)
+
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.INFEASIBLE
+
+            # Internal data: A = [-1], b = [1], G = [1], d = [0].
+            # Farkas ray: w = -1, v = 1 ⇒ Gᵀw - Aᵀv = 0, dᵀw - bᵀv = -1.
+            if !opt.sol.has_certificate
+                opt.sol = infeasible_sol(opt, [-1.0], [1.0])
+            end
+            sol = opt.sol
+
+            @test norm(farkas_residual(opt, sol)) < 1e-6
+            @test dot(opt.eq_d, sol.w) - dot(opt.ineq_b, sol.v) ≈ -1.0 atol=1e-8
+
+            @test MOI.get(opt, MOI.ResultCount()) == 1
+            @test MOI.get(opt, MOI.DualStatus()) == MOI.INFEASIBILITY_CERTIFICATE
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
+            @test MOI.get(opt, MOI.DualObjectiveValue()) ≈ 1.0 atol=1e-8
+
+            @test MOI.get(opt, MOI.ConstraintDual(), index_map[c_le]) ≈ -1.0 atol=1e-8
+            @test MOI.get(opt, MOI.ConstraintDual(), index_map[c_eq]) ≈ 1.0 atol=1e-8
+        end
+
+        @testset "Unbounded LP — primal ray is homogeneous" begin
+            # min x₁ + 5  s.t.  x₁ + 2 ≤ 2,  x₂ + 1 = 3
+            # The objective constant (5) and the constraint constants must not
+            # appear in any ray-valued getter.
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variables(src, 2)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x[1])], 5.0))
+            c_le = MOI.add_constraint(src, saf([(1.0, x[1])], 2.0), MOI.LessThan(2.0))
+            c_eq = MOI.add_constraint(src, saf([(1.0, x[2])], 1.0), MOI.EqualTo(3.0))
+
+            opt = ConicIP.Optimizer()
+            index_map, _ = MOI.optimize!(opt, src)
+
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.DUAL_INFEASIBLE
+
+            # c_int = -c_moi = [-1, 0]; ray ȳ = [-1, 0] gives c_intᵀȳ = +1,
+            # Gȳ = 0 and Aȳ = [1] ∈ K.
+            if !opt.sol.has_certificate
+                opt.sol = unbounded_sol(opt, [-1.0, 0.0])
+            end
+            sol = opt.sol
+
+            @test dot(opt.c_int, sol.y) ≈ 1.0 atol=1e-8
+            @test norm(opt.eq_G * sol.y) < 1e-8
+            @test minimum(opt.ineq_A * sol.y) > -1e-8
+
+            @test MOI.get(opt, MOI.ResultCount()) == 1
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.INFEASIBILITY_CERTIFICATE
+            @test MOI.get(opt, MOI.DualStatus()) == MOI.NO_SOLUTION
+
+            # MIN sense ⇒ improving direction ⇒ negative; constant 5 excluded
+            @test MOI.get(opt, MOI.ObjectiveValue()) < 0
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ -1.0 atol=1e-8
+
+            @test MOI.get(opt, MOI.VariablePrimal(), index_map[x[1]]) ≈ -1.0 atol=1e-8
+            @test MOI.get(opt, MOI.VariablePrimal(), index_map[x[2]]) ≈ 0.0 atol=1e-8
+
+            # ineq_offset = 2 (LessThan rhs) must NOT be added: -1, not +1
+            @test MOI.get(opt, MOI.ConstraintPrimal(), index_map[c_le]) ≈ -1.0 atol=1e-8
+            # eq_offset = 3 / eq_d = 2 must NOT enter: G*ȳ = 0, not 1
+            @test MOI.get(opt, MOI.ConstraintPrimal(), index_map[c_eq]) ≈ 0.0 atol=1e-8
+        end
+
+        @testset "Unbounded LP — MAX sense ray objective is positive" begin
+            # max x₁ + 7  s.t.  x₁ ≥ 0   (unbounded above)
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variable(src)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x)], 7.0))
+            MOI.add_constraint(src, x, MOI.GreaterThan(0.0))
+
+            opt = ConicIP.Optimizer()
+            MOI.optimize!(opt, src)
+
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.DUAL_INFEASIBLE
+
+            # MAX ⇒ c_int = c_moi = [1]; ray ȳ = [1] gives c_intᵀȳ = +1.
+            if !opt.sol.has_certificate
+                opt.sol = unbounded_sol(opt, [1.0])
+            end
+
+            @test MOI.get(opt, MOI.ResultCount()) == 1
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.INFEASIBILITY_CERTIFICATE
+            # MAX sense flips the internal -1 to +1; constant 7 excluded
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ 1.0 atol=1e-8
+        end
+
+        @testset "No certificate ⇒ no result" begin
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variable(src)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x)], 0.0))
+            MOI.add_constraint(src, x, MOI.GreaterThan(1.0))
+            MOI.add_constraint(src, x, MOI.LessThan(0.0))
+
+            opt = ConicIP.Optimizer()
+            MOI.optimize!(opt, src)
+
+            args = (opt.sol.y, opt.sol.w, opt.sol.v, opt.sol.s, :Infeasible,
+                    0, NaN, NaN, NaN, NaN, NaN, NaN)
+            opt.sol = ConicIP.Solution(args..., false)
+            @test MOI.get(opt, MOI.ResultCount()) == 0
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
+            @test MOI.get(opt, MOI.DualStatus()) == MOI.NO_SOLUTION
+
+            opt.sol = ConicIP.Solution(args[1:4]..., :Unbounded, args[6:end]..., false)
+            @test MOI.get(opt, MOI.ResultCount()) == 0
+            @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
+            @test MOI.get(opt, MOI.DualStatus()) == MOI.NO_SOLUTION
+        end
+
+        @testset "Almost-status mapping" begin
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variable(src)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x)], 0.0))
+            MOI.add_constraint(src, x, MOI.GreaterThan(0.0))
+
+            opt = ConicIP.Optimizer()
+            MOI.optimize!(opt, src)
+            args = (opt.sol.y, opt.sol.w, opt.sol.v, opt.sol.s)
+
+            opt.sol = ConicIP.Solution(args..., :AlmostInfeasible,
+                                       0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.ALMOST_INFEASIBLE
+            @test MOI.get(opt, MOI.ResultCount()) == 0
+
+            opt.sol = ConicIP.Solution(args..., :AlmostUnbounded,
+                                       0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.ALMOST_DUAL_INFEASIBLE
+            @test MOI.get(opt, MOI.ResultCount()) == 0
+        end
+
+        @testset "infeasTol option is accepted" begin
+            opt = ConicIP.Optimizer(infeasTol = 1e-9)
+            @test opt.infeasTol == 1e-9
+            src = MOI.Utilities.Model{Float64}()
+            x = MOI.add_variable(src)
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([(1.0, x)], 0.0))
+            MOI.add_constraint(src, x, MOI.GreaterThan(1.0))
+            MOI.optimize!(opt, src)
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ 1.0 atol=1e-5
+
+            # empty! clears the newly stored problem data
+            MOI.empty!(opt)
+            @test MOI.is_empty(opt)
+            @test isempty(opt.c_int)
+            @test opt.ineq_A === nothing
+            @test isempty(opt.ineq_b)
+        end
+    end
+
 end
