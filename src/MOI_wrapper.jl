@@ -1,7 +1,7 @@
 import MathOptInterface as MOI
 
 """
-    Optimizer(; verbose=false, optTol=1e-6, maxIters=100)
+    Optimizer(; verbose=false, optTol=1e-6, maxIters=100, infeasTol=1e-7)
 
 MathOptInterface optimizer wrapping the ConicIP interior-point solver.
 Use as a JuMP solver via `Model(ConicIP.Optimizer)`.
@@ -10,6 +10,8 @@ Use as a JuMP solver via `Model(ConicIP.Optimizer)`.
 - `verbose::Bool` -- print solver iterations (default: `false`)
 - `optTol::Float64` -- optimality tolerance (default: `1e-6`)
 - `maxIters::Int` -- maximum iterations (default: `100`)
+- `infeasTol::Float64` -- infeasibility/unboundedness certificate tolerance
+  (default: `1e-7`)
 
 # Supported Constraints
 - **Vector:** `Zeros`, `Nonnegatives`, `Nonpositives`, `SecondOrderCone`,
@@ -21,6 +23,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     max_sense::Bool
     objective_constant::Float64
     n::Int
+    c_int::Vector{Float64}         # internal objective vector handed to the solver
     # Constraint row tracking for primal/dual recovery
     eq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
     eq_offset::Vector{Float64}     # 0 for Zeros, rhs for EqualTo
@@ -32,21 +35,25 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     ineq_offset::Vector{Float64}   # 0 for vector, lower/upper for scalar
     ineq_is_scalar::Vector{Bool}
     ineq_is_psd::Vector{Bool}     # true for PSD constraints (√2 scaling)
+    ineq_A::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # inequality constraint matrix
+    ineq_b::Vector{Float64}                                # inequality constraint RHS
     # Timing
     solve_time::Float64
     # Solver options
     verbose::Bool
     optTol::Float64
     maxIters::Int
+    infeasTol::Float64
 end
 
-function Optimizer(; verbose::Bool = false, optTol::Float64 = 1e-6, maxIters::Int = 100)
+function Optimizer(; verbose::Bool = false, optTol::Float64 = 1e-6,
+                   maxIters::Int = 100, infeasTol::Float64 = 1e-7)
     return Optimizer(
-        nothing, false, 0.0, 0,
+        nothing, false, 0.0, 0, Float64[],
         Pair{Any, UnitRange{Int}}[], Float64[], Bool[], nothing, Float64[],
-        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[], Bool[],
+        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[], Bool[], nothing, Float64[],
         NaN,
-        verbose, optTol, maxIters,
+        verbose, optTol, maxIters, infeasTol,
     )
 end
 
@@ -56,6 +63,7 @@ function MOI.empty!(model::Optimizer)
     model.objective_constant = 0.0
     model.n = 0
     model.solve_time = NaN
+    empty!(model.c_int)
     empty!(model.eq_ci_map)
     empty!(model.eq_offset)
     empty!(model.eq_is_scalar)
@@ -66,6 +74,8 @@ function MOI.empty!(model::Optimizer)
     empty!(model.ineq_offset)
     empty!(model.ineq_is_scalar)
     empty!(model.ineq_is_psd)
+    model.ineq_A = nothing
+    empty!(model.ineq_b)
 end
 
 function MOI.is_empty(model::Optimizer)
@@ -259,6 +269,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     # For min c_moi'x: set c_int = -c_moi  → minimizes -(-c_moi)'x = c_moi'x
     # For max c_moi'x: set c_int = c_moi   → minimizes -(c_moi)'x = -c_moi'x
     c_int = dest.max_sense ? c_moi : -c_moi
+    dest.c_int = c_int
     Q = spzeros(n, n)
 
     # ── Constraints ──
@@ -393,6 +404,8 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         A = sparse(vcat(A_rows...))
         b = Float64.(b_vals)
     end
+    dest.ineq_A = A
+    dest.ineq_b = b
 
     # ── Solve ──
     t0 = time()
@@ -400,6 +413,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         verbose = dest.verbose,
         optTol = dest.optTol,
         maxIters = dest.maxIters,
+        infeasTol = dest.infeasTol,
     )
     dest.solve_time = time() - t0
 
@@ -409,6 +423,18 @@ end
 # ──────────────────────────────────────────────────────────────
 #  Result getters
 # ──────────────────────────────────────────────────────────────
+
+# A `Solution` carries a ray only when the solver verified one
+# (`has_certificate`). Per the `Solution` field-convention table:
+#   :Unbounded + certificate → sol.y is the primal ray ȳ (cᵀȳ = +1),
+#                              sol.s = A*ȳ, and sol.w/sol.v are NaN
+#   :Infeasible + certificate → sol.w/sol.v are the Farkas ray
+#                              (dᵀw̄ - bᵀv̄ = -1), and sol.y/sol.s are NaN
+_is_primal_ray(model::Optimizer) =
+    model.sol !== nothing && model.sol.status == :Unbounded && model.sol.has_certificate
+
+_is_dual_ray(model::Optimizer) =
+    model.sol !== nothing && model.sol.status == :Infeasible && model.sol.has_certificate
 
 function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
     if model.sol === nothing
@@ -421,6 +447,10 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
         return MOI.INFEASIBLE
     elseif status == :Unbounded
         return MOI.DUAL_INFEASIBLE
+    elseif status == :AlmostInfeasible
+        return MOI.ALMOST_INFEASIBLE
+    elseif status == :AlmostUnbounded
+        return MOI.ALMOST_DUAL_INFEASIBLE
     elseif status == :Abandoned
         return MOI.ITERATION_LIMIT
     else
@@ -460,7 +490,13 @@ function MOI.get(model::Optimizer, ::MOI.ResultCount)
     if model.sol === nothing
         return 0
     end
-    return model.sol.status == :Optimal ? 1 : 0
+    status = model.sol.status
+    if status == :Optimal
+        return 1
+    elseif status in (:Infeasible, :Unbounded) && model.sol.has_certificate
+        return 1
+    end
+    return 0
 end
 
 function MOI.get(model::Optimizer, ::MOI.RawStatusString)
@@ -475,6 +511,13 @@ function MOI.get(model::Optimizer, attr::MOI.ObjectiveValue)
     # pobj = (1/2)y'Qy - c_int'y
     # MIN: c_int = -c_moi → pobj = c_moi'y (correct)
     # MAX: c_int = c_moi  → pobj = -c_moi'y (negate)
+    if _is_primal_ray(model)
+        # Homogeneous ray value: (1/2)ȳ'Qȳ - c_int'ȳ with Q ≡ 0, so -c_int'ȳ.
+        # The ray is normalized to c_int'ȳ = +1, hence the internal value is -1;
+        # the objective constant is *not* added (a ray is a direction).
+        val = -dot(model.c_int, model.sol.y)
+        return model.max_sense ? -val : val
+    end
     val = model.sol.pobj
     if model.max_sense
         val = -val
@@ -482,6 +525,12 @@ function MOI.get(model::Optimizer, attr::MOI.ObjectiveValue)
     return val + model.objective_constant
 end
 
+# On a dual ray (:Infeasible with certificate) ResultCount is 1, so the primal
+# getters below pass `check_result_index_bounds`, but sol.y/sol.s are NaN by the
+# `Solution` field convention. We deliberately do NOT throw: PrimalStatus is
+# NO_SOLUTION, which is the documented signal that no primal point/ray exists,
+# and MOI (and MOI.Test) does not query primal values in that state. A caller
+# that ignores PrimalStatus gets NaN rather than an exception.
 function MOI.get(
     model::Optimizer,
     attr::MOI.VariablePrimal,
@@ -503,18 +552,24 @@ end
 # Equality constraints are approximately satisfied:
 #   Zeros:       f(x) ≈ 0    (offset=0)
 #   EqualTo(r):  f(x) ≈ r    (offset=r)
+#
+# On a primal ray (:Unbounded with certificate) the value is the *homogeneous*
+# part only: the constant terms (eq_d, ineq_offset) are dropped, since a ray is
+# a direction rather than a point.
 function MOI.get(
     model::Optimizer,
     attr::MOI.ConstraintPrimal,
     ci::MOI.ConstraintIndex,
 )
     MOI.check_result_index_bounds(model, attr)
+    ray = _is_primal_ray(model)
     for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
         if ci_stored == ci
-            # f(x) = G[rows,:]*y - d[rows] + offset
-            residual = model.eq_G[rows, :] * model.sol.y - model.eq_d[rows]
+            # f(x) = G[rows,:]*y - d[rows] + offset  (ray: G[rows,:]*ȳ)
+            residual = ray ? model.eq_G[rows, :] * model.sol.y :
+                model.eq_G[rows, :] * model.sol.y - model.eq_d[rows]
             if model.eq_is_scalar[i]
-                return residual[1] + model.eq_offset[i]
+                return ray ? residual[1] : residual[1] + model.eq_offset[i]
             else
                 return Vector(residual)
             end
@@ -523,7 +578,7 @@ function MOI.get(
     for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
         if ci_stored == ci
             sgn = model.ineq_sign[i]
-            off = model.ineq_offset[i]
+            off = ray ? 0.0 : model.ineq_offset[i]
             if model.ineq_is_scalar[i]
                 return sgn * model.sol.s[rows[1]] + off
             else
@@ -545,6 +600,10 @@ end
 # is negated relative to v. For MAX_SENSE, all duals are negated.
 # Formula: dual = sign * sense_sign * v  (ineq)
 #          dual = sense_sign * w         (eq)
+#
+# This is already correct on a dual ray (:Infeasible with certificate): the
+# Farkas ray lives in sol.w/sol.v with the same sign and PSD scaling
+# conventions as the optimal duals, and no constant enters the formula.
 function MOI.get(
     model::Optimizer,
     attr::MOI.ConstraintDual,
@@ -588,10 +647,22 @@ end
 MOI.supports(::Optimizer, ::MOI.SolveTimeSec) = true
 MOI.get(model::Optimizer, ::MOI.SolveTimeSec) = model.solve_time
 
+# Homogeneous dual objective along a Farkas ray. The ray is normalized so that
+# dᵀw̄ - bᵀv̄ = -1, hence bᵀv̄ - dᵀw̄ = +1 — positive, matching the MOI
+# convention that the dual objective improves without bound along the ray of a
+# MIN problem. NOTE: the overall sign convention here is the risky part; if
+# MOI.Test's Farkas-dual checks disagree, a single global flip is the fix.
+function _dual_ray_objective(model::Optimizer)
+    val = -(dot(model.eq_d, model.sol.w) - dot(model.ineq_b, model.sol.v))
+    return model.max_sense ? -val : val
+end
+
 MOI.supports(::Optimizer, ::MOI.ObjectiveBound) = true
 function MOI.get(model::Optimizer, ::MOI.ObjectiveBound)
     if model.sol === nothing
         return model.max_sense ? -Inf : Inf
+    elseif _is_dual_ray(model)
+        return _dual_ray_objective(model)
     end
     val = model.sol.dobj
     if model.max_sense
@@ -603,6 +674,10 @@ end
 MOI.supports(::Optimizer, ::MOI.DualObjectiveValue) = true
 function MOI.get(model::Optimizer, attr::MOI.DualObjectiveValue)
     MOI.check_result_index_bounds(model, attr)
+    if _is_dual_ray(model)
+        # Ray value: no objective constant (a ray is a direction).
+        return _dual_ray_objective(model)
+    end
     val = model.sol.dobj
     if model.max_sense
         val = -val
