@@ -39,13 +39,36 @@ ConicIP.Solution
 | Status | Meaning |
 |--------|---------|
 | `:Optimal` | Converged to an optimal solution |
-| `:Infeasible` | Problem is primal infeasible (dual certificate found) |
-| `:Unbounded` | Problem is dual infeasible / primal unbounded |
+| `:Infeasible` | Problem is primal infeasible (validated Farkas ray when `has_certificate`) |
+| `:Unbounded` | Problem is dual infeasible / primal unbounded (validated recession ray when `has_certificate`) |
+| `:AlmostInfeasible` | Iteration limit with a near-validating infeasibility candidate (no certificate) |
+| `:AlmostUnbounded` | Iteration limit with a near-validating unboundedness candidate (no certificate) |
 | `:Abandoned` | Solver stalled (step size too small or numerical issues) |
 | `:Error` | Solver encountered an error |
 
 See [Troubleshooting Solver Output](@ref) in the Mathematical Background
 for guidance on non-optimal statuses.
+
+## Certificate Validation
+
+Infeasibility and unboundedness claims are backed by rays validated against
+the original problem data. See
+[The Certificate Pipeline](@ref) in the Mathematical Background.
+
+```@docs
+ConicIP.CertificateCheck
+ConicIP.cone_margin
+ConicIP.validate_infeasibility_certificate
+ConicIP.validate_unboundedness_certificate
+```
+
+When the iterate loop exhausts with evidence of a ray, the solver can
+recover a certificate by solving an auxiliary min-norm QP:
+
+```@docs
+ConicIP.fallback_infeasibility_ray
+ConicIP.fallback_unbounded_ray
+```
 
 ## JuMP / MathOptInterface
 

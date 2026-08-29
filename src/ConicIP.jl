@@ -373,7 +373,8 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 - `w::Vector{Float64}` -- dual variables for equality constraints (Gy = d)
 - `v::Vector{Float64}` -- dual variables for inequality constraints (Ay ≥_K b)
 - `s::Vector{Float64}` -- cone slack variables (Ay - s = b, s ∈ K)
-- `status::Symbol` -- `:Optimal`, `:Infeasible`, `:Unbounded`, `:Abandoned`, or `:Error`
+- `status::Symbol` -- `:Optimal`, `:Infeasible`, `:Unbounded`,
+  `:AlmostInfeasible`, `:AlmostUnbounded`, `:Abandoned`, or `:Error`
 - `Iter::Integer` -- number of interior-point iterations
 - `Mu::Real` -- final complementarity gap parameter
 - `prFeas::Real` -- primal feasibility residual
@@ -381,6 +382,27 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 - `muFeas::Real` -- complementarity residual
 - `pobj::Real` -- primal objective value
 - `dobj::Real` -- dual objective value
+- `has_certificate::Bool` -- the returned vectors carry a *verified* ray
+  certifying infeasibility or unboundedness (see the table below)
+
+# Field conventions by status
+
+| status | y | w | v | s | pobj/dobj | has_certificate |
+|:--|:--|:--|:--|:--|:--|:--|
+| `:Optimal` | solution | dual (eq) | dual (ineq), ∈ K | slack, ∈ K | real | `false` |
+| `:Infeasible` *with ray* | all `NaN` | ray `w̄` | ray `v̄` ∈ K | all `NaN` | `NaN` | `true` |
+| `:Unbounded` *with ray* | ray `ȳ` | all `NaN` | all `NaN` | `A*ȳ` | `NaN` | `true` |
+| `:Infeasible`/`:Unbounded` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
+| `:Abandoned`, `:AlmostInfeasible`, `:AlmostUnbounded`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
+
+The infeasibility ray is normalized so that `dᵀw̄ - bᵀv̄ = -1` with
+`Gᵀw̄ - Aᵀv̄ ≈ 0`; the unboundedness ray is normalized so that `cᵀȳ = +1`
+with `Qȳ ≈ 0`, `Gȳ ≈ 0` and `Aȳ ∈ K`. See
+[`validate_infeasibility_certificate`](@ref) and
+[`validate_unboundedness_certificate`](@ref).
+
+A 12-argument constructor is provided which defaults `has_certificate` to
+`false`.
 """
 mutable struct Solution
 
@@ -396,18 +418,49 @@ mutable struct Solution
   muFeas :: Real
   pobj   :: Real
   dobj   :: Real
+  has_certificate :: Bool  # y/w/v carry a verified ray
 
+end
+
+# 12-argument constructor: no certificate by default
+Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj) =
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false)
+
+# Overwrite sol with a *verified* infeasibility ray (dᵀw̄ - bᵀv̄ = -1).
+# The primal iterate is discarded: it means nothing on an empty feasible set.
+function claim_infeasible!(sol::Solution, w̄, v̄)
+  fill!(sol.y, NaN); fill!(sol.s, NaN)
+  sol.w[:] = w̄; sol.v[:] = v̄
+  sol.pobj = NaN; sol.dobj = NaN
+  sol.status = :Infeasible
+  sol.has_certificate = true
+  return sol
+end
+
+# Overwrite sol with a *verified* recession ray (cᵀȳ = +1). The duals are
+# discarded: they mean nothing when the dual is infeasible.
+function claim_unbounded!(sol::Solution, ȳ, A)
+  sol.y[:] = ȳ; sol.s[:] = A*ȳ
+  fill!(sol.w, NaN); fill!(sol.v, NaN)
+  sol.pobj = NaN; sol.dobj = NaN
+  sol.status = :Unbounded
+  sol.has_certificate = true
+  return sol
 end
 
 """
   conicIP(Q, c, A, b, cone_dims, G, d;
   solve3x3gen = solve3x3gen_sparse,
-  optTol = 1e-5,
+  optTol = 1e-6,
   DTB = 0.01,
   verbose = true,
   maxRefinementSteps = 3,
   maxIters = 100,
   cache_nestodd = false,
+  infeasTol = 1e-7,
+  infeasAbsTol = 1e-9,
+  staticReg = 1e-8,
+  certFallback = true,
   refinementThreshold = optTol/1e7)
 
 Interior point solver for the system
@@ -430,6 +483,25 @@ e.g. [("R",2),("Q",4)] means
 
 SDP Cones are NOT supported and purely experimental at this
 point.
+
+Returns a [`Solution`](@ref) whose `status` is one of
+
+- `:Optimal` — `max(rDu, rPr, rCp, rEq) < optTol`.
+- `:Infeasible` / `:Unbounded` — a ray passed a screen *and* was accepted
+  by the corresponding validator; `has_certificate` is then `true`.
+- `:AlmostInfeasible` / `:AlmostUnbounded` — set only at loop exhaustion,
+  when the best iterate carries a ray that validates at `100*infeasTol`
+  but not at `infeasTol`. The best iterate is retained.
+- `:Abandoned` — iteration limit reached with no verdict.
+- `:Error` — nonfinite residuals.
+
+Selected keyword arguments:
+
+- `infeasTol` — infeasibility-certificate tolerance, decoupled from `optTol`.
+- `infeasAbsTol` — absolute tolerance for certificate validation.
+- `staticReg` — static KKT regularization scale; `0` (default) disables it.
+  `preprocess_conicIP` enables it when it detects rank deficiency.
+- `certFallback` — enable fallback certificate solve on stall.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -505,9 +577,14 @@ function conicIP(
   maxRefinementSteps = 3,  # Maximum number of IR Steps
   maxIters = 100,          # Maximum number of interior iterations
   cache_nestodd = false,   # Set to true if there are many small blocks
-  infeasTol = optTol,      # Infeasibility threshold (this shouldn't need to be tweaked,
+  infeasTol = 1e-7,        # Infeasibility threshold (this shouldn't need to be tweaked,
                            # but set it small if the program returns infeasible/unbounded when
                            # you are sure it isn't)
+  infeasAbsTol = 1e-9,     # used by certificate validation (WP3b)
+  staticReg = 0.0,         # Static regularization scale for the KKT factorization
+                           # (0 disables it; preprocess_conicIP opts in when it
+                           # detects rank deficiency in [Q A' G'])
+  certFallback = true,     # enables fallback certificate solve (WP5)
   refinementThreshold = optTol/1e7 # Accuracy of refinement steps
   )
 
@@ -534,6 +611,7 @@ function conicIP(
   normc = norm(c)
   normd = isempty(d) ? -Inf : norm(d)
   normb = normsafe(b)
+  normdsafe = normsafe(d)   # 0 for empty d (normd is -Inf there)
 
   # Sanity Checks
   ◂ = nothing
@@ -666,7 +744,14 @@ function conicIP(
 
   end
 
-  solve3x3gen = kktsolver(Q,A,G,cone_dims)
+  # Static regularization of the KKT factorization only. The factorization
+  # sees Q + δI, but every other use of Q (residuals, objective, iterative
+  # refinement) keeps the original Q — so the perturbed factorization acts as
+  # a preconditioner whose error the refinement loop corrects.
+  δ = staticReg*(1 + norm(Q, Inf))
+  Qᵣ = δ == 0 ? Q : Q + δ*Id(n)
+
+  solve3x3gen = kktsolver(Qᵣ,A,G,cone_dims)
 
   function solve4x4gen(λ, F, F⁻ᵀ, solve3x3gen = solve3x3gen)
 
@@ -729,6 +814,7 @@ function conicIP(
   optBest = Inf
   rStep   = 0
   rnorm   = 0
+  μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
   for Iter = 1:maxIters
 
     F    = nt_scaling(z.v, z.s)   # Nesterov-Todd Scaling Matrix
@@ -757,6 +843,7 @@ function conicIP(
     # Gap
     μbar = dot(z.v,z.s)
     μ    = μbar/conedim
+    push!(μ_history, μ)
 
     # ────────────────────────────────────────────────────────────
     #  Print iterate status, save best iterate
@@ -766,6 +853,7 @@ function conicIP(
     rDu = norm(r0.y)/(1+normc)
     rPr = normsafe(r0.v)/(1+normb)
     rCp = normsafe(r0.s)/(1+abs(cᵀy));
+    rEq = normsafe(r0.w)/(1+normdsafe)   # Gy - d
 
     pobj = 0.5*dot(z.y, Q*z.y) - dot(c, z.y)
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
@@ -779,74 +867,93 @@ function conicIP(
     end
 
     # ────────────────────────────────────────────────────────────
-    # Convergence Checks (on previous iterate)
+    #  Termination : candidate screen → validate → claim
+    #
+    #  Strict precedence. Optimality wins outright and returns; only
+    #  a non-optimal iterate is screened for a ray. A screen hit is a
+    #  *nomination* only — the status is claimed if and only if the
+    #  validator in certificates.jl accepts the ray against the
+    #  original problem data, and the claim returns immediately.
     # ────────────────────────────────────────────────────────────
 
-    # Optimality
-    if max(rDu, rPr, rCp) < optTol
-      sol.status = :Optimal
-    end
+    optimal = max(rDu, rPr, rCp, rEq) < optTol
 
-    if !(p == 0 && m == 0)
+    # Defined even when no screen runs (verbose row below reads them)
+    p_infeas = NaN
+    d_infeas = NaN
 
-      # Primal Infeasibility
+    claim = :None                      # set only by a validated ray
+    w̄ = z.w; v̄ = z.v; ȳ = z.y          # normalized ray, once validated
+
+    if !optimal && !(p == 0 && m == 0)
+
+      # Primal Infeasibility (Farkas ray)
       #
-      # Certificate: ∃w,v such that
-      #   Gᵀw + Aᵀv = 0
-      #   bᵀv + dᵀw < 0
-      #   w ≧ 0
+      #  (w,v) with w free and v ∈ K certifies {y : Ay ≥_K b, Gy = d}
+      #  is empty when
       #
-      # The program returns a certificate w,v that satisfies
+      #    Gᵀw - Aᵀv = 0,   v ∈ K,   dᵀw - bᵀv < 0
       #
-      #  CVXOPT style         ECOS Style
-      #  -------------------------------------------
-      #   Gᵀw + Aᵀv = 0        Gᵀw + Aᵀv = 0
-      #   bᵀv + dᵀw = -1       bᵀv + dᵀw < 0
-      #   w ≧ 0                w ≧ 0
-      #                        norm(v) + norm(w) = 1
+      #  The screen scales the residual ‖Gᵀw - Aᵀv‖ two ways, both
+      #  gated on dᵀw - bᵀv < 0:
       #
-      dᵀy_bᵀv  = dot(d,z.w) - dot(b,z.v)
+      #   CVXOPT style             ECOS style
+      #   ────────────────────     ────────────────────────
+      #    ‖Gᵀw - Aᵀv‖              ‖Gᵀw - Aᵀv‖
+      #    ───────────              ────────────────────────
+      #      ‖w‖ + ‖v‖              max(1,‖c‖)·|dᵀw - bᵀv|
+      #
+      #  Passing the screen only nominates (w,v); the claim is made
+      #  by validate_infeasibility_certificate, which also normalizes
+      #  the ray to dᵀw̄ - bᵀv̄ = -1.
+      dᵀw_bᵀv = dot(d,z.w) - dot(b,z.v)
 
       p_infeas_unscaled = norm(Gᵀ*z.w - Aᵀ*z.v)
-      p_infeas_cvx = dᵀy_bᵀv < 0 ? p_infeas_unscaled/(normsafe(z.y) + normsafe(z.v)) : NaN
-      p_infeas_ecos = dᵀy_bᵀv < 0 ? p_infeas_unscaled/(max(1,normc)*abs(dᵀy_bᵀv)) : NaN
+      p_infeas_cvx  = dᵀw_bᵀv < 0 ? p_infeas_unscaled/(normsafe(z.w) + normsafe(z.v)) : NaN
+      p_infeas_ecos = dᵀw_bᵀv < 0 ? p_infeas_unscaled/(max(1,normc)*abs(dᵀw_bᵀv)) : NaN
       p_infeas = max(p_infeas_cvx, p_infeas_ecos)
 
       if p_infeas < infeasTol
-        sol.y[:] = 0*sol.y[:]/0; sol.w[:] = z.w/-dᵀy_bᵀv; sol.v[:] = z.v/-dᵀy_bᵀv;
-        sol.status = :Infeasible
+        (pchk, w̄, v̄) = validate_infeasibility_certificate(
+                          Q, c, A, b, cone_dims, G, d, z.w, z.v;
+                          abstol = infeasAbsTol, reltol = infeasTol)
+        if pchk.valid; claim = :Infeasible; end
       end
 
-      # Dual Infeasiblity
+      # Dual Infeasibility (recession ray)
       #
-      # Certificate: ∃y,s such that
-      #   Ay - s = 0   (d_infeas1)
-      #   Gy = 0       (d_infeas2)
-      #   Qy = 0       (d_infeas3)
-      #   cᵀy > 0
-      #   s ≧ 0
+      #  y certifies ½yᵀQy - cᵀy is unbounded below over the feasible
+      #  set when
       #
-      # The program returns a certificate y that satisfies
+      #    Ay - s = 0, s ∈ K   (d_infeas1)
+      #    Gy = 0              (d_infeas2)
+      #    Qy = 0              (d_infeas3)
+      #    cᵀy > 0
       #
-      #  CVXOPT style    ECOS style
-      #  ------------------------------
-      #   Ay ≧ 0          Ay ≧ 0
-      #   Gy = 0          Gy = 0
-      #   Qy = 0          Qy = 0
-      #   cᵀy = 1         cᵀy > 0
-      #                   norm(y) = 1
+      #  The screen scales max(d_infeas1, d_infeas2, d_infeas3) two
+      #  ways, both gated on cᵀy > 0:
       #
+      #   CVXOPT style                    ECOS style
+      #   ─────────────────────────       ──────────────────────
+      #    max(d₁/max(1,‖b‖),              max(d₁, d₂, d₃)
+      #        d₂/max(1,‖d‖),              ───────────────
+      #        d₃/max(1,‖c‖)) / |cᵀy|            ‖y‖
+      #
+      #  Again a nomination only: validate_unboundedness_certificate
+      #  makes the claim and normalizes the ray to cᵀȳ = +1.
       d_infeas1 = isempty(A) ? -Inf : norm(A*z.y - z.s)
       d_infeas2 = isempty(G) ? -Inf : norm(G*z.y)
       d_infeas3 = all(isfinite.(z.y)) ? norm(Q*z.y) : NaN
 
-      d_infeas_cvx = cᵀy > 0 ? max(d_infeas1/max(1,normb), d_infeas2/max(1,normd), d_infeas3/max(1,normc))/abs(cᵀy) : NaN
+      d_infeas_cvx  = cᵀy > 0 ? max(d_infeas1/max(1,normb), d_infeas2/max(1,normd), d_infeas3/max(1,normc))/abs(cᵀy) : NaN
       d_infeas_ecos = cᵀy > 0 ? max(d_infeas1, d_infeas2, d_infeas3)/norm(z.y) : NaN
       d_infeas = abs(max(d_infeas_cvx, d_infeas_ecos))
 
-      if d_infeas < infeasTol
-        sol.y[:] = z.y/abs(cᵀy); sol.v[:] = 0*sol.v[:]/0; sol.w[:] = 0*sol.w[:]/0
-        sol.status = :Unbounded
+      if claim == :None && d_infeas < infeasTol
+        (dchk, ȳ) = validate_unboundedness_certificate(
+                       Q, c, A, b, cone_dims, G, d, z.y;
+                       abstol = infeasAbsTol, reltol = infeasTol)
+        if dchk.valid; claim = :Unbounded; end
       end
 
     end
@@ -858,13 +965,21 @@ function conicIP(
       if rnorm > 0.001; print("\x1b[0m"); end
     end
 
-    if verbose
-      if sol.status == :Infeasible; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
-      if sol.status == :Unbounded;  print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
-      if sol.status == :Optimal;    print("\n > EXIT -- Below Tolerance!\n\n"); end
+    if optimal
+      if verbose; print("\n > EXIT -- Below Tolerance!\n\n"); end
+      sol.status = :Optimal
+      return sol
     end
 
-    if sol.status != :None; return sol; end
+    if claim == :Infeasible
+      if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+      return claim_infeasible!(sol, w̄, v̄)
+    end
+
+    if claim == :Unbounded
+      if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+      return claim_unbounded!(sol, ȳ, A)
+    end
 
     # Cause of Divergence Unknown
     if !all(isfinite.([μ, rDu, rPr, rCp]))
@@ -933,11 +1048,104 @@ function conicIP(
 
   end
 
-  sol.status = :Abandoned
+  # ────────────────────────────────────────────────────────────
+  #  Loop exhausted : re-screen the best iterate
+  #
+  #  The screens above are evaluated on the *current* iterate and can
+  #  miss a ray that the best iterate carries. Re-validate that
+  #  iterate here, first at the nominal tolerance (a full claim, rare)
+  #  and then relaxed 100×, which downgrades to :AlmostInfeasible /
+  #  :AlmostUnbounded rather than claiming.
+  # ────────────────────────────────────────────────────────────
+
+  (pchk, w̄, v̄) = validate_infeasibility_certificate(
+                    Q, c, A, b, cone_dims, G, d, sol.w, sol.v;
+                    abstol = infeasAbsTol, reltol = infeasTol)
+  (dchk, ȳ)    = validate_unboundedness_certificate(
+                    Q, c, A, b, cone_dims, G, d, sol.y;
+                    abstol = infeasAbsTol, reltol = infeasTol)
+
+  (pchk100, _, _) = validate_infeasibility_certificate(
+                      Q, c, A, b, cone_dims, G, d, sol.w, sol.v;
+                      abstol = infeasAbsTol, reltol = 100*infeasTol)
+  (dchk100, _)    = validate_unboundedness_certificate(
+                      Q, c, A, b, cone_dims, G, d, sol.y;
+                      abstol = infeasAbsTol, reltol = 100*infeasTol)
+
+  # Secondary signal: complementarity collapsed while the residuals did
+  # not — the signature of a problem with no interior optimum. It only
+  # corroborates a *relaxed* verdict; a ray valid at 1× is never vetoed.
+  μ_collapsed = length(μ_history) > 1 && isfinite(μ_history[end]) &&
+                μ_history[end] <= 1e-3*maximum(μ_history)
+
+  # Diverging complementarity is the classic infeasible-start signature of
+  # an infeasible or unbounded problem (measured: μ can blow up by 1e38 on
+  # an infeasible box). Either extreme — collapse or divergence — is
+  # evidence that no interior optimum exists.
+  μ_diverged = length(μ_history) > 1 && (!isfinite(μ_history[end]) ||
+                μ_history[end] >= 1e3*minimum(μ_history))
+
+  # ── WP5 fallback: recover a ray by an auxiliary min-norm QP ──
+  #  Only when both 1× validations failed AND there is evidence a ray
+  #  exists (a relaxed validation passed, or complementarity collapsed).
+  #  A clean :Abandoned with no such signal does not earn a solve.
+  #  At most one attempt of each kind, and the auxiliary problems get
+  #  kktsolver_qr rather than the caller's solver: they have a different
+  #  structure (min-norm, wide equalities, regularized) and qr is the
+  #  robust default there.
+  if certFallback && !pchk.valid && !dchk.valid &&
+     (pchk100.valid || dchk100.valid || μ_collapsed || μ_diverged)
+
+    # The auxiliary solves use their own iteration budget: the outer
+    # maxIters is small in exactly the regime the fallback exists for.
+    if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0
+      ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d)
+      if ray !== nothing
+        (fchk, fw̄, fv̄) = validate_infeasibility_certificate(
+                            Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
+                            abstol = infeasAbsTol, reltol = infeasTol)
+        if fchk.valid
+          if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+          return claim_infeasible!(sol, fw̄, fv̄)
+        end
+      end
+    end
+
+    if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0
+      ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d)
+      if ray !== nothing
+        (fchk, fȳ) = validate_unboundedness_certificate(
+                       Q, c, A, b, cone_dims, G, d, ray;
+                       abstol = infeasAbsTol, reltol = infeasTol)
+        if fchk.valid
+          if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+          return claim_unbounded!(sol, fȳ, A)
+        end
+      end
+    end
+
+  end
+
+  if pchk.valid
+    if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+    return claim_infeasible!(sol, w̄, v̄)
+  elseif dchk.valid
+    if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+    return claim_unbounded!(sol, ȳ, A)
+  elseif pchk100.valid && μ_collapsed
+    sol.status = :AlmostInfeasible
+  elseif dchk100.valid && μ_collapsed
+    sol.status = :AlmostUnbounded
+  else
+    sol.status = :Abandoned
+  end
+
   return sol
 
 end
 
+include("certificates.jl")
+include("fallback.jl")
 include("preprocessor.jl")
 include("MOI_wrapper.jl")
 

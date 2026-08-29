@@ -31,10 +31,23 @@ which scales off-diagonal entries by `√2` to preserve inner products.
 
 ## Interior-Point Method
 
-ConicIP implements a homogeneous self-dual interior-point method based on
-the approach described by Andersen, Dahl, and Vandenberghe (2003). The
-method solves the primal and dual problems simultaneously and can detect
-infeasibility and unboundedness without a separate Phase I.
+ConicIP implements an **infeasible-start primal-dual interior-point method**
+with Mehrotra predictor-corrector steps and Nesterov-Todd scaling. The
+iterates are not required to be feasible: the method starts from a point
+strictly inside the cone but generally violating `Ay - s = b` and `Gy = d`,
+and drives the primal residual, dual residual, and complementarity gap to
+zero together. There is no Phase I, and no homogeneous self-dual embedding —
+the iterates carry no `τ`/`κ` variables.
+
+The KKT and scaling machinery follows the cone program solver in CVXOPT
+(Andersen, Dahl, and Vandenberghe), which is the closest algorithmic
+reference for the linear algebra at each iteration.
+
+Because the embedding is absent, infeasibility and unboundedness are not
+read off a single variable. They are detected *post hoc*: when the problem
+has no solution, the iterates diverge along a ray, and that ray — once it
+is validated against the original problem data — is the certificate. See
+[Convergence Criteria](@ref) below.
 
 ### Nesterov-Todd Scaling
 
@@ -72,6 +85,42 @@ The solver monitors three residuals:
 The solver terminates with status `:Optimal` when all three residuals
 fall below the tolerance `optTol` (default: `1e-6`).
 
+### The Certificate Pipeline
+
+Detecting infeasibility or unboundedness is a second, independent test,
+run in two stages so that the expensive part is paid only when it is likely
+to succeed.
+
+**Stage 1 — cheap per-iteration screens.** At every iteration the solver
+forms the scaled Farkas residuals used by CVXOPT and ECOS. For primal
+infeasibility these measure `‖Gᵀw - Aᵀv‖` relative to `‖w‖ + ‖v‖` (CVXOPT
+style) and relative to `|dᵀw - bᵀv|` (ECOS style); the analogous screens for
+unboundedness measure `‖Ay - s‖`, `‖Gy‖`, and `‖Qy‖` against `cᵀy`. These
+are functions of the *current, scaled* iterate, so they are cheap but not
+conclusive. A screen falling below `infeasTol` (default `1e-7`, decoupled
+from `optTol`) only nominates the current iterate as a *candidate ray*.
+
+**Stage 2 — validation against the original data.** A candidate is then
+checked by `ConicIP.validate_infeasibility_certificate` or
+`ConicIP.validate_unboundedness_certificate`. These are pure functions of the
+problem data as the user supplied it — they never consult solver state,
+scalings, or preprocessed copies. Each performs three checks:
+
+1. **Normalization.** The separation value must be strictly positive, and
+   the ray is rescaled by it: `dᵀw̄ - bᵀv̄ = -1` for infeasibility, `cᵀȳ = +1`
+   for unboundedness.
+2. **Farkas residual.** `Gᵀw̄ - Aᵀv̄ ≈ 0` for infeasibility; `Qȳ ≈ 0` and
+   `Gȳ ≈ 0` for unboundedness, measured in the `∞`-norm.
+3. **Cone membership.** The blockwise margin of the ray (`v̄` for
+   infeasibility, `Aȳ` for unboundedness) must be nonnegative: the minimum
+   component for an `"R"` block, `x₁ - ‖x₂:ₙ‖` for a `"Q"` block, and the
+   minimum eigenvalue for an `"S"` block.
+
+Checks 2 and 3 are accepted within `infeasAbsTol + infeasTol·(1 + ‖ray‖)`,
+so `infeasAbsTol` (default `1e-9`) sets the floor and `infeasTol` the
+relative slack. Only a candidate that passes all three is reported as a
+certificate.
+
 ## Troubleshooting Solver Output
 
 ### Status: `:Optimal`
@@ -82,7 +131,29 @@ a high-accuracy solution.
 
 ### Status: `:Infeasible`
 
-The solver found a certificate `(w, v)` proving no feasible point exists.
+No feasible point exists. The status is claimed only after a candidate ray
+has passed validation against the original problem data, so it is not an
+inference from a diverging iterate alone.
+
+When `sol.has_certificate` is `true`, `sol.w` and `sol.v` hold the verified
+Farkas ray, normalized so that
+
+```
+dᵀw̄ - bᵀv̄ = -1,    Gᵀw̄ - Aᵀv̄ ≈ 0,    v̄ ∈ K
+```
+
+and the remaining fields are `NaN`. Any nonnegative combination of the
+constraints therefore yields the contradiction `0 ≤ -1`, which you can
+check yourself from the returned vectors.
+
+When `sol.has_certificate` is `false`, the problem was still established as
+infeasible, but no usable ray is returned (all of `y`, `w`, `v`, `s` are
+`NaN`). This happens when infeasibility is settled before the ray exists —
+for example by the consistency checks in
+[`preprocess_conicIP`](@ref ConicIP.preprocess_conicIP), which detect an
+inconsistent equality system directly — or when the residual construction
+that would produce the ray breaks down numerically.
+
 Common causes:
 - Contradictory constraints (e.g., `x ≥ 1` and `x ≤ 0`)
 - Overly tight bounds combined with equality constraints
@@ -91,12 +162,46 @@ Common causes:
 
 ### Status: `:Unbounded`
 
-The solver found a ray along which the objective decreases without bound.
+The objective decreases without bound over the feasible set. As with
+`:Infeasible`, the status is claimed only after validation against the
+original data.
+
+When `sol.has_certificate` is `true`, `sol.y` holds the verified recession
+ray, normalized so that
+
+```
+cᵀȳ = +1,    Qȳ ≈ 0,    Gȳ ≈ 0,    Aȳ ∈ K
+```
+
+with `sol.s = A*ȳ`; `w` and `v` are `NaN`. Moving from any feasible point
+along `ȳ` stays feasible and decreases the objective at unit rate.
+
+When `sol.has_certificate` is `false`, unboundedness was detected but no
+usable ray is returned.
+
 Common causes:
 - Missing constraints that should bound the feasible region
 - `Q = 0` (LP) with an unbounded feasible direction
 
 **What to try:** Add bounding constraints or verify the objective.
+
+### Status: `:AlmostInfeasible` / `:AlmostUnbounded`
+
+The iteration limit was reached with a candidate ray that validates only
+when the tolerances are relaxed by a factor of 100. This is the gray zone
+between a stall and a proof: the evidence points at infeasibility (or
+unboundedness), but not strongly enough to assert it.
+
+No certificate is returned — `has_certificate` is `false` and the solution
+fields hold the best iterate, not a ray. Treat the result as advisory.
+
+**What to try:**
+- Increase `maxIters`; the candidate may sharpen into a real certificate
+- Loosen `infeasTol` if you are confident the problem is infeasible
+- Tighten `infeasTol` if you believe the problem is feasible and the
+  detection is spurious
+- Rescale the problem data, which is the usual cause of a ray that will
+  not quite validate
 
 ### Status: `:Abandoned`
 
@@ -143,7 +248,10 @@ point but the duality gap hasn't closed — try more iterations (`maxIters`).
 | `maxIters` | `100` | Maximum interior-point iterations |
 | `DTB` | `0.01` | Distance-to-boundary parameter; controls step conservatism |
 | `maxRefinementSteps` | `3` | Iterative refinement steps for KKT solve |
-| `infeasTol` | `optTol` | Threshold for infeasibility detection |
+| `infeasTol` | `1e-7` | Relative tolerance for certificate screening and validation |
+| `infeasAbsTol` | `1e-9` | Absolute floor for certificate validation |
+| `staticReg` | `0` | Static regularization of the KKT factorization |
+| `certFallback` | `true` | Attempt an auxiliary certificate solve on stall |
 
 **`optTol`:** Decrease for higher accuracy (e.g., `1e-8`); increase if the
 solver stalls (e.g., `1e-5`). Tighter tolerances require more iterations.
@@ -155,6 +263,35 @@ values (e.g., `0.001`) are more conservative but more stable; larger values
 **`maxIters`:** Increase if the solver reports `:Abandoned` after reaching
 the iteration limit. Most well-conditioned problems converge in 20–50
 iterations.
+
+**`infeasTol`:** Governs certificate detection only, and is deliberately
+decoupled from `optTol` — changing the accuracy you demand of an optimal
+solution should not change how readily the solver declares a problem
+infeasible. Decrease it if the solver reports `:Infeasible` or `:Unbounded`
+for a problem you know has a solution; increase it if a genuinely infeasible
+problem is reported as `:Abandoned` or `:AlmostInfeasible`.
+
+**`infeasAbsTol`:** The absolute term in the validation tolerance
+`infeasAbsTol + infeasTol·(1 + ‖ray‖)`. It matters only for rays whose norm
+is small, where the relative term alone would be too strict. Rarely needs
+adjustment.
+
+**`staticReg`:** Adds `δI` with `δ = staticReg·(1 + ‖Q‖∞)` to the matrix
+that is factorized, so a rank-deficient `[Q Aᵀ Gᵀ]` still yields a usable
+factorization. The perturbation is confined to the factorization: residuals,
+objective values, and iterative refinement all use the true `Q`, so the
+regularized factorization acts as a preconditioner whose error the
+refinement loop removes. The default `0` disables it;
+[`preprocess_conicIP`](@ref ConicIP.preprocess_conicIP) enables it
+automatically when it detects rank deficiency, so setting it by hand is
+usually unnecessary.
+
+**`certFallback`:** When the solver stalls or hits the iteration limit
+without deciding the problem, it solves an auxiliary strongly convex problem
+whose solution is a certificate candidate, then puts that candidate through
+the same validation as any other. The cost is one extra solve on problems
+that would otherwise return `:Abandoned`; set it to `false` if you would
+rather have the stall reported immediately.
 
 ## References
 
