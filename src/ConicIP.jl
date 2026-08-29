@@ -961,7 +961,7 @@ function conicIP(
     if verbose
       if rnorm > 0.001; print("\x1b[1m\x1b[31m"); end
       ξ2()=@printf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %i\n",
-                  Iter, rDu, rPr, rCp, pobj, dobj, p_infeas, d_infeas, rStep);ξ2()
+                  Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, rStep);ξ2()
       if rnorm > 0.001; print("\x1b[0m"); end
     end
 
