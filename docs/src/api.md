@@ -97,4 +97,7 @@ ConicIP.placeholder
 ConicIP.identical_sparse_structure
 ConicIP.count_lift
 ConicIP.count_dense
+ConicIP._psd_moi_vecm_info
+ConicIP._psd_vecm_to_moi
+ConicIP._psd_scale_input!
 ```
