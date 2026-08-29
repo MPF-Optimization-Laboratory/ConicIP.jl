@@ -428,12 +428,16 @@ Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj) =
 """
   conicIP(Q, c, A, b, cone_dims, G, d;
   solve3x3gen = solve3x3gen_sparse,
-  optTol = 1e-5,
+  optTol = 1e-6,
   DTB = 0.01,
   verbose = true,
   maxRefinementSteps = 3,
   maxIters = 100,
   cache_nestodd = false,
+  infeasTol = 1e-7,
+  infeasAbsTol = 1e-9,
+  staticReg = 1e-8,
+  certFallback = true,
   refinementThreshold = optTol/1e7)
 
 Interior point solver for the system
@@ -456,6 +460,14 @@ e.g. [("R",2),("Q",4)] means
 
 SDP Cones are NOT supported and purely experimental at this
 point.
+
+Selected keyword arguments:
+
+- `infeasTol` — infeasibility-certificate tolerance, decoupled from `optTol`.
+- `infeasAbsTol` — absolute tolerance for certificate validation.
+- `staticReg` — static KKT regularization scale; `0` (default) disables it.
+  `preprocess_conicIP` enables it when it detects rank deficiency.
+- `certFallback` — enable fallback certificate solve on stall.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -531,9 +543,14 @@ function conicIP(
   maxRefinementSteps = 3,  # Maximum number of IR Steps
   maxIters = 100,          # Maximum number of interior iterations
   cache_nestodd = false,   # Set to true if there are many small blocks
-  infeasTol = optTol,      # Infeasibility threshold (this shouldn't need to be tweaked,
+  infeasTol = 1e-7,        # Infeasibility threshold (this shouldn't need to be tweaked,
                            # but set it small if the program returns infeasible/unbounded when
                            # you are sure it isn't)
+  infeasAbsTol = 1e-9,     # used by certificate validation (WP3b)
+  staticReg = 0.0,         # Static regularization scale for the KKT factorization
+                           # (0 disables it; preprocess_conicIP opts in when it
+                           # detects rank deficiency in [Q A' G'])
+  certFallback = true,     # enables fallback certificate solve (WP5)
   refinementThreshold = optTol/1e7 # Accuracy of refinement steps
   )
 
@@ -692,7 +709,14 @@ function conicIP(
 
   end
 
-  solve3x3gen = kktsolver(Q,A,G,cone_dims)
+  # Static regularization of the KKT factorization only. The factorization
+  # sees Q + δI, but every other use of Q (residuals, objective, iterative
+  # refinement) keeps the original Q — so the perturbed factorization acts as
+  # a preconditioner whose error the refinement loop corrects.
+  δ = staticReg*(1 + norm(Q, Inf))
+  Qᵣ = δ == 0 ? Q : Q + δ*Id(n)
+
+  solve3x3gen = kktsolver(Qᵣ,A,G,cone_dims)
 
   function solve4x4gen(λ, F, F⁻ᵀ, solve3x3gen = solve3x3gen)
 
