@@ -5,3 +5,8 @@
 docs/build/
 docs/src/tutorials/generated/
 /Manifest.toml
+
+# Track the shared Claude Code settings, nothing else in .claude/
+!.claude/
+.claude/*
+!.claude/settings.json

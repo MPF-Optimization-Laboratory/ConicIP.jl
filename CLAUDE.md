@@ -7,6 +7,7 @@ Pure-Julia conic interior-point solver for quadratic programs with linear, secon
 - GitHub: `MPF-Optimization-Laboratory/ConicIP.jl`
 - Julia compat: `≥ 1.10`
 - Key deps: JuMP, MathOptInterface, WoodburyMatrices
+- Quadratic objectives are supported only through the direct `conicIP` API, not through the JuMP/MOI interface
 
 ## Architecture
 
@@ -55,3 +56,23 @@ julia --project -e 'using Pkg; Pkg.test()'
 
 - Feature branches use worktrees in `.worktrees/` directory
 - `.worktrees/` is gitignored
+
+## Commit and PR conventions
+
+- Never add `Co-Authored-By` lines to commits.
+- When you author a commit, append the trailer:
+
+      Assisted-by: Claude Code
+
+  If the commit is substantially machine-generated, use instead:
+
+      Generated-by: Claude Code
+
+- When you open a PR or issue, or write a substantive comment,
+  end with one line: "Drafted with Claude Code."
+- Never add a `Signed-off-by` line. Sign-off is reserved for humans.
+- Do not add any disclosure to trivial edits dictated verbatim by
+  the maintainer.
+- When opening a PR, fill in the template at
+  `.github/pull_request_template.md`, including the AI-assistance
+  checkbox that matches the commits.
