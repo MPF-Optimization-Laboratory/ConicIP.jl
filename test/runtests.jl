@@ -1660,7 +1660,8 @@ end
         end
         mixes = ([("R", 4), ("Q", 3), ("Q", 5)],
                  [("R", 3), ("Q", 4), ("S", 6)],
-                 [("Q", 8), ("S", 6)])
+                 [("Q", 8), ("S", 6)],
+                 [("S", 6), ("S", 10)])
         for kktsolver = (ConicIP.kktsolver_qr,
                          ConicIP.kktsolver_sparse,
                          pivot(ConicIP.kktsolver_2x2)),
@@ -2185,5 +2186,7 @@ end
             @test isempty(opt.ineq_b)
         end
     end
+
+    include("sdp_tests.jl")
 
 end

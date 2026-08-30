@@ -231,8 +231,10 @@ end
 function nestod_sdc(z,s)
 
   # Nesterov-Todd Scaling Matrix for the Semidefinite Cone
-  # Matrix which satisfies the properties
-  # W*z = inv(W)*sb
+  # Matrix which satisfies the property
+  # F*z = inv(F')*s
+  # (equivalently F'*(F*z) = s).  Note inv(F') and not inv(F): the two
+  # agree only when mat(z) and mat(s) commute.
 
   Ls  = cholesky(mat(s)).L
   Lz  = cholesky(mat(z)).L
