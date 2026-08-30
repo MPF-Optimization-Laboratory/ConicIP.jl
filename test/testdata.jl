@@ -148,3 +148,65 @@ function miles_problem_3()
     A_mpb = sparse(I, J, V, length(b), length(c))
     return (c=c, A=A_mpb, b=b, con_cones=con_cones, var_cones=var_cones)
 end
+
+# ──────────────────────────────────────────────────────────────
+#  Issue #10 structural class: sum-of-norms SOCP
+#  min Σᵢ tᵢ  s.t.  rᵢ = Aᵢx - bᵢ,  (tᵢ; rᵢ) ∈ Q³
+#  Many 3-dim SOCs + many equality rows, very sparse — the shape
+#  of mlubin's gist instance (n=6010, 16010 nnz, ~2.7 nnz/col).
+# ──────────────────────────────────────────────────────────────
+using Random
+
+"""
+    socp_sum_of_norms(k; d, seed) -> (Q, c, A, b, cone_dims, G, d)
+
+Generate a sum-of-norms SOCP in ConicIP internal form with `k` 3-dim
+second-order cones over `x ∈ R^d`. Variables are `y = (x, t, r)` with
+`n = d + 3k`; equalities `rᵢ - Aᵢx = -bᵢ` give `p = 2k` rows; cone
+constraints select `(tᵢ; rᵢ)` giving `m = 3k`. Requires `2k ≥ d` so the
+stacked `Aᵢ` has full column rank (every column is covered
+deterministically), making the problem bounded with a unique minimizer
+generically. `k=1000, d=2000` matches issue #10's scale; `k=150, d=200`
+is test-suite sized.
+"""
+function socp_sum_of_norms(k::Int; d::Int = max(2, div(k, 2)), seed::Int = 0)
+    2k >= d || throw(ArgumentError("socp_sum_of_norms needs 2k ≥ d " *
+                                   "(got k=$k, d=$d): the stacked Aᵢ " *
+                                   "would be column-rank-deficient"))
+    rng = Random.MersenneTwister(seed)
+    n = d + 3k
+    ti(i) = d + i           # index of tᵢ
+    ri(j) = d + k + j       # index of r component j (j = 1:2k)
+
+    # Equalities: rᵢ - Aᵢ x = -bᵢ, one 2-vector per cone
+    Ig, Jg, Vg = Int[], Int[], Float64[]
+    dvec = zeros(2k)
+    for j in 1:2k
+        push!(Ig, j); push!(Jg, ri(j)); push!(Vg, 1.0)
+        # deterministic column for full coverage of x, plus two random ones
+        push!(Ig, j); push!(Jg, mod1(j, d)); push!(Vg, -randn(rng))
+        for _ in 1:2
+            push!(Ig, j); push!(Jg, rand(rng, 1:d)); push!(Vg, -randn(rng))
+        end
+        dvec[j] = -randn(rng)
+    end
+    G = sparse(Ig, Jg, Vg, 2k, n)
+
+    # Inequalities: (tᵢ; rᵢ) ∈ Q³ — pure selector rows, b = 0
+    Ia, Ja, Va = Int[], Int[], Float64[]
+    for i in 1:k
+        base = 3(i - 1)
+        push!(Ia, base + 1); push!(Ja, ti(i));      push!(Va, 1.0)
+        push!(Ia, base + 2); push!(Ja, ri(2i - 1)); push!(Va, 1.0)
+        push!(Ia, base + 3); push!(Ja, ri(2i));     push!(Va, 1.0)
+    end
+    A = sparse(Ia, Ja, Va, 3k, n)
+    b = zeros(3k)
+    cone_dims = [("Q", 3) for _ in 1:k]
+
+    Q = spzeros(n, n)
+    c = zeros(n)
+    c[d+1:d+k] .= -1.0    # minimize Σ tᵢ (solver minimizes -c'y)
+
+    return (Q=Q, c=c, A=A, b=b, cone_dims=cone_dims, G=G, d=dvec)
+end
