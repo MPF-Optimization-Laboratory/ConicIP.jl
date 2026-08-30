@@ -108,7 +108,9 @@ ConicIP.broadcastf
 ConicIP.Id
 ConicIP.VecCongurance
 ConicIP.mat
+ConicIP.mat!
 ConicIP.vecm
+ConicIP.vecm!
 ConicIP.imcols
 ```
 
