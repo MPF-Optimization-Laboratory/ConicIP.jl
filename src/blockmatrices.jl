@@ -51,6 +51,10 @@ end
 Base.size(A::Block, i::Integer)    = (i == 1 || i == 2) ? size(A)[1] : 1
 getindex(A::Block, i::Int)         = A.Blocks[i]
 setindex!(A::Block, B::BlockElem, i::Int) = begin; A.Blocks[i] = B; end
+# NB: any block type outside BlockElem is SILENTLY densified here. If a
+# block operation starts returning a new type (e.g. a plain Woodbury from
+# a SymWoodbury product), extend BlockElem rather than paying an O(k²)
+# dense conversion on every assignment.
 setindex!(A::Block, B, i::Int) = begin; A.Blocks[i] = Matrix{Float64}(B); end
 
 """

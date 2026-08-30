@@ -1,11 +1,12 @@
 """
-  imcols(A, b; ϵ = 1e-10)
+  imcols(A, b, ϵ = 1e-8)
 
 Removes redundant inequalities in a system of equations
 
 Ax = b
 
-and checks if the equations are consistent.
+and checks if the equations are consistent. Returns `(R, consistent)`
+where `R` are the indices of a maximal independent row set.
 """
 function imcols(A, b, ϵ = 1e-8)
 
@@ -19,15 +20,25 @@ function imcols(A, b, ϵ = 1e-8)
 
   A = A/nA; b = b/nA
 
+  # SPQR of A'. Row selection uses Heath-style dead-column detection:
+  # a small |R[i,i]| marks column pcol[i] of A' (row pcol[i] of A) as
+  # dependent on the kept ones — the same heuristic SPQR itself uses for
+  # rank detection. It is a heuristic, not a strong rank-revealing
+  # factorization; the certificate validators downstream re-validate any
+  # verdict against the original data, which is what makes this sound.
   F = qr(sparse(A'))
-  R_mat = F.R
-  n_r = min(size(R_mat)...)
-  diag_R = [abs(R_mat[i,i]) for i in 1:n_r]
-  piv = F.pcol  # column permutation
-  R = sort(piv[findall(diag_R .> ϵ)])
+  diag_R = abs.(diag(F.R))
+  n_r = min(size(F.R)...)
+  piv = F.pcol  # fill-reducing column permutation
+  R = sort(piv[findall(view(diag_R, 1:n_r) .> ϵ)])
 
   if isempty(R); return ([], true); end
 
+  # Consistency: solve with the kept rows and verify against all rows.
+  # NB this is a second sparse factorization. Reusing F alone is not
+  # sound: SPQR's dead columns leave nonzero off-diagonal rows in R, so
+  # an R-only test with the dead coordinates zeroed checks membership in
+  # a subspace of the true row space and can misreport inconsistency.
   return (norm(A*(A[R,:]\b[R]) - b, Inf) < ϵ) ? (R, true) : ([], false)
 
 end
@@ -151,6 +162,17 @@ function preprocess_conicIP(Q, c::AbstractVector,
     verbose = verbose,       #                   |
     staticReg = reg,         # Removed redundant linear constraints
     rest...)                 # TODO : (use view?)
+
+  # One retry with static regularization on a numerical (:Error) failure,
+  # only when the first attempt ran unregularized and the caller did not
+  # pin staticReg themselves. A rank-deficient G is deliberately NOT
+  # retried this way: staticReg touches only the Q block and cannot cure
+  # it (imcols already trimmed dependent rows above).
+  if sol.status == :Error && reg == 0.0 && !haskey(opts, :staticReg)
+    if verbose; println("   - KKT failure; retrying once with staticReg = 1e-8"); end
+    sol = conicIP(Q, c, A, b, cone_dims, G[IP,:], d[IP];
+      verbose = verbose, staticReg = 1e-8, rest...)
+  end
 
   # Re-expand the equality duals over the original rows, zero on the dropped
   # ones. This is exact for the two quantities the certificate identity uses:

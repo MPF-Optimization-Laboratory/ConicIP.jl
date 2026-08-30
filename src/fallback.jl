@@ -37,7 +37,7 @@
 
 """
     fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
-                               kktsolver = kktsolver_qr, maxIters = 50)
+                               kktsolver = default_kktsolver, maxIters = 50)
 
 Solve the minimum-norm Farkas auxiliary QP and return a candidate
 infeasibility ray `(w, v)`, or `nothing` if the auxiliary solve does not
@@ -48,7 +48,7 @@ The returned pair is *not* validated and *not* normalized — pass it to
 [`validate_infeasibility_certificate`](@ref).
 """
 function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
-                                    kktsolver = kktsolver_qr,
+                                    kktsolver = default_kktsolver,
                                     maxIters = 50)
 
   n = length(c)
@@ -106,7 +106,7 @@ end
 
 """
     fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
-                           kktsolver = kktsolver_qr, maxIters = 50)
+                           kktsolver = default_kktsolver, maxIters = 50)
 
 Solve the minimum-norm recession auxiliary QP and return a candidate
 unboundedness ray `y`, or `nothing` if the auxiliary solve does not reach
@@ -118,7 +118,7 @@ validated and *not* normalized — pass it to
 [`validate_unboundedness_certificate`](@ref).
 """
 function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
-                                kktsolver = kktsolver_qr,
+                                kktsolver = default_kktsolver,
                                 maxIters = 50)
 
   n = length(c)
