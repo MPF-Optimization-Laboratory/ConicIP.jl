@@ -1,17 +1,31 @@
 import MathOptInterface as MOI
 
 """
-    Optimizer(; verbose=false, optTol=1e-6, maxIters=100, infeasTol=1e-7)
+    Optimizer(; kwargs...)
 
 MathOptInterface optimizer wrapping the ConicIP interior-point solver.
 Use as a JuMP solver via `Model(ConicIP.Optimizer)`.
 
-# Keyword Arguments
+# Options
+
+Settable as constructor keywords or through
+`MOI.RawOptimizerAttribute` / JuMP's `set_attribute`:
+
 - `verbose::Bool` -- print solver iterations (default: `false`)
 - `optTol::Float64` -- optimality tolerance (default: `1e-6`)
 - `maxIters::Int` -- maximum iterations (default: `100`)
 - `infeasTol::Float64` -- infeasibility/unboundedness certificate tolerance
   (default: `1e-7`)
+- `kktsolver` -- `"auto"` (default; picks by cone mix and sparsity via
+  [`choose_kktsolver`](@ref)), `"qr"`, `"sparse"`, `"2x2"`, or a solver
+  function
+- `preprocess::Bool` -- remove redundant equality rows via
+  [`preprocess_conicIP`](@ref) before solving (default: `true`)
+- plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `staticReg`,
+  `certFallback`, `certFallbackIters`, `cache_nestodd` — forwarded to
+  [`conicIP`](@ref)
+
+`MOI.Silent` is supported and overrides `verbose`.
 
 # Supported Constraints
 - **Vector:** `Zeros`, `Nonnegatives`, `Nonpositives`, `SecondOrderCone`,
@@ -39,23 +53,79 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     ineq_b::Vector{Float64}                                # inequality constraint RHS
     # Timing
     solve_time::Float64
-    # Solver options
-    verbose::Bool
-    optTol::Float64
-    maxIters::Int
-    infeasTol::Float64
+    # Solver options: only the ones explicitly set are stored, so the
+    # solver's own defaults (and the preprocessor's dynamic staticReg
+    # opt-in) stay in charge of everything else.
+    options::Dict{String, Any}
+    silent::Bool
 end
 
-function Optimizer(; verbose::Bool = false, optTol::Float64 = 1e-6,
-                   maxIters::Int = 100, infeasTol::Float64 = 1e-7)
-    return Optimizer(
+# Options settable via MOI.RawOptimizerAttribute (and Optimizer kwargs)
+const _SUPPORTED_OPTIONS = (
+    "verbose", "optTol", "maxIters", "infeasTol", "infeasAbsTol", "DTB",
+    "maxRefinementSteps", "staticReg", "certFallback", "certFallbackIters",
+    "cache_nestodd", "kktsolver", "preprocess",
+)
+
+# Map a kktsolver name to the solver constructor. Accepts the constructor
+# itself, or "auto" | "qr" | "sparse" | "2x2"/"pivot".
+function _resolve_kktsolver(v)
+    v isa Function && return v
+    s = lowercase(string(v))
+    s == "auto"             && return default_kktsolver
+    s == "qr"               && return kktsolver_qr
+    s == "sparse"           && return kktsolver_sparse
+    s in ("2x2", "pivot")   && return pivot(kktsolver_2x2)
+    throw(ArgumentError(
+        "unknown kktsolver \"$v\" (expected \"auto\", \"qr\", \"sparse\", " *
+        "\"2x2\", or a solver function)"))
+end
+
+function Optimizer(; kwargs...)
+    model = Optimizer(
         nothing, false, 0.0, 0, Float64[],
         Pair{Any, UnitRange{Int}}[], Float64[], Bool[], nothing, Float64[],
         Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[], Bool[], nothing, Float64[],
         NaN,
-        verbose, optTol, maxIters, infeasTol,
+        Dict{String, Any}(), false,
     )
+    for (k, v) in kwargs
+        MOI.set(model, MOI.RawOptimizerAttribute(string(k)), v)
+    end
+    return model
 end
+
+MOI.supports(::Optimizer, attr::MOI.RawOptimizerAttribute) =
+    attr.name in _SUPPORTED_OPTIONS
+
+function MOI.set(model::Optimizer, attr::MOI.RawOptimizerAttribute, value)
+    if !MOI.supports(model, attr)
+        throw(MOI.UnsupportedAttribute(attr))
+    end
+    if attr.name == "kktsolver"
+        _resolve_kktsolver(value)   # validate eagerly
+    end
+    model.options[attr.name] = value
+    return
+end
+
+function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
+    if !MOI.supports(model, attr)
+        throw(MOI.UnsupportedAttribute(attr))
+    end
+    defaults = Dict{String, Any}(
+        "verbose" => false, "optTol" => 1e-6, "maxIters" => 100,
+        "infeasTol" => 1e-7, "infeasAbsTol" => 1e-9, "DTB" => 0.01,
+        "maxRefinementSteps" => 3, "staticReg" => 0.0,
+        "certFallback" => true, "certFallbackIters" => 50,
+        "cache_nestodd" => false, "kktsolver" => "auto",
+        "preprocess" => true)
+    return get(model.options, attr.name, defaults[attr.name])
+end
+
+MOI.supports(::Optimizer, ::MOI.Silent) = true
+MOI.set(model::Optimizer, ::MOI.Silent, value::Bool) = (model.silent = value; nothing)
+MOI.get(model::Optimizer, ::MOI.Silent) = model.silent
 
 function MOI.empty!(model::Optimizer)
     model.sol = nothing
@@ -408,13 +478,15 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.ineq_b = b
 
     # ── Solve ──
+    do_preprocess = get(dest.options, "preprocess", true)
+    verbose = dest.silent ? false : get(dest.options, "verbose", false)
+    solver = _resolve_kktsolver(get(dest.options, "kktsolver", "auto"))
+    kw = (; (Symbol(k) => v for (k, v) in dest.options
+             if k ∉ ("preprocess", "kktsolver", "verbose"))...)
+    entry = do_preprocess ? preprocess_conicIP : conicIP
     t0 = time()
-    dest.sol = preprocess_conicIP(Q, c_int, A, b, cone_dims, G, d;
-        verbose = dest.verbose,
-        optTol = dest.optTol,
-        maxIters = dest.maxIters,
-        infeasTol = dest.infeasTol,
-    )
+    dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
+        verbose = verbose, kktsolver = solver, kw...)
     dest.solve_time = time() - t0
 
     return index_map, false
@@ -453,6 +525,8 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
         return MOI.ALMOST_DUAL_INFEASIBLE
     elseif status == :Abandoned
         return MOI.ITERATION_LIMIT
+    elseif status == :Error
+        return MOI.NUMERICAL_ERROR
     else
         return MOI.OTHER_ERROR
     end
@@ -503,7 +577,10 @@ function MOI.get(model::Optimizer, ::MOI.RawStatusString)
     if model.sol === nothing
         return "OPTIMIZE_NOT_CALLED"
     end
-    return string(model.sol.status)
+    if isempty(model.sol.message)
+        return string(model.sol.status)
+    end
+    return string(model.sol.status, ": ", model.sol.message)
 end
 
 function MOI.get(model::Optimizer, attr::MOI.ObjectiveValue)

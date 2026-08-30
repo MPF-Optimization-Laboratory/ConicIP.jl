@@ -26,17 +26,42 @@ Nesterov-Todd scaling. The block type depends on the cone:
 | `"Q"` | `SymWoodbury` | Low-rank-plus-diagonal for second-order cone |
 | `"S"` | `VecCongurance` | Congruence transform for semidefinite cone |
 
+## Automatic Selection (default)
+
+By default (`kktsolver = default_kktsolver`), ConicIP picks the solver
+per problem via [`choose_kktsolver`](@ref ConicIP.choose_kktsolver),
+using cone mix, size, and *structural* sparsity — never the storage
+type of the inputs:
+
+1. **Any SDP cone → `kktsolver_qr`.** The dense double-QR method is the
+   numerically robust choice for the dense SDP scaling blocks.
+2. **Small problems (`n + m + p < 1000`) → `kktsolver_qr`.** Dense
+   factorization wins at small sizes; behavior matches the historical
+   default exactly.
+3. **Dense-ish data (more than 10 structural nonzeros per column of
+   `[Q; A; G]` on average) → `kktsolver_qr`.** A sparse-typed matrix
+   with dense columns (e.g. many small SOCs over a 10%-dense `A`)
+   factors faster densely.
+4. **Otherwise → `kktsolver_sparse`.** Large and genuinely sparse —
+   the regime of [issue #10](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/issues/10),
+   where the dense method is slower by orders of magnitude.
+
+With `verbose = true` the solver prints the choice it made. Passing
+`kktsolver` explicitly always overrides the heuristic.
+
 ## Built-in Solvers
 
-### `kktsolver_qr` (default)
+### `kktsolver_qr`
 
-QR-based solver using the double QR method from CVXOPT. This is the
-default and works reliably for all problem types.
+QR-based solver using the double QR method from CVXOPT: a thin QR of
+`G'` at setup, then per iteration a Cholesky factorization of the
+reduced Hessian `Q₂'(Q + AᵀF⁻¹F⁻ᵀA)Q₂` on the null space of `G`.
 
-**When to use:** General-purpose; a safe default for any problem.
+**When to use:** SDP problems, and small or dense problems.
 
-**Trade-offs:** More numerically robust than sparse LU, but slower for
-large sparse problems.
+**Trade-offs:** Numerically robust, but the per-iteration factorization
+is dense — `O((n-p)³)` — so it is the wrong choice for large sparse
+problems.
 
 ### `kktsolver_sparse`
 
@@ -50,7 +75,10 @@ strategies:
   Better when constraints are the product of many small cones.
 
 The solver estimates the nonzero count for each strategy and picks the
-sparser one automatically.
+sparser one automatically. (SDP blocks cannot be lifted, so any `"S"`
+cone forces the dense formulation.) The sparse LU factorization reuses
+its symbolic analysis across iterations once the sparsity pattern
+stabilizes.
 
 **When to use:** Large problems with sparse `Q` and `A`.
 
@@ -70,16 +98,27 @@ sol = conicIP(Q, c, A, b, cone_dims; kktsolver=pivot(kktsolver_2x2))
 **When to use:** Problems where the Schur complement `Q + Aᵀ(FᵀF)⁻¹A`
 is sparser or better conditioned than the full 3×3 system.
 
-## Choosing a Solver
+## Choosing a Solver Manually
+
+The automatic default covers the common cases. Override it when you
+know better:
 
 | Problem characteristics | Recommended solver |
 |------------------------|-------------------|
-| Small/medium, any structure | `kktsolver_qr` (default) |
-| Large, sparse Q and A | `kktsolver_sparse` |
+| Small/medium, any structure | `kktsolver_qr` (auto picks this) |
+| Any SDP cone | `kktsolver_qr` (auto picks this) |
+| Large, sparse Q and A | `kktsolver_sparse` (auto picks this) |
 | Large, few large SOC cones | `kktsolver_sparse` (uses lifted form) |
-| Large, many small cones | `kktsolver_sparse` (uses dense form) |
-| Structured Schur complement | `pivot(kktsolver_2x2)` |
+| Structured/sparse Schur complement | `pivot(kktsolver_2x2)` |
 | Custom problem structure | Write a custom solver (see below) |
+
+If a factorization breaks down (e.g. rank-deficient `G` passed directly
+to [`conicIP`](@ref)), the solver returns a `Solution` with
+`status == :Error` and the failure reason in `sol.message` rather than
+throwing; [`preprocess_conicIP`](@ref) removes redundant rows up front,
+and structurally degenerate inputs (an all-zero equality row, a variable
+appearing in no constraint) are detected exactly in `O(nnz)` and either
+deflated or answered with a certified `:Infeasible`/`:Unbounded`.
 
 ## Writing a Custom Solver
 

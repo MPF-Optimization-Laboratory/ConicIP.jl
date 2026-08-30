@@ -1,7 +1,7 @@
 module ConicIP
 
 export Id, conicIP, pivot, preprocess_conicIP,
-  Optimizer, Block
+  Optimizer, Block, choose_kktsolver, default_kktsolver
 
 import Base: +, *, -, \, ^
 using LinearAlgebra
@@ -65,8 +65,26 @@ function axpy4!(α::Number, x::v4x1, y::v4x1)
     axpy!(α, x.v, y.v); axpy!(α, x.s, y.s)
 end
 
+# dest = a - b, in place (no allocation)
+function sub4!(dest::v4x1, a::v4x1, b::v4x1)
+    dest.y .= a.y .- b.y; dest.w .= a.w .- b.w
+    dest.v .= a.v .- b.v; dest.s .= a.s .- b.s
+    return dest
+end
+
 # VecCongurance methods that depend on mat/vecm (defined below)
-*(W::VecCongurance, x::VectorTypes)    = vecm(W.R'*mat(x)*W.R)
+*(W::VecCongurance, x::AbstractVector) = vecm(W.R'*mat(x)*W.R)
+
+# Column-wise action on matrices. Needed for Block*Matrix products with
+# SDP blocks; the old `x::VectorTypes` signature also captured 2-D
+# SubArrays and fed whole matrices to mat().
+function *(W::VecCongurance, X::AbstractMatrix)
+  Y = zeros(size(X,1), size(X,2))
+  for j in axes(X,2)
+    Y[:,j] = W * view(X,:,j)
+  end
+  return Y
+end
 
 function Base.Matrix(W::VecCongurance)
   n = size(W,1)
@@ -99,19 +117,27 @@ function mat(x)
   #  3√2  5√2   6
 
   n = ord(x)
-  Z = zeros(n,n)
-  for i = 1:n
-    k = round(Int, length(x) - (n-i+2)*(n-i+1)/2)
-    for j = 1:n
-      if i <= j
-        if i == j
-          Z[i,j] = x[k+j-i+1]
-        else
-          Z[i,j] = x[k+j-i+1]/√2
-        end
-      else
-        Z[i,j] = Z[j,i];
-      end
+  return mat!(zeros(n,n), x)
+
+end
+
+"""
+    mat!(Z, x)
+
+In-place [`mat`](@ref): fill the symmetric matrix `Z` from the
+vectorized form `x`. `Z` must be `ord(x)` square.
+"""
+function mat!(Z, x)
+
+  n = size(Z,1)
+  s = 1/√2
+  c = 1
+  @inbounds for i = 1:n
+    Z[i,i] = x[c]; c += 1
+    for j = i+1:n
+      v = x[c]*s
+      Z[i,j] = v; Z[j,i] = v
+      c += 1
     end
   end
   return Z
@@ -132,18 +158,24 @@ function vecm(Z)
   # [1 2√2 3√2 4 5√2 6]
 
   n = size(Z,1)
-  x = zeros(round(Int, n*(n+1)/2))
+  return vecm!(zeros((n*(n+1)) >> 1), Z)
+
+end
+
+"""
+    vecm!(x, Z)
+
+In-place [`vecm`](@ref): write the vectorized form of the symmetric
+matrix `Z` into `x`, which must have length `n(n+1)/2`.
+"""
+function vecm!(x, Z)
+
+  n = size(Z,1)
   c = 1
-  for i = 1:n
-    for j = 1:n
-      if i <= j
-        if i == j
-          x[c] = Z[i,j];
-        else
-          x[c] = Z[i,j]*√2;
-        end
-        c = c + 1;
-      end
+  @inbounds for i = 1:n
+    x[c] = Z[i,i]; c += 1
+    for j = i+1:n
+      x[c] = Z[i,j]*√2; c += 1
     end
   end
   return x
@@ -419,12 +451,16 @@ mutable struct Solution
   pobj   :: Real
   dobj   :: Real
   has_certificate :: Bool  # y/w/v carry a verified ray
+  message :: String        # diagnostic detail (e.g. the factorization
+                           # failure behind an :Error status); "" otherwise
 
 end
 
-# 12-argument constructor: no certificate by default
+# 12/13-argument constructors: no certificate / no message by default
 Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj) =
-  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false)
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false, "")
+Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate) =
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, "")
 
 # Overwrite sol with a *verified* infeasibility ray (dᵀw̄ - bᵀv̄ = -1).
 # The primal iterate is discarded: it means nothing on an empty feasible set.
@@ -448,9 +484,47 @@ function claim_unbounded!(sol::Solution, ȳ, A)
   return sol
 end
 
+# ──────────────────────────────────────────────────────────────
+#  Structural degeneracy and KKT failure handling (issue #10)
+# ──────────────────────────────────────────────────────────────
+
+# Factorization failures that degrade to a clean :Error status instead of
+# escaping the solver. Deliberately narrow: anything else (BoundsError,
+# ArgumentError, …) signals a broken invariant and must propagate.
+const KKT_FAILURES = Union{LinearAlgebra.SingularException,
+                           LinearAlgebra.PosDefException,
+                           LinearAlgebra.ZeroPivotException,
+                           LinearAlgebra.LAPACKException}
+
+# Rows/columns of M with no structural nonzero entry, in O(nnz).
+function structurally_zero_rows(M::SparseMatrixCSC)
+  z = trues(size(M,1))
+  rv = rowvals(M); nz = nonzeros(M)
+  @inbounds for k in 1:length(rv)
+    if nz[k] != 0; z[rv[k]] = false; end
+  end
+  return z
+end
+structurally_zero_rows(M::AbstractMatrix) =
+  BitVector(Bool[all(iszero, view(M,i,:)) for i in 1:size(M,1)])
+
+function structurally_zero_cols(M::SparseMatrixCSC)
+  z = trues(size(M,2))
+  nz = nonzeros(M)
+  @inbounds for j in 1:size(M,2)
+    # NB: a comma-form `for j, k` would exit both loops on break
+    for k in nzrange(M,j)
+      if nz[k] != 0; z[j] = false; break; end
+    end
+  end
+  return z
+end
+structurally_zero_cols(M::AbstractMatrix) =
+  BitVector(Bool[all(iszero, view(M,:,j)) for j in 1:size(M,2)])
+
 """
   conicIP(Q, c, A, b, cone_dims, G, d;
-  solve3x3gen = solve3x3gen_sparse,
+  kktsolver = default_kktsolver,
   optTol = 1e-6,
   DTB = 0.01,
   verbose = true,
@@ -459,8 +533,9 @@ end
   cache_nestodd = false,
   infeasTol = 1e-7,
   infeasAbsTol = 1e-9,
-  staticReg = 1e-8,
+  staticReg = 0.0,
   certFallback = true,
+  certFallbackIters = 50,
   refinementThreshold = optTol/1e7)
 
 Interior point solver for the system
@@ -493,7 +568,18 @@ Returns a [`Solution`](@ref) whose `status` is one of
   when the best iterate carries a ray that validates at `100*infeasTol`
   but not at `infeasTol`. The best iterate is retained.
 - `:Abandoned` — iteration limit reached with no verdict.
-- `:Error` — nonfinite residuals.
+- `:Error` — nonfinite residuals, or a KKT factorization failure (the
+  reason is recorded in `sol.message`). Rank-deficient `G` handed
+  directly to `conicIP` typically lands here; use
+  [`preprocess_conicIP`](@ref) to trim redundant rows first. `staticReg`
+  regularizes only the `Q` block of the KKT system and cannot repair a
+  rank-deficient `G`.
+
+Structurally degenerate inputs are handled exactly before any
+factorization: an all-zero row of `G` is deflated (`dᵢ = 0`) or answered
+with a certified `:Infeasible` (`dᵢ ≠ 0`), and a variable absent from
+`Q`, `A`, and `G` is deflated (`cⱼ = 0`) or answered with a certified
+`:Unbounded` (`cⱼ ≠ 0`).
 
 Selected keyword arguments:
 
@@ -569,7 +655,7 @@ function conicIP(
   # │ Q + AᵀFᵀFA  G' │ │ a │ = │ y │
   # │ G              │ │ b │   │ w │
   # └                ┘ └   ┘   └   ┘
-  kktsolver = kktsolver_qr,
+  kktsolver = default_kktsolver,
 
   optTol = 1e-6,           # Optimal Tolerance
   DTB = 0.01,              # Distance to Boundary
@@ -585,6 +671,7 @@ function conicIP(
                            # (0 disables it; preprocess_conicIP opts in when it
                            # detects rank deficiency in [Q A' G'])
   certFallback = true,     # enables fallback certificate solve (WP5)
+  certFallbackIters = 50,  # iteration budget for each fallback solve
   refinementThreshold = optTol/1e7 # Accuracy of refinement steps
   )
 
@@ -600,10 +687,13 @@ function conicIP(
   block_data   = zip(block_types, cum_range(block_sizes),
                      [i for i in 1:length(block_types)])
 
-  # Pre-allocated buffers for in-place ÷! and ∘! (avoids zeros(m) per call)
+  # Pre-allocated buffers for in-place cone_div!/cone_prod! (avoids
+  # zeros(m) per call), and v4x1 scratch for the refinement loop
   _div_buf   = zeros(m)
   _prod_buf1 = zeros(m)
   _prod_buf2 = zeros(m)
+  _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
 
   # Pre-allocated Block for inv(F)' — reused each iteration
   F⁻ᵀ_cache = Block(size(block_sizes, 1))
@@ -620,6 +710,80 @@ function conicIP(
   size(c,1) != n        ? error("Inconsistency in inequalities/objective") : ◂
   size(d,1) != p        ? error("Inconsistency in equalities") : ◂
   size(G,2) != n        ? error("Inconsistency in equalities/objective") : ◂
+
+  # ────────────────────────────────────────────────────────────
+  #  Structural degeneracy: exact O(nnz) handling (issue #10)
+  #
+  #  A structurally zero row of G is either trivially infeasible
+  #  (dᵢ ≠ 0 ⇒ the Farkas ray -sign(dᵢ)eᵢ) or vacuous (dᵢ = 0 ⇒
+  #  deflate the row and re-expand the dual). A zero column of
+  #  [Q; A; G] with cⱼ ≠ 0 admits the recession ray sign(cⱼ)eⱼ;
+  #  with cⱼ = 0 the variable is deflated. Without these checks
+  #  every KKT factorization below is exactly singular.
+  # ────────────────────────────────────────────────────────────
+
+  Gzr = structurally_zero_rows(G)
+  Zc  = structurally_zero_cols(Q) .& structurally_zero_cols(A) .&
+        structurally_zero_cols(G)
+
+  i0 = findfirst(i -> Gzr[i] && d[i] != 0, 1:p)
+  if i0 !== nothing
+    w̄0 = zeros(p); w̄0[i0] = -sign(d[i0])
+    (chk, w̄, v̄) = validate_infeasibility_certificate(
+        Q, c, A, b, cone_dims, G, d, w̄0, zeros(m);
+        abstol = infeasAbsTol, reltol = infeasTol)
+    if chk.valid
+      if verbose
+        print("\n > EXIT -- Structurally infeasible (zero row $(i0) of G, d[$(i0)] ≠ 0)\n\n")
+      end
+      sol0 = Solution(fill(NaN,n), zeros(p), zeros(m), fill(NaN,m),
+                      :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
+      return claim_infeasible!(sol0, w̄, v̄)
+    end
+  end
+
+  j0 = findfirst(j -> Zc[j] && c[j] != 0, 1:n)
+  if j0 !== nothing
+    ȳ0 = zeros(n); ȳ0[j0] = sign(c[j0])
+    (chk, ȳ) = validate_unboundedness_certificate(
+        Q, c, A, b, cone_dims, G, d, ȳ0;
+        abstol = infeasAbsTol, reltol = infeasTol)
+    if chk.valid
+      if verbose
+        print("\n > EXIT -- Structurally unbounded (zero column $(j0) of [Q; A; G], c[$(j0)] ≠ 0)\n\n")
+      end
+      sol0 = Solution(zeros(n), fill(NaN,p), fill(NaN,m), zeros(m),
+                      :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
+      return claim_unbounded!(sol0, ȳ, A)
+    end
+  end
+
+  if any(Gzr) || any(Zc)
+    keep_r = findall(.!Gzr)
+    keep_c = findall(.!Zc)
+    solr = conicIP(Q[keep_c, keep_c], c[keep_c], A[:, keep_c], b, cone_dims,
+                   G[keep_r, keep_c], d[keep_r];
+                   kktsolver = kktsolver, optTol = optTol, DTB = DTB,
+                   verbose = verbose, maxRefinementSteps = maxRefinementSteps,
+                   maxIters = maxIters, cache_nestodd = cache_nestodd,
+                   infeasTol = infeasTol, infeasAbsTol = infeasAbsTol,
+                   staticReg = staticReg, certFallback = certFallback,
+                   certFallbackIters = certFallbackIters,
+                   refinementThreshold = refinementThreshold)
+    # Re-expand, inserting zeros at deflated positions when the block is
+    # meaningful for the returned status (see the Solution field table);
+    # blocks the convention leaves NaN stay all-NaN.
+    best_iter = solr.status in (:Optimal, :Abandoned, :AlmostInfeasible,
+                                :AlmostUnbounded, :Error, :None)
+    w_ok = best_iter || (solr.status == :Infeasible && solr.has_certificate)
+    y_ok = best_iter || (solr.status == :Unbounded && solr.has_certificate)
+    w = fill(NaN, p); y = fill(NaN, n)
+    if w_ok; fill!(w, 0.0); w[keep_r] = solr.w; end
+    if y_ok; fill!(y, 0.0); y[keep_c] = solr.y; end
+    return Solution(y, w, solr.v, solr.s, solr.status, solr.Iter, solr.Mu,
+                    solr.prFeas, solr.duFeas, solr.muFeas, solr.pobj,
+                    solr.dobj, solr.has_certificate, solr.message)
+  end
 
   # Number to scale (z's) by
   # 1 for each R_+ dimension
@@ -684,46 +848,16 @@ function conicIP(
 
   end
 
-  function ÷(x,y)
-
-    # Group division x ○\ y
-
-    o = zeros(length(x))
-    @inbounds for (btype, I, i) = block_data
-      xI = view(x,I); yI = view(y,I); oI = view(o,I)
-      if btype == "R"; drp!(xI, yI, oI);  end
-      if btype == "Q"; dsoc!(xI, yI, oI); end
-      if btype == "S"; dsdc!(xI, yI, oI); end
-    end
-    return o;
-
-  end
-
   function cone_div!(o,x,y)
 
     # In-place group division x ○\ y → o
+    # (each per-cone primitive fully overwrites its output view)
 
-    fill!(o, 0.0)
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; drp!(xI, yI, oI);  end
       if btype == "Q"; dsoc!(xI, yI, oI); end
       if btype == "S"; dsdc!(xI, yI, oI); end
-    end
-    return o;
-
-  end
-
-  function ∘(x,y)
-
-    # Group product x ○ y
-
-    o = zeros(length(x))
-    @inbounds for (btype, I, i) = block_data
-      xI = view(x,I); yI = view(y,I); oI = view(o,I)
-      if btype == "R"; xrp!(xI, yI, oI);  end
-      if btype == "Q"; xsoc!(xI, yI, oI); end
-      if btype == "S"; xsdc!(xI, yI, oI); end
     end
     return o;
 
@@ -732,8 +866,8 @@ function conicIP(
   function cone_prod!(o,x,y)
 
     # In-place group product x ○ y → o
+    # (each per-cone primitive fully overwrites its output view)
 
-    fill!(o, 0.0)
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; xrp!(xI, yI, oI);  end
@@ -751,7 +885,29 @@ function conicIP(
   δ = staticReg*(1 + norm(Q, Inf))
   Qᵣ = δ == 0 ? Q : Q + δ*Id(n)
 
-  solve3x3gen = kktsolver(Qᵣ,A,G,cone_dims)
+  # A KKT factorization failure (rank-deficient G, cone iterate at the
+  # boundary, …) is reported as an :Error status with the reason in
+  # sol.message, never as an escaped exception (issue #10).
+  function kkt_error(where, err)
+    msg = "KKT solve failed ($where): $(sprint(showerror, err))"
+    if verbose; print("\n > EXIT -- Error! ($msg)\n\n"); end
+    return msg
+  end
+
+  if verbose && kktsolver === default_kktsolver
+    chosen = choose_kktsolver(Qᵣ, A, G, cone_dims)
+    nnz_pc = (_structural_nnz(Q) + _structural_nnz(A) + _structural_nnz(G)) / max(n, 1)
+    @printf(" > KKT solver: %s (auto, %.1f nnz/col)\n", nameof(chosen), nnz_pc)
+  end
+
+  solve3x3gen = try
+    kktsolver(Qᵣ,A,G,cone_dims)
+  catch err
+    err isa KKT_FAILURES || rethrow()
+    return Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
+                    :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false,
+                    kkt_error("solver setup", err))
+  end
 
   function solve4x4gen(λ, F, F⁻ᵀ, solve3x3gen = solve3x3gen)
 
@@ -790,7 +946,14 @@ function conicIP(
 
   I  = Block([Diagonal(ones(i)) for i = block_sizes])
   r0 = v4x1(c, d, b, zeros(m))
-  z  = solve4x4gen(e,I,I)(r0)
+  z  = try
+    solve4x4gen(e,I,I)(r0)
+  catch err
+    err isa KKT_FAILURES || rethrow()
+    return Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
+                    :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false,
+                    kkt_error("initial point", err))
+  end
 
   α_v = maxstep(z.v, nothing)
   α_s = maxstep(z.s, nothing)
@@ -822,8 +985,15 @@ function conicIP(
     F⁻ᵀ  = F⁻ᵀ_cache
     λ    = F*z.v;                 # This is also F⁻ᵀ*z.s.
 
-    solve = solve4x4gen(λ,F,F⁻ᵀ)   # Caches 4x4 solver
+    solve = try
+      solve4x4gen(λ,F,F⁻ᵀ)         # Caches 4x4 solver
                                    # (used a few times, at least 2)
+    catch err
+      err isa KKT_FAILURES || rethrow()
+      sol.status = :Error
+      sol.message = kkt_error("factorization, iteration $Iter", err)
+      return sol
+    end
 
     #         ┌                   ┐ ┌     ┐
     # rleft = │ Q   G'   -A'      │ │ z.y │
@@ -858,12 +1028,12 @@ function conicIP(
     pobj = 0.5*dot(z.y, Q*z.y) - dot(c, z.y)
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
 
-    if max(rDu, rPr, rCp) < optBest
+    if max(rDu, rPr, rCp, rEq) < optBest
       sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v; sol.s[:] = z.s
       sol.Iter = Iter; sol.Mu = μ;
       sol.duFeas = rDu; sol.prFeas = rPr; sol.muFeas = rCp
       sol.pobj = pobj; sol.dobj = dobj
-      optBest = max(rDu, rPr, rCp)
+      optBest = max(rDu, rPr, rCp, rEq)
     end
 
     # ────────────────────────────────────────────────────────────
@@ -982,7 +1152,7 @@ function conicIP(
     end
 
     # Cause of Divergence Unknown
-    if !all(isfinite.([μ, rDu, rPr, rCp]))
+    if !(isfinite(μ) && isfinite(rDu) && isfinite(rPr) && isfinite(rCp))
       if verbose; print("\n > EXIT -- Error!\n\n"); end
       sol.status = :Error; return sol
     end
@@ -991,7 +1161,14 @@ function conicIP(
     #  Predictor
     # ────────────────────────────────────────────────────────────
 
-    d_aff   = solve(r0)
+    d_aff   = try
+      solve(r0)
+    catch err
+      err isa KKT_FAILURES || rethrow()
+      sol.status = :Error
+      sol.message = kkt_error("predictor, iteration $Iter", err)
+      return sol
+    end
 
     α_aff_v = min( maxstep( z.v, d_aff.v ) , 1 )
     α_aff_s = min( maxstep( z.s, d_aff.s ) , 1 )
@@ -1019,19 +1196,30 @@ function conicIP(
     #  Take newton step, with iterative refinement
     # ────────────────────────────────────────────────────────────
 
-    Δz  = solve(r);
+    Δz  = try
+      solve(r)
+    catch err
+      err isa KKT_FAILURES || rethrow()
+      sol.status = :Error
+      sol.message = kkt_error("corrector, iteration $Iter", err)
+      return sol
+    end
     rStep = 1;
     for rStep = 1:maxRefinementSteps
       cone_prod!(_prod_buf1, λ, F*Δz.v)
       cone_prod!(_prod_buf2, λ, F⁻ᵀ*Δz.s)
-      rkkt  = v4x1( Q*Δz.y  + Gᵀ*Δz.w  - Aᵀ*Δz.v , # y
-                    G*Δz.y                       , # w
-                    A*Δz.y - Δz.s                , # v
-                    _prod_buf1 + _prod_buf2      )    # s
-      rIr = r - rkkt
-      rnorm = norm(rIr)/(n + 2*m)
+      # KKT residual of the step, into preallocated scratch:
+      #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
+      mul!(_rkkt.y, Q, Δz.y)
+      mul!(_rkkt.y, Gᵀ, Δz.w, 1.0, 1.0)
+      mul!(_rkkt.y, Aᵀ, Δz.v, -1.0, 1.0)
+      mul!(_rkkt.w, G, Δz.y)
+      mul!(_rkkt.v, A, Δz.y); _rkkt.v .-= Δz.s
+      _rkkt.s .= _prod_buf1 .+ _prod_buf2
+      sub4!(_rIr, r, _rkkt)
+      rnorm = norm(_rIr)/(n + p + 2*m)
       if rnorm < refinementThreshold; break; end
-      Δzr = solve(rIr)
+      Δzr = solve(_rIr)
       axpy4!(1.0, Δzr, Δz)
     end
 
@@ -1089,17 +1277,18 @@ function conicIP(
   #  Only when both 1× validations failed AND there is evidence a ray
   #  exists (a relaxed validation passed, or complementarity collapsed).
   #  A clean :Abandoned with no such signal does not earn a solve.
-  #  At most one attempt of each kind, and the auxiliary problems get
-  #  kktsolver_qr rather than the caller's solver: they have a different
-  #  structure (min-norm, wide equalities, regularized) and qr is the
-  #  robust default there.
+  #  At most one attempt of each kind. The auxiliary problems run under
+  #  default_kktsolver rather than the caller's solver: they have a
+  #  different structure (min-norm, wide equalities, regularized), so
+  #  the selection heuristic is re-run on the auxiliary data.
   if certFallback && !pchk.valid && !dchk.valid &&
      (pchk100.valid || dchk100.valid || μ_collapsed || μ_diverged)
 
     # The auxiliary solves use their own iteration budget: the outer
     # maxIters is small in exactly the regime the fallback exists for.
     if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0
-      ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d)
+      ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
+                                       maxIters = certFallbackIters)
       if ray !== nothing
         (fchk, fw̄, fv̄) = validate_infeasibility_certificate(
                             Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
@@ -1112,7 +1301,8 @@ function conicIP(
     end
 
     if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0
-      ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d)
+      ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
+                                   maxIters = certFallbackIters)
       if ray !== nothing
         (fchk, fȳ) = validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, ray;

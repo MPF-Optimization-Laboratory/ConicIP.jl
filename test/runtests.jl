@@ -897,8 +897,9 @@ end
             args12 = (zeros(1), Float64[], zeros(1), zeros(1), :Optimal,
                       3, 1e-9, 1e-9, 1e-9, 1e-9, 0.0, 0.0)
             sol = ConicIP.Solution(args12...)
-            @test fieldnames(ConicIP.Solution)[end] == :has_certificate
+            @test :has_certificate in fieldnames(ConicIP.Solution)
             @test sol.has_certificate == false
+            @test sol.message == ""
 
             sol2 = ConicIP.Solution(args12..., true)
             @test sol2.has_certificate == true
@@ -1354,6 +1355,133 @@ end
     end
 
     # ──────────────────────────────────────────────────────────────
+    #  Issue #10: solver selection, structural degeneracy, KKT contract
+    # ──────────────────────────────────────────────────────────────
+
+    @testset "choose_kktsolver" begin
+        # #10-shaped: large, very sparse, no SDP → sparse solver
+        pg = socp_sum_of_norms(150; d = 200)
+        @test choose_kktsolver(pg.Q, pg.A, pg.G, pg.cone_dims) ===
+              ConicIP.kktsolver_sparse
+        # SDP anywhere → qr, regardless of sparsity
+        @test choose_kktsolver(pg.Q, pg.A, pg.G, [("Q",3), ("S",6)]) ===
+              ConicIP.kktsolver_qr
+        # small problems keep the historical qr default (protects every
+        # pinned compare() value in the suites above)
+        @test choose_kktsolver(spzeros(10,10), sprandn(5,10,0.5),
+                               spzeros(0,10), [("R",5)]) ===
+              ConicIP.kktsolver_qr
+        # sparse-typed but dense-ish data (many small SOCs, 10%-dense A)
+        @test choose_kktsolver(spzeros(500,500), sprandn(750,500,0.1),
+                               spzeros(0,500), [("Q",3) for _ in 1:250]) ===
+              ConicIP.kktsolver_qr
+    end
+
+    @testset "Issue #10 regression (sum-of-norms SOCP)" begin
+        pg = socp_sum_of_norms(150; d = 200)
+        sol = conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                      verbose = false)
+        @test sol.status == :Optimal
+        @test sol.Iter <= 60
+        @test max(sol.prFeas, sol.duFeas, sol.muFeas) < 1e-6
+        # and through the preprocessor (the MOI path)
+        sol2 = preprocess_conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims,
+                                  pg.G, pg.d; verbose = false)
+        @test sol2.status == :Optimal
+    end
+
+    @testset "Structural degeneracy — direct conicIP" begin
+        n = 5
+        Q = Matrix{Float64}(I, n, n); c = ones(n)
+        A = sparse(1.0I, n, n); b = zeros(n)
+        cd = [("R", n)]
+        for kktsolver = (ConicIP.kktsolver_qr,
+                         ConicIP.kktsolver_sparse,
+                         pivot(ConicIP.kktsolver_2x2))
+            # zero row of G, dᵢ = 0: vacuous row is deflated exactly
+            G = sparse([1.0 0 0 0 0; 0 0 0 0 0]); dvec = [1.0, 0.0]
+            s = conicIP(Q, c, A, b, cd, G, dvec;
+                        verbose = false, kktsolver = kktsolver)
+            @test s.status == :Optimal
+            @test length(s.w) == 2 && s.w[2] == 0.0
+            # zero row of G, dᵢ ≠ 0: certified infeasibility, no solve
+            s = conicIP(Q, c, A, b, cd, G, [1.0, 2.0];
+                        verbose = false, kktsolver = kktsolver)
+            @test s.status == :Infeasible
+            @test s.has_certificate
+            @test s.Iter == 0
+            # duplicated (dependent, nonzero) rows: clean :Error status,
+            # no escaped SingularException
+            G2 = sparse([1.0 0 0 0 0; 1.0 0 0 0 0])
+            s = conicIP(Q, c, A, b, cd, G2, [1.0, 1.0];
+                        verbose = false, kktsolver = kktsolver)
+            @test s.status == :Error
+            @test !isempty(s.message)
+        end
+        # zero column of [Q; A; G] with cⱼ ≠ 0: certified unboundedness
+        Qz = spzeros(3,3); cz = [0.0, 0.0, 1.0]
+        Az = sparse([1.0 0 0; 0 1.0 0]); bz = zeros(2)
+        s = conicIP(Qz, cz, Az, bz, [("R",2)], spzeros(0,3), zeros(0);
+                    verbose = false)
+        @test s.status == :Unbounded
+        @test s.has_certificate
+        # p > n under kktsolver_qr: invariant violation, clear error
+        Gpn = sparse(ones(7, 5))
+        @test_throws ArgumentError conicIP(Q, c, A, b, cd, Gpn, ones(7);
+            verbose = false, kktsolver = ConicIP.kktsolver_qr)
+    end
+
+    @testset "KKT solver contract" begin
+        # solve3x3gen(F,F⁻ᵀ)(bx,by,bz) must solve the documented 3×3
+        # system for every solver and cone mix — including SOC+SDP mixes
+        # under kktsolver_sparse (the lift form cannot represent SDP
+        # blocks and must be bypassed) and under pivot (whose reconstruction
+        # needs the true adjoint for non-self-adjoint SDP scalings).
+        function contract_residual(kktsolver, cone_dims; p = 3)
+            m = sum(cdim[2] for cdim in cone_dims)
+            n = m + 1
+            Q = sparse(Symmetric(sprandn(n, n, 0.3) + 5.0*I))
+            A = sprandn(m, n, 0.4) + [sparse(1.0I, m, m) spzeros(m, 1)]
+            G = sprandn(p, n, 0.5); G[1,1] += 2.0
+            F = ConicIP.placeholder(cone_dims)
+            F⁻ᵀ = ConicIP.inv_adjoint!(Block(length(cone_dims)), F)
+            solve = kktsolver(Q, A, G, cone_dims)(F, F⁻ᵀ)
+            bx = randn(n); by = randn(p); bz = randn(m)
+            (x, y, z) = solve(bx, by, bz)
+            r1 = norm(Q*x + G'*y - A'*z - bx)
+            r2 = norm(G*x - by)
+            r3 = norm(A*x + F'*(F*z) - bz)
+            return max(r1, r2, r3) / max(norm(bx), norm(by), norm(bz))
+        end
+        mixes = ([("R", 4), ("Q", 3), ("Q", 5)],
+                 [("R", 3), ("Q", 4), ("S", 6)],
+                 [("Q", 8), ("S", 6)])
+        for kktsolver = (ConicIP.kktsolver_qr,
+                         ConicIP.kktsolver_sparse,
+                         pivot(ConicIP.kktsolver_2x2)),
+            cone_mix in mixes
+            @test contract_residual(kktsolver, cone_mix) < 1e-10
+        end
+    end
+
+    @testset "mat!/vecm! and VecCongurance on matrices" begin
+        x = randn(10)                      # ord = 4
+        Z = ConicIP.mat(x)
+        @test Z ≈ Z'
+        @test ConicIP.vecm(Z) ≈ x
+        Zb = zeros(4,4); ConicIP.mat!(Zb, x)
+        @test Zb ≈ Z
+        xb = zeros(10); ConicIP.vecm!(xb, Z)
+        @test xb ≈ x
+        # matrix action = column-wise vector action (incl. views)
+        W = ConicIP.VecCongurance(randn(4,4))
+        X = randn(10, 3)
+        WX = W * X
+        @test WX[:,2] ≈ W * X[:,2]
+        @test W * view(X, :, 1:2) ≈ WX[:,1:2]
+    end
+
+    # ──────────────────────────────────────────────────────────────
     #  MathOptInterface Tests
     # ──────────────────────────────────────────────────────────────
 
@@ -1422,6 +1550,29 @@ end
 
     @testset "MOI wrapper" begin
         import MathOptInterface as MOI
+
+        @testset "Optimizer options (WP6)" begin
+            opt = ConicIP.Optimizer(verbose = false, maxIters = 42)
+            @test MOI.get(opt, MOI.RawOptimizerAttribute("maxIters")) == 42
+            @test MOI.get(opt, MOI.RawOptimizerAttribute("kktsolver")) == "auto"
+            MOI.set(opt, MOI.RawOptimizerAttribute("kktsolver"), "sparse")
+            @test MOI.get(opt, MOI.RawOptimizerAttribute("kktsolver")) == "sparse"
+            @test MOI.supports(opt, MOI.RawOptimizerAttribute("preprocess"))
+            @test !MOI.supports(opt, MOI.RawOptimizerAttribute("bogus"))
+            @test_throws MOI.UnsupportedAttribute MOI.set(
+                opt, MOI.RawOptimizerAttribute("bogus"), 1)
+            @test_throws ArgumentError MOI.set(
+                opt, MOI.RawOptimizerAttribute("kktsolver"), "nope")
+            @test MOI.supports(opt, MOI.Silent())
+            MOI.set(opt, MOI.Silent(), true)
+            @test MOI.get(opt, MOI.Silent())
+            # every named solver resolves
+            for name in ("auto", "qr", "sparse", "2x2", "pivot")
+                @test ConicIP._resolve_kktsolver(name) isa Function
+            end
+            @test ConicIP._resolve_kktsolver(ConicIP.kktsolver_qr) ===
+                  ConicIP.kktsolver_qr
+        end
 
         @testset "Simple LP via MOI" begin
             # min x₁ + x₂ s.t. x₁ + x₂ ≥ 1, x₁ ≥ 0, x₂ ≥ 0
@@ -1750,7 +1901,7 @@ end
 
         @testset "infeasTol option is accepted" begin
             opt = ConicIP.Optimizer(infeasTol = 1e-9)
-            @test opt.infeasTol == 1e-9
+            @test MOI.get(opt, MOI.RawOptimizerAttribute("infeasTol")) == 1e-9
             src = MOI.Utilities.Model{Float64}()
             x = MOI.add_variable(src)
             MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)

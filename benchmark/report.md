@@ -4,6 +4,13 @@
 **Julia:** 1.12.3 (aarch64-apple-darwin)
 **ConicIP:** v0.2.0
 
+> **Note (2026-08-29, issue #10 work):** the numbers below predate the
+> kktsolver_qr rewrite, the symbolic-factorization reuse in
+> kktsolver_sparse, automatic solver selection (`default_kktsolver`),
+> and the WP8 allocation fixes. Re-run `benchmark/profile.jl` before
+> quoting them. The type-stability findings in §3d were fixed the same
+> day this report was written (commits `1e4ae19`, `6682b8c`).
+
 ## 1. Executive Summary
 
 **Top 3 findings:**
