@@ -78,10 +78,13 @@ ConicIP.Optimizer
 
 ## KKT Solver Functions
 
-Three built-in KKT solvers are provided. See the [KKT Solvers](@ref) guide
+Three built-in KKT solvers are provided, and the default picks among
+them automatically per problem. See the [KKT Solvers](@ref) guide
 for detailed usage and custom solver development.
 
 ```@docs
+ConicIP.default_kktsolver
+ConicIP.choose_kktsolver
 ConicIP.kktsolver_qr
 ConicIP.kktsolver_sparse
 ConicIP.kktsolver_2x2

@@ -130,6 +130,18 @@ function prob_mixed_rqs(; n=86)
     (; Q, c, A, b, cone_dims, G, d, name="Mixed R+Q+S (n=$n)")
 end
 
+include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
+
+function prob_issue10(; k=400, d_dim=800)
+    # Issue #10 structural class: many 3-dim SOCs + sparse equalities,
+    # ~2.5 nnz/col at n = d_dim + 3k. Sized so the dense-QR row of the
+    # benchmark stays tolerable; the full-size gist instance itself is
+    # benchmarked by benchmark/issue10.jl.
+    p = socp_sum_of_norms(k; d = d_dim)
+    (; p.Q, p.c, p.A, p.b, p.cone_dims, p.G, p.d,
+       name="Issue #10 sum-of-norms (k=$k)")
+end
+
 # ══════════════════════════════════════════════════════════════════
 #  1B. Macro Benchmarks
 # ══════════════════════════════════════════════════════════════════
@@ -144,6 +156,7 @@ function run_macro_benchmarks()
         prob_larger_sdp,
         prob_mixed_rq_eq,
         prob_mixed_rqs,
+        prob_issue10,
     ]
 
     solvers = [
@@ -414,10 +427,13 @@ function run_type_stability_audit()
     println("\n--- @code_warntype: Block' (adjoint) ---")
     @code_warntype broadcastf(adjoint, F)
 
-    # broadcastf with mixed blocks
+    # broadcastf with mixed blocks. NB: the Block constructor converts any
+    # input vector to Vector{BlockElem}, so this measures the union-typed
+    # container that the solver actually uses (the historical Vector{Any}
+    # instability is gone — see benchmark/report.md).
     println("\n--- @code_warntype: broadcastf(*, mixed Block, Matrix) ---")
-    F_mixed = Block(Any[Diagonal(ones(5)),
-                        ConicIP.nestod_soc([1.0; zeros(4)], [1.0; zeros(4)])])
+    F_mixed = Block([Diagonal(ones(5)),
+                     ConicIP.nestod_soc([1.0; zeros(4)], [1.0; zeros(4)])])
     x_mixed = randn(10, 1)
     @code_warntype broadcastf(*, F_mixed, x_mixed)
 
