@@ -10,6 +10,11 @@ using SparseArrays
 using WoodburyMatrices
 using Printf
 
+# Verbose log: an iteration row is printed in bold red when the scaled KKT
+# residual of the step, ‖r - K Δz‖/(n + p + 2m), is still above this after
+# the iterative-refinement loop. It flags an ill-conditioned KKT system.
+const REFINE_WARN_NORM = 1e-3
+
 """
     Id(n)
 
@@ -937,7 +942,7 @@ function conicIP(
   end
 
   if verbose
-      print("\n > INTERIOR POINT SOLVER v0.7 (July 2016)\n\n")
+      print("\n > INTERIOR POINT SOLVER (ConicIP v$(pkgversion(@__MODULE__)))\n\n")
   end
 
   # ────────────────────────────────────────────────────────────
@@ -965,8 +970,9 @@ function conicIP(
   if verbose
       println("            Optimality                      Objective              Infeasibility       ")
       println()
-      ξ1()=@printf("\x1b[1m %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-8s \x1b[0m\n",
-                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine");ξ1()
+      printstyled(@sprintf(" %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-8s \n",
+                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine");
+                  bold = true)
   end
 
   # ────────────────────────────────────────────────────────────
@@ -1129,10 +1135,15 @@ function conicIP(
     end
 
     if verbose
-      if rnorm > 0.001; print("\x1b[1m\x1b[31m"); end
-      ξ2()=@printf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %i\n",
-                  Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, rStep);ξ2()
-      if rnorm > 0.001; print("\x1b[0m"); end
+      # A row is highlighted in red when the KKT step is still inaccurate
+      # after iterative refinement (see REFINE_WARN_NORM).
+      row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %i\n",
+                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, rStep)
+      if rnorm > REFINE_WARN_NORM
+        printstyled(row; bold = true, color = :red)
+      else
+        print(row)
+      end
     end
 
     if optimal

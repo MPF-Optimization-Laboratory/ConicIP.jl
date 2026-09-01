@@ -70,7 +70,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   if verbose == true
     println()
-    println(" > INTERIOR POINT PREPROCESSOR v0.7.1 (Aug 2016)")
+    println(" > INTERIOR POINT PREPROCESSOR")
     println()
   end
 
