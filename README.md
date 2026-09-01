@@ -1,25 +1,40 @@
-ConicIP.jl: A Pure Julia Conic QP Solver
-==
+# ConicIP.jl
 
 [![CI](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/actions/workflows/CI.yml)
 [![codecov](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl)
+[![Documentation (stable)](https://img.shields.io/badge/docs-stable-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/)
 [![Documentation (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
 
 `ConicIP` (Conic **I**nterior **P**oint) is a pure-Julia interior-point solver for optimizing quadratic objectives with linear equality constraints, and polyhedral, second-order cone, and (experimental) semidefinite cone constraints. Because ConicIP is written in Julia, it allows abstract input and custom KKT solver callbacks for exploiting problem structure.
 
-### Installation
+## Affiliation
 
-ConicIP.jl is not yet registered in the Julia General registry. Install directly from GitHub:
+ConicIP.jl is developed and maintained by the
+[MPF Optimization Laboratory](https://github.com/MPF-Optimization-Laboratory)
+at the University of British Columbia. It is not affiliated with JuMP-dev.
+
+## License
+
+ConicIP.jl is licensed under the [MIT License](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/blob/master/LICENSE.md).
+
+## Getting help
+
+If you need help, please ask a question by
+[opening a GitHub issue](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/issues/new).
+
+## Installation
+
+Install ConicIP.jl from the Julia General registry:
 
 ```julia
-using Pkg
-Pkg.add(url="https://github.com/MPF-Optimization-Laboratory/ConicIP.jl")
+import Pkg
+Pkg.add("ConicIP")
 ```
 
 Requires Julia 1.10 or later.
 
-### Basic Usage
+## Basic usage
 
 ConicIP has the interface
 ```julia
@@ -65,7 +80,7 @@ b = zeros(n)
 sol = conicIP(Q, c, A, b, 𝐾, verbose=true);
 ```
 
-### Usage with JuMP
+## Use with JuMP
 
 ConicIP implements a [MathOptInterface](https://github.com/jump-dev/MathOptInterface.jl) wrapper, so it can be used as a solver in [JuMP](https://github.com/jump-dev/JuMP.jl). Note: only linear objectives are supported through JuMP; use the direct `conicIP` API for quadratic programs.
 
@@ -81,6 +96,6 @@ optimize!(model)
 value.(x) # should be ≈ [0.1, 0.1, …, 0.1]
 ```
 
-### Documentation
+## Documentation
 
-For full documentation including tutorials, how-to guides, and API reference, see the [documentation](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/).
+For full documentation including tutorials, how-to guides, and API reference, see the [stable documentation](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/) (or the [development version](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)).
