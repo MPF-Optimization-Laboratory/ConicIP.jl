@@ -6,11 +6,16 @@
 
 ## Installing ConicIP.jl
 
-ConicIP.jl is not yet registered in the Julia General registry. Install it
-directly from GitHub:
+ConicIP.jl is registered in the Julia General registry:
 
 ```julia
 using Pkg
+Pkg.add("ConicIP")
+```
+
+To track the development version instead, install directly from GitHub:
+
+```julia
 Pkg.add(url="https://github.com/MPF-Optimization-Laboratory/ConicIP.jl")
 ```
 
