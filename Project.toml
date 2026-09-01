@@ -1,6 +1,6 @@
 name = "ConicIP"
 uuid = "d92ec50d-21ac-4ea5-850a-0588cd9e47b8"
-version = "0.3.1"
+version = "0.3.2"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
