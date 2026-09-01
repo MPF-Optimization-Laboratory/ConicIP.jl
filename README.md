@@ -10,9 +10,18 @@
 
 ## Affiliation
 
-ConicIP.jl is developed and maintained by the
+ConicIP.jl is maintained by the
 [MPF Optimization Laboratory](https://github.com/MPF-Optimization-Laboratory)
 at the University of British Columbia. It is not affiliated with JuMP-dev.
+
+## History
+
+ConicIP.jl was originally written by [Gabriel Goh](https://github.com/gabgoh)
+in 2016 as a PhD project under the supervision of Michael P. Friedlander at the
+University of California, Davis. Development paused after Gabriel graduated.
+Michael Friedlander revived the package in 2026, modernized it for current
+Julia and JuMP, and registered it in the General registry. Thanks also to
+Tony Kelman and Miles Lubin for early contributions.
 
 ## License
 
