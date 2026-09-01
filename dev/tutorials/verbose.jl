@@ -86,10 +86,11 @@ println("status: ", sol.status)
 #
 # `refine` counts the iterative-refinement steps spent on that iteration's
 # KKT solve, capped by `maxRefinementSteps` (default `3`). Zero on the first
-# iteration and one thereafter is the healthy pattern. If the refined
-# residual is still large the whole row is printed in red — a signal that the
-# KKT system is badly conditioned and that `staticReg` or a different
-# `kktsolver` may be needed.
+# iteration and one thereafter is the healthy pattern. If the scaled KKT
+# residual of the step is still above `1e-3` after refinement, the whole row
+# is printed in bold red — a signal that the KKT system is badly conditioned
+# and that `staticReg` or a different `kktsolver` may be needed. Colour
+# follows Julia's `--color` setting, so it never appears in captured output.
 #
 # ## The exit line
 #
