@@ -5,7 +5,24 @@ type: software
 authors:
   - given-names: Michael P.
     family-names: Friedlander
+    affiliation: University of British Columbia
   - given-names: Gabriel
     family-names: Goh
+abstract: >-
+  A pure-Julia conic interior-point solver for quadratic programs with
+  linear, second-order cone, and semidefinite constraints, with a
+  MathOptInterface wrapper for JuMP and pluggable KKT solvers.
+version: 0.3.2
+date-released: 2026-09-01
 repository-code: "https://github.com/MPF-Optimization-Laboratory/ConicIP.jl"
+url: "https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/"
 license: MIT
+keywords:
+  - julia
+  - optimization
+  - interior-point
+  - conic-optimization
+  - second-order-cone
+  - semidefinite-programming
+  - quadratic-programming
+  - jump
