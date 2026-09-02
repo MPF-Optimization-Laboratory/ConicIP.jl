@@ -6,13 +6,13 @@
 [![Documentation (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/blob/master/LICENSE.md)
 
-`ConicIP` (Conic **I**nterior **P**oint) is a pure-Julia interior-point solver for optimizing quadratic objectives with linear equality constraints, and polyhedral, second-order cone, and (experimental) semidefinite cone constraints. Because ConicIP is written in Julia, it allows abstract input and custom KKT solver callbacks for exploiting problem structure.
+[ConicIP.jl](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl) (Conic **I**nterior **P**oint) is a pure-Julia interior-point solver for optimizing quadratic objectives with linear equality constraints, and polyhedral, second-order cone, and (experimental) semidefinite cone constraints. Because ConicIP is written in Julia, it allows abstract input and custom KKT solver callbacks for exploiting problem structure.
 
 ## Affiliation
 
 ConicIP.jl is maintained by the
 [MPF Optimization Laboratory](https://github.com/MPF-Optimization-Laboratory)
-at the University of British Columbia. It is not affiliated with JuMP-dev.
+at the University of British Columbia.
 
 ## History
 
@@ -34,14 +34,11 @@ If you need help, please ask a question by
 
 ## Installation
 
-Install ConicIP.jl from the Julia General registry:
-
+Install ConicIP.jl as follows:
 ```julia
 import Pkg
 Pkg.add("ConicIP")
 ```
-
-Requires Julia 1.10 or later.
 
 ## Basic usage
 
@@ -91,12 +88,10 @@ sol = conicIP(Q, c, A, b, 𝐾, verbose=true);
 
 ## Use with JuMP
 
-ConicIP implements a [MathOptInterface](https://github.com/jump-dev/MathOptInterface.jl) wrapper, so it can be used as a solver in [JuMP](https://github.com/jump-dev/JuMP.jl). Note: only linear objectives are supported through JuMP; use the direct `conicIP` API for quadratic programs.
+ConicIP implements a [MathOptInterface](https://github.com/jump-dev/MathOptInterface.jl) wrapper, so it can be used as a solver in [JuMP](https://github.com/jump-dev/JuMP.jl).
 
 ```julia
-using JuMP
-using ConicIP
-
+using JuMP, ConicIP
 model = Model(ConicIP.Optimizer)
 @variable(model, x[1:10] >= 0)
 @constraint(model, sum(x) == 1.0)
