@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/
+    about: Tutorials, how-to guides, and the API reference.
+  - name: JuMP community forum
+    url: https://jump.dev/forum
+    about: Usage questions about modelling with JuMP.

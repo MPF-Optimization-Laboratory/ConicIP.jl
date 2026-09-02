@@ -1,0 +1,40 @@
+name: Bug report
+description: Something is wrong (crash, wrong answer, bad status, error)
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did ConicIP do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: mre
+    attributes:
+      label: Minimal reproducible example
+      description: >-
+        The smallest self-contained Julia script that shows the problem.
+        Random data is fine if you fix the seed.
+      render: julia
+      placeholder: |
+        using ConicIP
+        # ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: >-
+        The solver log (run with `verbose=true`), the error message, or the
+        wrong result.
+      render: text
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Paste the output of `versioninfo()` and `Pkg.status()`.
+      render: text
+    validations:
+      required: true
