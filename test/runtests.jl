@@ -1801,7 +1801,10 @@ end
         # Infeasibility and unboundedness on a pure semidefinite cone,
         # through the direct API and through MOI. Both rays are produced by
         # the same validators as the R₊/Q cases, but only the S cone
-        # exercises maxstep_sdc/nestod_sdc on the way there.
+        # exercises maxstep_sdc/nestod_sdc on the way there. These are
+        # coverage tests for a path the suite did not reach, not
+        # regression evidence for either fix in this branch — they pass
+        # against the pre-fix solver too.
         k = 6                                     # vec dim of S³
         Qs = spzeros(k, k)
         As = sparse(1.0I, k, k); bs = zeros(k)     # X ⪰ 0
@@ -1825,14 +1828,13 @@ end
 
         import MathOptInterface as MOI
 
-        # MOI stores the upper triangle column by column, off-diagonals
-        # once. In the dual coordinates an off-diagonal carries twice the
-        # weight of the matrix entry, so halve it when rebuilding.
-        function moi_mat(t, n; halve_offdiag = false)
+        # MOI stores the upper triangle column by column with
+        # off-diagonals appearing once and unscaled, in the primal and in
+        # the dual alike, so the matrix is read off directly.
+        function moi_mat(t, n)
             M = zeros(n, n); c = 1
             for j = 1:n, i = 1:j
-                val = (i == j || !halve_offdiag) ? t[c] : t[c] / 2
-                M[i, j] = val; M[j, i] = val; c += 1
+                M[i, j] = t[c]; M[j, i] = t[c]; c += 1
             end
             return M
         end
@@ -1855,8 +1857,7 @@ end
             @test MOI.get(model, MOI.TerminationStatus()) == MOI.INFEASIBLE
             @test MOI.get(model, MOI.DualStatus()) ==
                   MOI.INFEASIBILITY_CERTIFICATE
-            V = moi_mat(MOI.get(model, MOI.ConstraintDual(), psd), 3;
-                        halve_offdiag = true)
+            V = moi_mat(MOI.get(model, MOI.ConstraintDual(), psd), 3)
             w = MOI.get(model, MOI.ConstraintDual(), eq)
             @test eigmin(Symmetric(V)) > -1e-8     # ray lies in the cone
             @test norm(V, Inf) > 1e-6              # and is not the zero ray
@@ -2206,6 +2207,60 @@ end
 
             @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
             @test MOI.get(model, MOI.ObjectiveValue()) ≈ 1.0 atol=1e-4
+        end
+
+        @testset "Max eigenvalue SDP via MOI" begin
+            # min t s.t. t*I - C ⪰ 0, with C = I + 2uu' and u = [1,2,3]/√14,
+            # so λ(C) = (3,1,1): t⋆ = 3 and the dual of the PSD constraint
+            # is the spectral projector uu' onto the leading eigenvector.
+            # This is the sdp_affine_eigmax fixture of the SDP suite; here
+            # it also pins the MOI triangle convention end to end, since C
+            # has distinct off-diagonal entries.
+            u = [1.0, 2.0, 3.0] / sqrt(14.0)
+            C = Matrix{Float64}(I, 3, 3) + 2 * (u * u')
+
+            model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+            MOI.set(model, MOI.Silent(), true)
+            # The dual is recovered to about optTol, so ask for more than
+            # the 1e-6 default before asserting 1e-6 on uu'.
+            MOI.set(model, MOI.RawOptimizerAttribute("optTol"), 1e-9)
+            t = MOI.add_variable(model)
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, t)], 0.0))
+
+            # PositiveSemidefiniteConeTriangle stores the upper triangle
+            # column by column: (1,1),(1,2),(2,2),(1,3),(2,3),(3,3).
+            terms = MOI.VectorAffineTerm{Float64}[]
+            consts = Float64[]
+            row = 1
+            for j = 1:3, i = 1:j
+                if i == j
+                    push!(terms, MOI.VectorAffineTerm(row,
+                        MOI.ScalarAffineTerm(1.0, t)))
+                end
+                push!(consts, -C[i, j])
+                row += 1
+            end
+            psd = MOI.add_constraint(model,
+                MOI.VectorAffineFunction(terms, consts),
+                MOI.PositiveSemidefiniteConeTriangle(3))
+
+            MOI.optimize!(model)
+
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test MOI.get(model, MOI.VariablePrimal(), t) ≈ 3.0 atol=1e-8
+            @test MOI.get(model, MOI.ObjectiveValue()) ≈ 3.0 atol=1e-8
+
+            # The dual comes back in the same plain triangle coordinates
+            # as the constraint function: off-diagonals appear once and
+            # unscaled, so the matrix is read off directly.
+            dv = MOI.get(model, MOI.ConstraintDual(), psd)
+            V = zeros(3, 3); row = 1
+            for j = 1:3, i = 1:j
+                V[i, j] = dv[row]; V[j, i] = dv[row]; row += 1
+            end
+            @test norm(V - u * u') < 1e-6
         end
     end
 

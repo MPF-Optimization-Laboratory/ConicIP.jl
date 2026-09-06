@@ -12,6 +12,8 @@
 # and optionally
 #
 #   known_y                 expected primal `sol.y` in full
+#   known_V                 expected PSD matrix in the *dual* `sol.v`, for
+#                           instances whose matrix variable is the dual
 #   unique_y = false        the optimal set is not a singleton, so solvers
 #                           may legitimately return different `y`
 #   checks                  `"name" => (sol, tol) -> Bool` structural checks
@@ -22,7 +24,9 @@
 # so an objective `min tr(C*X)` is encoded as `c = -vecm(C)` and then
 # `sol.pobj == tr(C*X⋆)`.  The modeled matrix variable is `sol.y`; the cone
 # slack is `sol.s = A*y - b`, which coincides with `y` only when `A = I`
-# and `b = 0`.  Every generator here uses `A = I`.
+# and `b = 0`.  Every generator here uses `A = I` except
+# `sdp_affine_eigmax`, whose `A` is a single column and whose matrix
+# variable is therefore the dual `sol.v` (reported as `known_V`).
 #
 # Generators draw from a local RNG (`Random.Xoshiro(seed)`) so that they
 # never perturb the global stream shared with the rest of the test suite.
@@ -436,6 +440,40 @@ function sdp_rank_one()
 end
 
 """
+    sdp_affine_eigmax()
+
+Largest eigenvalue as an SDP: `min t  s.t.  t*I - C ⪰ 0`, with
+`C = I + 2uu'` and `u = [1,2,3]/√14`, so `λ(C) = (3, 1, 1)` and
+`t⋆ = λmax(C) = 3` with `u` the (simple) leading eigenvector.
+
+Unlike every other generator here, `A` is a single column and `b` has
+nonzero off-diagonal entries, so the matrix variable is *not* `sol.y`
+(which is the scalar `t`): it is the inequality dual `sol.v`, which at
+the optimum is the spectral projector `uu'`.  The instance therefore
+pins the vecm scaling of an off-diagonal in `b` *and* the off-diagonal
+entries of a recovered dual.
+
+This is a coverage fixture, not regression evidence for any particular
+bug: it passes against the pre-Jordan-product `xsdc!`/`dsdc!` as well.
+"""
+function sdp_affine_eigmax()
+    u = [1.0, 2.0, 3.0] / sqrt(14.0)
+    C = Matrix{Float64}(I, 3, 3) + 2 * (u * u')
+
+    k = _vdim(3)
+    Q = zeros(1, 1)
+    c = [-1.0]                                      # -c'y = t
+    A = reshape(ConicIP.vecm(Matrix{Float64}(I, 3, 3)), k, 1)
+    b = ConicIP.vecm(C)                             # t*I - C ⪰ 0
+
+    return (Q = Q, c = c, A = A, b = b, cone_dims = [("S", k)],
+            G = spzeros(0, 1), d = zeros(0),
+            known_status = :Optimal, known_obj = 3.0,
+            known_X = nothing, known_y = [3.0], known_V = u * u',
+            description = "Max eigenvalue: min t s.t. t*I ⪰ C (n=3)")
+end
+
+"""
     sdp_all_problems()
 
 The standard list of SDP instances used by the test suite.  Only one PSD
@@ -454,5 +492,6 @@ sdp_all_problems() = [
     sdp_multiple_blocks(n1 = 3, n2 = 4),
     sdp_mixed_cones(n_r = 4, n_q = 3, n_s = 3),
     sdp_with_equality(n = 4),
+    sdp_affine_eigmax(),
     sdp_larger(n = 11),
 ]

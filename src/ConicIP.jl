@@ -413,16 +413,26 @@ end
 
 function dsdc!(x, y, o)
 
-  n = round(Int, sqrt(size(x,1)))
+  # Inverse of the Jordan product: solve (Y*Z + Z*Y)/2 = X for Z.
+  # lyap(A,C) solves A*Z + Z*A' + C = 0, and Y is symmetric, so the
+  # equation is Z = lyap(Y, -2X). lyap goes through LAPACK's
+  # overflow-scaled Sylvester solver, which an eigen-basis Hadamard
+  # formula would give up.
   X = mat(x); Y = mat(y)
-  o[:] = vecm(lyap(Y,-X))
+  Z = lyap(Y, -2 .* X)
+  vecm!(o, (Z .+ Z') ./ 2)
 
 end
 
 function xsdc!(x, y, o)
 
+  # Jordan product (X*Y + Y*X)/2 of the semidefinite cone, whose identity
+  # is I = mat(e) — matching the e assembled in conicIP. For symmetric X
+  # and Y, (X*Y)' = Y'*X' = Y*X, so the symmetrization below is exactly
+  # the Jordan product.
   X = mat(x); Y = mat(y)
-  o[:] = vecm(X*Y + Y*X)
+  XY = X*Y
+  vecm!(o, (XY .+ XY') ./ 2)
 
 end
 
@@ -993,9 +1003,12 @@ function conicIP(
   # ────────────────────────────────────────────────────────────
 
   I  = Block([Diagonal(ones(i)) for i = block_sizes])
-  r0 = v4x1(c, d, b, zeros(m))
+  # Named apart from the loop's r0 so that the loop-local residual has a
+  # single assignment site and is not boxed when the predictor closure
+  # captures it.
+  r_init = v4x1(c, d, b, zeros(m))
   z  = try
-    solve4x4gen(e,I,I)(r0)
+    solve4x4gen(e,I,I)(r_init)
   catch err
     err isa KKT_FAILURES || rethrow()
     return errsol(kkt_error("initial point", err))
