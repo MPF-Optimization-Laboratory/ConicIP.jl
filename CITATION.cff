@@ -12,8 +12,8 @@ abstract: >-
   A pure-Julia conic interior-point solver for quadratic programs with
   linear, second-order cone, and semidefinite constraints, with a
   MathOptInterface wrapper for JuMP and pluggable KKT solvers.
-version: 0.3.2
-date-released: 2026-09-01
+version: 0.4.0
+date-released: 2026-09-06
 repository-code: "https://github.com/MPF-Optimization-Laboratory/ConicIP.jl"
 url: "https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/"
 license: MIT

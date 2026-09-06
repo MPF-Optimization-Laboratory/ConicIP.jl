@@ -29,8 +29,10 @@
 # the reference. `benchmark/sdplib.jl` runs a spread of instances through the
 # MOI wrapper and reports status, iterations, time and relative error against
 # the published optimal values; `test/sdplib/README.md` records provenance,
-# checksums and the SDPA sign conventions for the six-instance subset that is
-# vendored as a CI gate. On an Apple-Silicon laptop, with relative error
+# checksums and the SDPA sign conventions for the six-instance subset that
+# serves as a CI gate (fetched from a pinned upstream commit and cached; no
+# SDPLIB data is stored in the repository). On an Apple-Silicon laptop, with
+# relative error
 # measured as `|obj - ref| / (1 + |ref|)`:
 #
 # | Instances | `optTol` | Outcome |
