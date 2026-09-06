@@ -104,11 +104,15 @@ round(objective_value(model), digits=6)
 
 ## Limitations
 
-!!! warning "No quadratic objectives through JuMP"
-    The MOI wrapper currently supports only **linear objectives**. For quadratic
-    programs, use the direct [`conicIP`](@ref) interface.
+!!! note "Quadratic objectives through JuMP are bridged"
+    The MOI wrapper itself accepts only affine objectives. A quadratic
+    objective in JuMP still works: MathOptInterface bridges reformulate it as
+    an epigraph over a second-order cone before it reaches the solver. The
+    direct [`conicIP`](@ref) interface handles a quadratic term in the
+    objective natively, without that reformulation, which is usually faster
+    and more accurate for large quadratic programs.
 
-Other limitations:
+Limitations:
 
 - No integer variables
 - No indicator or SOS constraints
