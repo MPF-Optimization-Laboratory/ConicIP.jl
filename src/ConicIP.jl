@@ -61,8 +61,6 @@ normsafe(x) = isempty(x) ? 0 : norm(x)
 
 mutable struct v4x1; y::Vector{Float64}; w::Vector{Float64}; v::Vector{Float64}; s::Vector{Float64}; end
 
-+(a::v4x1, b::v4x1) = v4x1(a.y + b.y, a.w + b.w, a.v + b.v, a.s + b.s)
--(a::v4x1, b::v4x1) = v4x1(a.y - b.y, a.w - b.w, a.v - b.v, a.s - b.s)
 LinearAlgebra.norm(a::v4x1) = norm(a.y) + normsafe(a.w) + normsafe(a.v) + normsafe(a.s)
 
 function axpy4!(α::Number, x::v4x1, y::v4x1)

@@ -188,13 +188,31 @@ function preprocess_conicIP(Q, c::AbstractVector,
     sol.w = nanvec(p)   # keep a non-certificate ray NaN rather than part-zero
   end
 
+  # A ray that certifies the reduced data but not the original one means the
+  # reduction changed the problem (imcols dropped a row that was only
+  # dependent to tolerance ϵ). The reduced problem's verdict then says
+  # nothing about the caller's problem, so it must not survive as a terminal
+  # status: downgrade to :Error rather than report an uncertified claim.
+  # The iterate belongs to a different problem, so it is NaN'd rather than
+  # returned as a "best iterate".
+  function retract!(sol, claim)
+    dropped = setdiff(1:p, IP)
+    sol.y = nanvec(n); sol.w = nanvec(p); sol.v = nanvec(m); sol.s = nanvec(m)
+    sol.has_certificate = false
+    sol.status  = :Error
+    sol.message = string(claim, " claimed on the reduced equality system ",
+                         "(dropped rows ", dropped, ") but the ray does not ",
+                         "certify the original data")
+    return sol
+  end
+
   if sol.status == :Infeasible && sol.has_certificate
     (check, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims,
       G, d, sol.w, sol.v; abstol = abstol, reltol = reltol)
     if check.valid
       sol.w = w̄; sol.v = v̄
     else
-      sol.w = nanvec(p); sol.v = nanvec(m); sol.has_certificate = false
+      return retract!(sol, :Infeasible)
     end
   end
 
@@ -206,7 +224,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     if check.valid
       sol.y = ȳ; sol.s = A*ȳ
     else
-      sol.y = nanvec(n); sol.s = nanvec(m); sol.has_certificate = false
+      return retract!(sol, :Unbounded)
     end
   end
 

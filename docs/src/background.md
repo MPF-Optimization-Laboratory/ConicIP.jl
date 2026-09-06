@@ -219,9 +219,18 @@ Common causes:
 ### Status: `:Error`
 
 An unexpected error occurred (e.g., singular factorization). This usually
-indicates a problem with the input data.
+indicates a problem with the input data. `sol.message` carries the reason.
+
+[`preprocess_conicIP`](@ref ConicIP.preprocess_conicIP) also returns `:Error`
+when the solve on its reduced equality system claims `:Infeasible` or
+`:Unbounded` but the ray fails to certify the *original* data. That means
+the redundancy detection dropped a row that was only dependent to tolerance,
+so the reduced problem's verdict does not transfer; the status is retracted
+rather than reported without a certificate.
 
 **What to try:** Check that `Q` is positive semidefinite and `A` has full row rank.
+For the preprocessor case, rescale badly scaled equality rows or call
+[`conicIP`](@ref) directly.
 
 ## Reading Residuals
 
