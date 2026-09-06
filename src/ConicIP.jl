@@ -838,7 +838,10 @@ function conicIP(
   function nt_scaling(x, y)
 
     # Compute Nesterov-Todd scaling matrix, F s.t.
-    # λ = F*x = F\y
+    # λ = F*x = inv(F')*y
+    # For the self-adjoint R and Q blocks this is λ = F*x = F\y; for
+    # an S block F is a congruence and only the adjoint form holds
+    # (see nestod_sdc).
 
     B = Block(size(block_sizes,1));
 

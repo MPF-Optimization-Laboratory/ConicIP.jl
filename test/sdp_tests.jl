@@ -16,9 +16,12 @@ function sdp_solve(prob; kwargs...)
 end
 
 # Extract the first SDP block of a solution as a matrix.  The modeled
-# matrix variable is `sol.y`; the cone slack is `sol.s = A*y - b`, which
-# coincides with `y` only when A = I and b = 0 -- as it does for every
-# instance here.  `sol.v` is the inequality dual, never the primal.
+# matrix variable is `sol.y`, read here by cone offset, which is valid
+# because every instance in this file uses A = I so the cone blocks of
+# `y` line up with `cone_dims`.  The cone slack is `sol.s = A*y - b`,
+# which differs from `y` whenever b ≠ 0 (trace minimization, multiple
+# blocks, and the with-equality instance).  `sol.v` is the inequality
+# dual, never the primal.
 function sdp_block(sol, cone_dims)
     offset = 0
     for (ctype, cdim) in cone_dims
