@@ -46,6 +46,12 @@ julia --project -e 'using Pkg; Pkg.test()'
 - Docs structure follows Diátaxis: tutorials / how-to guides / reference / explanation
 - Documenter.jl gotcha: `@ref` links fail if a header slug matches a page title slug (e.g., "KKT Solvers" as both header and nav entry) — rename one to disambiguate
 
+## Static Analysis
+
+- Type-aware diagnostics: `~/.julia/bin/jetls check --quiet --progress=none src/ConicIP.jl` (JETLS CLI; analyzes the whole package via includes, ~10 s warm)
+- Useful flags: `--show-severity=warn` for inference errors only; default shows lowering hints (unused locals, boxed captures) too
+- Treat findings as leads, not verdicts — JET diagnostics on dynamic code have false positives
+
 ## Benchmarking
 
 - `benchmark/profile.jl` — profiling script (timing, allocation, type stability)
