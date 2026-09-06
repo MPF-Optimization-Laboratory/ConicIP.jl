@@ -153,7 +153,7 @@ function MOI.is_empty(model::Optimizer)
 end
 
 MOI.get(::Optimizer, ::MOI.SolverName) = "ConicIP"
-MOI.get(::Optimizer, ::MOI.SolverVersion) = "0.2"
+MOI.get(::Optimizer, ::MOI.SolverVersion) = string(pkgversion(@__MODULE__))
 
 # Interior-point solver — no simplex basis information
 MOI.supports(::Optimizer, ::MOI.VariableBasisStatus) = false

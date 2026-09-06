@@ -14,6 +14,22 @@ uses [Semantic Versioning](https://semver.org/).
 ### Changed
 - CI: coverage upload now fails loudly if the Codecov token is missing;
   Julia nightly failures no longer fail the workflow.
+- `fallback_infeasibility_ray` / `fallback_unbounded_ray` now catch only KKT
+  factorization failures; other exceptions from a custom `kktsolver` propagate
+  instead of being reported as "no certificate".
+- Tests: staged KKT-failure fault injection, post-loop certificate exits,
+  MOI status mapping and metadata, `Block` `inv`/`Adjoint` products.
+
+### Fixed
+- `preprocess_conicIP` reported `:Infeasible`/`:Unbounded` (without a
+  certificate) when the reduced problem's ray failed revalidation against the
+  original data, e.g. on a bounded problem whose equality rows are dependent
+  only to tolerance. The status is now `:Error` with an explanatory message.
+- `MOI.SolverVersion` returned a stale hard-coded `"0.2"`; it now reports the
+  package version.
+
+### Removed
+- Unused `+`/`-` methods on the internal `v4x1` block vector.
 
 ## [0.3.2] - 2026-09-01
 

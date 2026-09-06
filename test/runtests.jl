@@ -55,6 +55,18 @@ end
 
         @test A' * ones(9) ≈ Matrix(A)' * ones(9)
 
+        # inv is promised by the Block docstring. adjoint(::Block) returns a
+        # Block, so the Adjoint{_,Block} methods are reached only through an
+        # explicitly constructed wrapper — keep them exercised.
+        C = Block(2)
+        C[1] = rand(3, 3) + 3I        # well conditioned for the inverse check
+        C[2] = rand(2, 2) + 3I
+        @test Matrix(inv(C)) ≈ inv(Matrix(C))
+        Aᴴ = LinearAlgebra.Adjoint(A)
+        @test Aᴴ * ones(9) ≈ Matrix(A)' * ones(9)
+        @test Aᴴ * Matrix{Float64}(I, 9, 9) ≈ Matrix(A)'
+        @test Matrix(Aᴴ * B) ≈ Matrix(A)' * Matrix(B)
+
         Ad = deepcopy(A)
         Ad[1] = zeros(4, 4)
 
@@ -1041,6 +1053,92 @@ end
                               :Abandoned, :Error)
         end
 
+        @testset "Fallback solves surface non-KKT exceptions" begin
+            # A factorization failure means "no ray"; anything else from a
+            # custom kktsolver is a broken invariant and must propagate.
+            Qu = zeros(2, 2); cu = [1.0, 0.0]          # min -x₁, x ≥ 0: unbounded
+            Au = sparse(1.0I, 2, 2); bu = zeros(2); Ku = [("R", 2)]
+            Gu = spzeros(0, 2); du = Float64[]
+            throwing(exc) = (args...) -> throw(exc)
+
+            @test_throws ArgumentError ConicIP.fallback_infeasibility_ray(
+                Qi, ci, Ai, bi, Ki, Gi, di; kktsolver = throwing(ArgumentError("boom")))
+            @test_throws ArgumentError ConicIP.fallback_unbounded_ray(
+                Qu, cu, Au, bu, Ku, Gu, du; kktsolver = throwing(ArgumentError("boom")))
+
+            @test ConicIP.fallback_infeasibility_ray(
+                Qi, ci, Ai, bi, Ki, Gi, di;
+                kktsolver = throwing(SingularException(0))) === nothing
+            @test ConicIP.fallback_unbounded_ray(
+                Qu, cu, Au, bu, Ku, Gu, du;
+                kktsolver = throwing(SingularException(0))) === nothing
+            # sanity: the unbounded auxiliary problem is well posed
+            @test ConicIP.fallback_unbounded_ray(Qu, cu, Au, bu, Ku, Gu, du) !== nothing
+        end
+
+    end
+
+    # ──────────────────────────────────────────────────────────────
+    #  Post-loop certificate exits
+    #
+    #  The in-loop screens only nominate a ray once a cheap heuristic
+    #  passes; the exhaustion path re-validates the saved iterate
+    #  unconditionally. These cases reach the post-loop claims without
+    #  ever passing the in-loop screen.
+    # ──────────────────────────────────────────────────────────────
+    @testset "Post-loop certificate exits" begin
+        atol = 1e-9; rtol = 1e-7
+
+        @testset "Infeasible — post-loop validator claims" begin
+            # x ≥ 1 and -x ≥ 1e8 is empty. After one iteration the screen
+            # reads icertp ≈ 0.45 (no nomination) but the saved iterate
+            # already carries a Farkas ray at default tolerance.
+            Q = ones(1, 1); c = [0.0]
+            A = sparse(reshape([1.0, -1.0], 2, 1)); b = [1.0, 1e8]
+            K = [("R", 2)]; G = spzeros(0, 1); d = Float64[]
+            s = conicIP(Q, c, A, b, K, G, d;
+                        verbose = false, maxIters = 1, certFallback = false)
+            @test s.status == :Infeasible
+            @test s.has_certificate
+            @test s.Iter == 1
+            (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+                Q, c, A, b, K, G, d, s.w, s.v; abstol = atol, reltol = rtol)
+            @test chk.valid
+            @test abs(dot(d, s.w) - dot(b, s.v) + 1) < 1e-6
+            @test all(isnan, s.y)
+        end
+
+        @testset "Unbounded — post-loop validator claims" begin
+            # min -x s.t. x ≥ 0. With maxIters = 0 the loop body never runs
+            # (zero iterations is a supported budget), so the only route to
+            # a claim is the post-loop re-validation of the initial point.
+            Q = zeros(1, 1); c = [1.0]
+            A = sparse(ones(1, 1)); b = [0.0]
+            K = [("R", 1)]; G = spzeros(0, 1); d = Float64[]
+            s = conicIP(Q, c, A, b, K, G, d;
+                        verbose = false, maxIters = 0, certFallback = false)
+            @test s.status == :Unbounded
+            @test s.has_certificate
+            @test s.Iter == 0
+            (chk, ȳ) = ConicIP.validate_unboundedness_certificate(
+                Q, c, A, b, K, G, d, s.y; abstol = atol, reltol = rtol)
+            @test chk.valid
+            @test dot(c, s.y) ≈ 1.0 atol = 1e-8
+            @test s.s ≈ A * s.y
+            @test all(isnan, s.w) && all(isnan, s.v)
+        end
+
+        @testset "Exhausted budget without a ray is :Abandoned" begin
+            # Same infeasible problem, but with the certificate tolerance
+            # tightened past what one iteration can deliver: no claim.
+            Q = ones(1, 1); c = [0.0]
+            A = sparse(reshape([1.0, -1.0], 2, 1)); b = [1.0, 1e8]
+            s = conicIP(Q, c, A, b, [("R", 2)];
+                        verbose = false, maxIters = 1, certFallback = false,
+                        infeasTol = 1e-12)
+            @test s.status == :Abandoned
+            @test !s.has_certificate
+        end
     end
 
     # ──────────────────────────────────────────────────────────────
@@ -1431,6 +1529,113 @@ end
             verbose = false, kktsolver = ConicIP.kktsolver_qr)
     end
 
+    @testset "Preprocessor status soundness" begin
+        import MathOptInterface as MOI
+
+        # Bounded problem: 100·y₁ = 0 and 100·y₁ + 1e-6·y₂ = 0 force y = 0, so
+        # min -y₂ has optimum 0. imcols drops row 2 as numerically dependent,
+        # the reduced problem is unbounded, and the recession ray fails
+        # revalidation on the full G. That verdict must not survive as a
+        # terminal :Unbounded (it used to, with has_certificate = false).
+        Q = zeros(2, 2); c = [0.0, 1.0]
+        A = sparse(1.0I, 2, 2); b = zeros(2); K = [("R", 2)]
+        G = sparse([100.0 0.0; 100.0 1e-6]); d = zeros(2)
+
+        @testset "Reduced-problem ray failing revalidation is :Error" begin
+            (IP, consistent) = ConicIP.imcols(G, d)
+            @test consistent && length(IP) == 1       # premise: a row is dropped
+            s = preprocess_conicIP(Q, c, A, b, K, G, d; verbose = false)
+            @test s.status == :Error
+            @test !s.has_certificate
+            @test all(isnan, s.y) && all(isnan, s.w)
+            @test occursin("Unbounded", s.message)
+            @test occursin("dropped rows [2]", s.message)
+            @test occursin("does not certify the original data", s.message)
+        end
+
+        @testset "Same problem through MOI maps to NUMERICAL_ERROR" begin
+            model = MOI.Utilities.CachingOptimizer(
+                MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
+                ConicIP.Optimizer())
+            x = MOI.add_variables(model, 2)
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(-1.0, x[2])], 0.0))
+            MOI.add_constraint(model,
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(100.0, x[1])], 0.0),
+                MOI.EqualTo(0.0))
+            MOI.add_constraint(model,
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(100.0, x[1]),
+                                          MOI.ScalarAffineTerm(1e-6, x[2])], 0.0),
+                MOI.EqualTo(0.0))
+            MOI.add_constraint(model, x[1], MOI.GreaterThan(0.0))
+            MOI.add_constraint(model, x[2], MOI.GreaterThan(0.0))
+            MOI.optimize!(model)
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.NUMERICAL_ERROR
+            @test MOI.get(model, MOI.ResultCount()) == 0
+            @test occursin("does not certify", MOI.get(model, MOI.RawStatusString()))
+        end
+    end
+
+    @testset "KKT failure at every stage" begin
+        # conicIP catches KKT_FAILURES at five distinct call sites and must
+        # degrade each to a clean :Error naming the stage; any other
+        # exception is a broken invariant and must propagate. A counting
+        # wrapper around kktsolver_qr injects the failure at a chosen stage.
+        # Call order: gen #1 = initial point, gen #2 = iteration-1
+        # factorization; solve #1 = initial point, #2 = predictor,
+        # #3 = corrector.
+        function failing_kkt(fail_at; exc = SingularException(0))
+            ngen = Ref(0); nsolve = Ref(0)
+            function factory(Q, A, G, cone_dims)
+                fail_at == :setup && throw(exc)
+                inner = ConicIP.kktsolver_qr(Q, A, G, cone_dims)
+                function gen(F, F⁻ᵀ)
+                    ngen[] += 1
+                    (fail_at == :initial && ngen[] == 1) && throw(exc)
+                    (fail_at == :factor  && ngen[] == 2) && throw(exc)
+                    solve = inner(F, F⁻ᵀ)
+                    function counted(bx, by, bz)
+                        nsolve[] += 1
+                        (fail_at == :predictor && nsolve[] == 2) && throw(exc)
+                        (fail_at == :corrector && nsolve[] == 3) && throw(exc)
+                        return solve(bx, by, bz)
+                    end
+                end
+            end
+        end
+        Q = Matrix(1.0I, 3, 3); c = ones(3)
+        A = sparse(1.0I, 3, 3); b = zeros(3)
+        G = sparse([1.0 1.0 1.0]); d = [1.0]
+        K = [("R", 3)]
+
+        stages = ((:setup,     "solver setup"),
+                  (:initial,   "initial point"),
+                  (:factor,    "factorization, iteration 1"),
+                  (:predictor, "predictor, iteration 1"),
+                  (:corrector, "corrector, iteration 1"))
+        for (stage, word) in stages
+            s = conicIP(Q, c, A, b, K, G, d;
+                        verbose = false, kktsolver = failing_kkt(stage))
+            @test s.status == :Error
+            @test !s.has_certificate
+            @test occursin(word, s.message)
+            @test occursin("SingularException", s.message)
+        end
+
+        # the guard is narrow: a non-KKT exception escapes
+        for stage in (:setup, :initial, :factor, :predictor, :corrector)
+            @test_throws ArgumentError conicIP(Q, c, A, b, K, G, d;
+                verbose = false,
+                kktsolver = failing_kkt(stage; exc = ArgumentError("boom")))
+        end
+
+        # sanity: the wrapper is transparent when it does not fire
+        s = conicIP(Q, c, A, b, K, G, d;
+                    verbose = false, kktsolver = failing_kkt(:never))
+        @test s.status == :Optimal
+    end
+
     @testset "KKT solver contract" begin
         # solve3x3gen(F,F⁻ᵀ)(bx,by,bz) must solve the documented 3×3
         # system for every solver and cone mix — including SOC+SDP mixes
@@ -1572,6 +1777,66 @@ end
             end
             @test ConicIP._resolve_kktsolver(ConicIP.kktsolver_qr) ===
                   ConicIP.kktsolver_qr
+        end
+
+        @testset "Status mapping and metadata" begin
+            opt = ConicIP.Optimizer()
+            @test MOI.get(opt, MOI.SolverName()) == "ConicIP"
+            @test MOI.get(opt, MOI.SolverVersion()) == string(pkgversion(ConicIP))
+            @test_throws MOI.UnsupportedAttribute MOI.get(
+                opt, MOI.RawOptimizerAttribute("bogus"))
+            @test !MOI.supports(opt, MOI.VariableBasisStatus())
+            @test !MOI.supports(opt, MOI.ConstraintBasisStatus())
+
+            # before optimize!
+            @test MOI.get(opt, MOI.ResultCount()) == 0
+            @test MOI.get(opt, MOI.RawStatusString()) == "OPTIMIZE_NOT_CALLED"
+            @test MOI.get(opt, MOI.ObjectiveBound()) == Inf
+            opt.max_sense = true      # set by copy_to; no public setter pre-solve
+            @test MOI.get(opt, MOI.ObjectiveBound()) == -Inf
+
+            function cached(; kw...)
+                MOI.Utilities.CachingOptimizer(
+                    MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
+                    ConicIP.Optimizer(; kw...))
+            end
+
+            # :Abandoned → ITERATION_LIMIT (min Σ i·xᵢ, Σ xᵢ = 1, x ≥ 0, one iteration)
+            model = cached(maxIters = 1, preprocess = false)
+            x = MOI.add_variables(model, 10)
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction(
+                    [MOI.ScalarAffineTerm(Float64(i), x[i]) for i in 1:10], 0.0))
+            MOI.add_constraint(model,
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, xi) for xi in x], 0.0),
+                MOI.EqualTo(1.0))
+            for xi in x; MOI.add_constraint(model, xi, MOI.GreaterThan(0.0)); end
+            MOI.optimize!(model)
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.ITERATION_LIMIT
+            @test MOI.get(model, MOI.RawStatusString()) == "Abandoned"
+            @test MOI.get(model, MOI.ResultCount()) == 0
+
+            # :Error → NUMERICAL_ERROR with the KKT message (duplicated equality
+            # row; preprocess = false so the duplicate reaches the factorization)
+            model = cached(preprocess = false)
+            x = MOI.add_variables(model, 2)
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, x[1]),
+                                          MOI.ScalarAffineTerm(1.0, x[2])], 0.0))
+            for _ in 1:2
+                MOI.add_constraint(model,
+                    MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, x[1])], 0.0),
+                    MOI.EqualTo(1.0))
+            end
+            for xi in x; MOI.add_constraint(model, xi, MOI.GreaterThan(0.0)); end
+            MOI.optimize!(model)
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.NUMERICAL_ERROR
+            @test MOI.get(model, MOI.ResultCount()) == 0
+            raw = MOI.get(model, MOI.RawStatusString())
+            @test startswith(raw, "Error: ")
+            @test occursin("KKT solve failed", raw)
         end
 
         @testset "Simple LP via MOI" begin

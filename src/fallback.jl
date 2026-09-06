@@ -91,7 +91,10 @@ function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
             verbose = false,
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
-  catch
+  catch err
+    # Only factorization failures mean "no ray"; anything else is a broken
+    # invariant (bad custom kktsolver, indexing bug) and must propagate.
+    err isa KKT_FAILURES || rethrow()
     return nothing
   end
 
@@ -160,7 +163,8 @@ function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
             verbose = false,
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
-  catch
+  catch err
+    err isa KKT_FAILURES || rethrow()
     return nothing
   end
 
