@@ -15,7 +15,6 @@
 #   unique_y = false        the optimal set is not a singleton, so solvers
 #                           may legitimately return different `y`
 #   checks                  `"name" => (sol, tol) -> Bool` structural checks
-#   skip_sparse             exclude kktsolver_sparse from the cross-solver loop
 #
 # read by the test loop through `get(prob, :field, default)`.
 #
@@ -254,7 +253,6 @@ function sdp_multiple_blocks(; n1 = 3, n2 = 4)
             known_status = :Optimal, known_obj = tr(C1) + tr(C2),
             known_X = nothing,
             known_y = vcat(ConicIP.vecm(C1), ConicIP.vecm(C2)),
-            skip_sparse = true,
             description = "Multiple SDP blocks (n1=$n1, n2=$n2)")
 end
 

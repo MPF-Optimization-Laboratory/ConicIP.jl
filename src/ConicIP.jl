@@ -63,6 +63,14 @@ mutable struct v4x1; y::Vector{Float64}; w::Vector{Float64}; v::Vector{Float64};
 
 LinearAlgebra.norm(a::v4x1) = norm(a.y) + normsafe(a.w) + normsafe(a.v) + normsafe(a.s)
 
+# All four blocks finite. Screening for this *before* handing an iterate or
+# a direction to LAPACK matters: a NaN reaching a factorization raises
+# ArgumentError("matrix contains Infs or NaNs"), which is deliberately not a
+# KKT_FAILURE and would escape the solver. (`all(isfinite, Δ)` would be a
+# MethodError -- v4x1 is not iterable.)
+isfinite4(Δ::v4x1) = all(isfinite, Δ.y) && all(isfinite, Δ.w) &&
+                     all(isfinite, Δ.v) && all(isfinite, Δ.s)
+
 function axpy4!(α::Number, x::v4x1, y::v4x1)
     axpy!(α, x.y, y.y); axpy!(α, x.w, y.w)
     axpy!(α, x.v, y.v); axpy!(α, x.s, y.s)
@@ -205,6 +213,15 @@ function nestod_soc(z,s)
 
   n = size(z,1)
 
+  # QF(x) = x₁² - ‖x̄‖² is the Jordan determinant of the SOC. It is
+  # positive in the interior, and roundoff on a near-boundary iterate can
+  # push it to zero or below — at which point β and γ silently become Inf
+  # or NaN and a non-finite scaling matrix escapes into the KKT solve.
+  # Refuse it here so that a boundary SOC iterate surfaces as a guarded
+  # factorization failure, exactly as a boundary SDP iterate does through
+  # the cholesky in nestod_sdc.
+  (QF(z) > 0 && QF(s) > 0) || throw(LinearAlgebra.PosDefException(1))
+
   β = (QF(s)/QF(z))^(1/4)
 
   # Normalize z,s vectors
@@ -236,12 +253,15 @@ function nestod_sdc(z,s)
   # (equivalently F'*(F*z) = s).  Note inv(F') and not inv(F): the two
   # agree only when mat(z) and mat(s) commute.
 
-  Ls  = cholesky(mat(s)).L
-  Lz  = cholesky(mat(z)).L
+  Ls  = cholesky(Symmetric(mat(s))).L
+  Lz  = cholesky(Symmetric(mat(z))).L
   F   = svd(Lz'*Ls)
   U   = F.U
   Λ   = F.S
-  R = inv(Lz)'*U*spdiagm(0 => sqrt.(Λ))
+  # R = inv(Lz)'*U*diagm(sqrt.(Λ)), formed as a triangular solve plus a
+  # column scaling: inv(Lz)' = inv(Lz') so inv(Lz)'*U is Lz' \ U, and
+  # right-multiplying by a diagonal scales the columns.
+  R = (Lz' \ U) .* sqrt.(Λ)'
   return VecCongurance(R)
 
 end
@@ -249,7 +269,9 @@ end
 function maxstep_rp(x,d)
 
   # Assume x in R+.
-  # Returns maximum α such that x + α*d in R+.
+  # Returns maximum α such that x - α*d in R+.
+  # (every cone's maxstep uses the minus convention: the solver step is
+  #  z ← z - α*Δz.)
 
   minVal = Inf
   for i = 1:length(x)
@@ -308,34 +330,42 @@ end
 
 function maxstep_sdc(x,d)
 
-  # Maximum step to Semidefinite cone
-  X     = mat(x)
-  # If X is not positive definite, return Inf
-  λX    = eigvals(Symmetric(X))
-  if any(λX .<= 0)
-    return Inf
-  end
-  Xih   = X^(-1/2)
-  D     = mat(d)
-  XDX   = Xih*D*Xih
-  XDX   = 0.5*(XDX + XDX')
-  Λ     = eigvals(XDX)
-  Λn    = Λ .< 0
-  if all(Λn)
-    return Inf
-  else
-    return 1/maximum(Λ[.!Λn])
-  end
+  # Maximum α such that mat(x) - α*mat(d) ⪰ 0, for X = mat(x) ≻ 0.
+  #
+  # For X ≻ 0,
+  #
+  #     X - αD ⪰ 0  ⟺  I - α X^{-1/2} D X^{-1/2} ⪰ 0  ⟺  α·λmax ≤ 1,
+  #
+  # where λmax is the largest eigenvalue of X^{-1/2} D X^{-1/2}. Those
+  # eigenvalues are exactly the generalized eigenvalues of the symmetric-
+  # definite pencil (D, X), so one LAPACK sygvd call — a Cholesky of X
+  # plus one symmetric eigen-decomposition — replaces the three
+  # decompositions the explicit form needs.
+  #
+  # sygvd factors X, so X ⋡ 0 raises PosDefException instead of being
+  # answered with Inf; conicIP catches it and reports :Error.
+  Λ = eigvals(Symmetric(mat(d)), Symmetric(mat(x)))
+  # An order-0 block constrains nothing, so it never limits the step.
+  isempty(Λ) && return Inf
+  # sygvd can return NaN rather than throw when X is positive definite but
+  # scaled into the subnormal range; treat that as a factorization failure.
+  all(isfinite, Λ) || throw(LinearAlgebra.LAPACKException(0))
+  λmax = maximum(Λ)
+  # λmax ≤ 0 means every direction of D moves *into* the cone. The
+  # comparison (rather than a sign mask) is what makes a direction of
+  # signed zeros — which kktsolver_sparse produces for a mathematically
+  # zero step — return +Inf rather than 1/(-0.0) = -Inf.
+  return λmax <= 0 ? Inf : 1/λmax
 
 end
 
 function maxstep_sdc(x,d::Nothing)
 
-  # Maximum step to Semidefinite cone
-  X = mat(x)
-  Λ = eigvals(X)
-  minΛ  = minimum(Λ)
-  return all(minΛ .> 0) ? 0 : -1 + minΛ
+  # Maximum step to Semidefinite cone (see maxstep_rp(x, ::Nothing))
+  # An order-0 block is vacuously strictly feasible and needs no shift.
+  isempty(x) && return 0
+  minΛ = eigmin(Symmetric(mat(x)))
+  return minΛ > 0 ? 0 : -1 + minΛ
 
 end
 
@@ -573,12 +603,20 @@ Returns a [`Solution`](@ref) whose `status` is one of
   when the best iterate carries a ray that validates at `100*infeasTol`
   but not at `infeasTol`. The best iterate is retained.
 - `:Abandoned` — iteration limit reached with no verdict.
-- `:Error` — nonfinite residuals, or a KKT factorization failure (the
-  reason is recorded in `sol.message`). Rank-deficient `G` handed
-  directly to `conicIP` typically lands here; use
-  [`preprocess_conicIP`](@ref) to trim redundant rows first. `staticReg`
-  regularizes only the `Q` block of the KKT system and cannot repair a
-  rank-deficient `G`.
+- `:Error` — nonfinite residuals, a nonfinite search direction or
+  iterate, or a KKT factorization failure (the reason is recorded in
+  `sol.message`). Rank-deficient `G` handed directly to `conicIP`
+  typically lands here; use [`preprocess_conicIP`](@ref) to trim
+  redundant rows first. `staticReg` regularizes only the `Q` block of
+  the KKT system and cannot repair a rank-deficient `G`.
+
+Every factorization or cone line search that can fail on a boundary
+iterate is guarded, so such a failure is reported as an `:Error` status
+with a reason in `sol.message` and never as an escaped exception (issue
+#10). A guarded failure returns immediately with the current iterate (the
+initial point, with `Iter = 0` and `pobj = Inf`, if no iteration
+completed); it does not go through the certificate-fallback path, which
+runs only when the iteration limit is exhausted.
 
 Structurally degenerate inputs are handled exactly before any
 factorization: an all-zero row of `G` is deflated (`dᵢ = 0`) or answered
@@ -902,6 +940,10 @@ function conicIP(
     return msg
   end
 
+  # :Error status carrying no iterate (nothing has been computed yet).
+  errsol(msg) = Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
+                         :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false, msg)
+
   if verbose && kktsolver === default_kktsolver
     chosen = choose_kktsolver(Qᵣ, A, G, cone_dims)
     nnz_pc = (_structural_nnz(Q) + _structural_nnz(A) + _structural_nnz(G)) / max(n, 1)
@@ -912,9 +954,7 @@ function conicIP(
     kktsolver(Qᵣ,A,G,cone_dims)
   catch err
     err isa KKT_FAILURES || rethrow()
-    return Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                    :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false,
-                    kkt_error("solver setup", err))
+    return errsol(kkt_error("solver setup", err))
   end
 
   function solve4x4gen(λ, F, F⁻ᵀ, solve3x3gen = solve3x3gen)
@@ -958,13 +998,18 @@ function conicIP(
     solve4x4gen(e,I,I)(r0)
   catch err
     err isa KKT_FAILURES || rethrow()
-    return Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                    :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false,
-                    kkt_error("initial point", err))
+    return errsol(kkt_error("initial point", err))
   end
 
-  α_v = maxstep(z.v, nothing)
-  α_s = maxstep(z.s, nothing)
+  # A nonfinite initial point would reach LAPACK through maxstep below.
+  isfinite4(z) || return errsol("non-finite initial point (initial point)")
+
+  (α_v, α_s) = try
+    (maxstep(z.v, nothing), maxstep(z.s, nothing))
+  catch err
+    err isa KKT_FAILURES || rethrow()
+    return errsol(kkt_error("initial point", err))
+  end
 
   # Change to +
   z.v = z.v - α_v*e
@@ -987,12 +1032,53 @@ function conicIP(
   rStep   = 0
   rnorm   = 0
   μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
+
+  # ── Guards ──
+  #
+  # Every factorization and every cone line search below can raise a
+  # KKT_FAILURE on a boundary iterate, and the documented contract is an
+  # :Error status rather than an escaped exception. `guarded` stamps the
+  # solution and returns `nothing`; a `return` inside the closure would
+  # not leave conicIP, so each call site must `return sol` itself.
+  # `nothing` is usable as the failure sentinel because no guarded closure
+  # below can legitimately return it (they return a Block, a v4x1, or a
+  # tuple of step lengths).
+  function guarded(f, stage)
+    try
+      return f()
+    catch err
+      err isa KKT_FAILURES || rethrow()
+      sol.status = :Error
+      sol.message = kkt_error(stage, err)
+      return nothing
+    end
+  end
+
+  # Same verdict for a nonfinite direction or iterate, which has no
+  # exception to report but must not be handed to LAPACK.
+  function nonfinite!(what, stage)
+    sol.status = :Error
+    sol.message = "non-finite $what ($stage)"
+    if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
+    return sol
+  end
+
   for Iter = 1:maxIters
 
-    F    = nt_scaling(z.v, z.s)   # Nesterov-Todd Scaling Matrix
-    inv_adjoint!(F⁻ᵀ_cache, F)
-    F⁻ᵀ  = F⁻ᵀ_cache
-    λ    = F*z.v;                 # This is also F⁻ᵀ*z.s.
+    # Nesterov-Todd scaling matrix. nestod_sdc factors both cone iterates,
+    # so a boundary iterate surfaces here as a PosDefException.
+    Fλ = guarded("NT scaling, iteration $Iter") do
+      Fi = nt_scaling(z.v, z.s)
+      inv_adjoint!(F⁻ᵀ_cache, Fi)
+      (Fi, Fi*z.v)                 # λ = F*z.v is also F⁻ᵀ*z.s
+    end
+    Fλ === nothing && return sol
+    (F, λ) = Fλ
+    F⁻ᵀ    = F⁻ᵀ_cache
+    # A scaling that is non-finite without having thrown would reach
+    # inv_adjoint! and the KKT solve as Inf/NaN.
+    all(isfinite, λ) ||
+      return nonfinite!("NT scaling", "NT scaling, iteration $Iter")
 
     solve = try
       solve4x4gen(λ,F,F⁻ᵀ)         # Caches 4x4 solver
@@ -1175,22 +1261,25 @@ function conicIP(
     #  Predictor
     # ────────────────────────────────────────────────────────────
 
-    d_aff   = try
+    d_aff = guarded("predictor, iteration $Iter") do
       solve(r0)
-    catch err
-      err isa KKT_FAILURES || rethrow()
-      sol.status = :Error
-      sol.message = kkt_error("predictor, iteration $Iter", err)
-      return sol
     end
+    d_aff === nothing && return sol
+    isfinite4(d_aff) ||
+      return nonfinite!("predictor direction", "predictor, iteration $Iter")
 
-    α_aff_v = min( maxstep( z.v, d_aff.v ) , 1 )
-    α_aff_s = min( maxstep( z.s, d_aff.s ) , 1 )
-    α_aff   = min( α_aff_v , α_aff_s )
+    α_aff_vs = guarded("predictor line search, iteration $Iter") do
+      ( min( maxstep( z.v, d_aff.v ) , 1 ),
+        min( maxstep( z.s, d_aff.s ) , 1 ) )
+    end
+    α_aff_vs === nothing && return sol
+    α_aff = min( α_aff_vs[1] , α_aff_vs[2] )
 
     # >> ρ  = (z.v - α_aff*d_aff.v)'*(z.s - α_aff*d_aff.s)/μbar
     ρ  = fts(z.v, α_aff, d_aff.v, z.s, α_aff,d_aff.s)/μbar
     σ  = max(0,min(1,ρ))^3
+    (isfinite(ρ) && isfinite(σ)) ||
+      return nonfinite!("centering parameter", "predictor, iteration $Iter")
 
     # ────────────────────────────────────────────────────────────
     #  Corrector
@@ -1210,14 +1299,13 @@ function conicIP(
     #  Take newton step, with iterative refinement
     # ────────────────────────────────────────────────────────────
 
-    Δz  = try
+    Δz = guarded("corrector, iteration $Iter") do
       solve(r)
-    catch err
-      err isa KKT_FAILURES || rethrow()
-      sol.status = :Error
-      sol.message = kkt_error("corrector, iteration $Iter", err)
-      return sol
     end
+    Δz === nothing && return sol
+    isfinite4(Δz) ||
+      return nonfinite!("corrector direction", "corrector, iteration $Iter")
+
     rStep = 1;
     for rStep = 1:maxRefinementSteps
       cone_prod!(_prod_buf1, λ, F*Δz.v)
@@ -1233,20 +1321,37 @@ function conicIP(
       sub4!(_rIr, r, _rkkt)
       rnorm = norm(_rIr)/(n + p + 2*m)
       if rnorm < refinementThreshold; break; end
-      Δzr = solve(_rIr)
+      Δzr = guarded("refinement, iteration $Iter") do
+        solve(_rIr)
+      end
+      Δzr === nothing && return sol
+      isfinite4(Δzr) ||
+        return nonfinite!("refinement direction", "refinement, iteration $Iter")
       axpy4!(1.0, Δzr, Δz)
     end
+    isfinite4(Δz) ||
+      return nonfinite!("search direction", "search direction, iteration $Iter")
 
     # ────────────────────────────────────────────────────────────
     # Make Step
     # ────────────────────────────────────────────────────────────
 
-    α_v = min( maxstep(z.v, Δz.v/(1-DTB)), 1 )
-    α_s = min( maxstep(z.s, Δz.s/(1-DTB)), 1 )
-    α   = min( α_v, α_s )
+    # maxstep is homogeneous of degree -1 in the direction, so scaling the
+    # step back from the boundary by (1-DTB) is the same as searching along
+    # Δz/(1-DTB) — without forming the scaled direction.
+    α_vs = guarded("line search, iteration $Iter") do
+      ( min( 1, (1-DTB)*maxstep(z.v, Δz.v) ),
+        min( 1, (1-DTB)*maxstep(z.s, Δz.s) ) )
+    end
+    α_vs === nothing && return sol
+    α = min( α_vs[1], α_vs[2] )
 
     # >> z = z - α*Δz;
     axpy4!(-α, Δz, z)
+
+    # The next iteration's nt_scaling factors this iterate.
+    isfinite4(z) ||
+      return nonfinite!("iterate", "line search, iteration $Iter")
 
   end
 

@@ -247,6 +247,71 @@ end
         @test ConicIP.maxstep_sdc(xL, dNeg) == Inf
     end
 
+    @testset "maxstep_sdc generalized eigen form" begin
+        # maxstep_sdc solves the pencil (D, X) instead of forming
+        # X^{-1/2}*D*X^{-1/2}. The two must agree wherever the explicit
+        # form is defined, and the pencil form must additionally be exact
+        # on the degenerate inputs that broke the explicit one.
+        for n in 2:6, seed in (11, 12, 13)
+            Random.seed!(1000 * n + seed)
+            A = randn(n, n); X = A' * A + I           # strictly PD
+            R = randn(n, n); D = (R + R') / 2
+
+            x = ConicIP.vecm(X); d = ConicIP.vecm(D)
+            α = ConicIP.maxstep_sdc(x, d)
+
+            Xih = X^(-1 / 2)
+            M   = Symmetric((Xih * D * Xih + (Xih * D * Xih)') / 2)
+            λmax = maximum(eigvals(M))
+
+            if λmax > 0
+                @test α ≈ 1 / λmax rtol=1e-8
+                # X - α*D sits exactly on the cone boundary
+                @test eigmin(Symmetric(X - α * D)) ≈ 0 atol=1e-10 * norm(X)
+            else
+                @test α == Inf
+            end
+        end
+
+        # A zero direction never limits the step. kktsolver_sparse returns
+        # -0.0 for a mathematically zero affine dual step; the old sign
+        # mask let those through and produced 1/(-0.0) = -Inf.
+        Xi = ConicIP.vecm(Matrix{Float64}(I, 3, 3))
+        @test ConicIP.maxstep_sdc(Xi,  ConicIP.vecm(zeros(3, 3))) == Inf
+        @test ConicIP.maxstep_sdc(Xi, -ConicIP.vecm(zeros(3, 3))) == Inf
+
+        # X positive definite but scaled into the subnormal range: LAPACK
+        # sygvd returns NaN rather than throwing, which must still be
+        # reported as a KKT failure (never as NaN, never as ArgumentError).
+        @test_throws ConicIP.KKT_FAILURES ConicIP.maxstep_sdc(
+            ConicIP.vecm(diagm(0 => [1.0, 1e-310])),
+            ConicIP.vecm(Matrix{Float64}(I, 2, 2)))
+
+        # And X ⋡ 0 is a factorization failure, not an infinite step.
+        @test_throws ConicIP.KKT_FAILURES ConicIP.maxstep_sdc(
+            ConicIP.vecm(-Matrix{Float64}(I, 3, 3)),
+            ConicIP.vecm(Matrix{Float64}(I, 3, 3)))
+    end
+
+    @testset "Order-0 S block" begin
+        # MOI's PositiveSemidefiniteConeTriangle(0) reaches the solver as
+        # ("S", 0) — the wrapper does not filter it — so every per-cone
+        # primitive has to survive an empty block.  `maximum` and `eigmin`
+        # both throw on an empty spectrum, so both line searches need the
+        # explicit answer: an order-0 block constrains nothing.
+        @test ConicIP.maxstep_sdc(Float64[], Float64[]) == Inf
+        @test ConicIP.maxstep_sdc(Float64[], nothing) == 0
+        @test ConicIP.nestod_sdc(Float64[], Float64[]) isa ConicIP.VecCongurance
+
+        # and end to end, next to a live block
+        n = 2
+        sol = conicIP(Matrix{Float64}(I, n, n), ones(n),
+                      sparse(1.0I, n, n), zeros(n), [("R", n), ("S", 0)];
+                      verbose = false, optTol = optTol)
+        @test sol.status == :Optimal
+        @test norm(sol.y - ones(n), Inf) < tol
+    end
+
     # ──────────────────────────────────────────────────────────────
     #  Standard problem instances
     # ──────────────────────────────────────────────────────────────
@@ -285,18 +350,9 @@ end
 
     @testset "Consistency across KKT solvers" begin
         for prob in sdp_all_problems()
-            # `skip_sparse` marks a known kktsolver_sparse breakdown on
-            # small zero-Hessian SDP blocks: the search direction goes
-            # non-finite and LAPACK throws from inside maxstep_sdc.  This is
-            # off the default path — choose_kktsolver routes any SDP to
-            # kktsolver_qr — and is tracked in a robustness issue, so the
-            # pair is excluded here rather than pinned as expected output.
             solvers = Any[("qr", ConicIP.kktsolver_qr),
                           ("sparse", ConicIP.kktsolver_sparse),
                           ("pivot(2x2)", pivot(ConicIP.kktsolver_2x2))]
-            if get(prob, :skip_sparse, false)
-                deleteat!(solvers, 2)
-            end
 
             # Where the optimal set is not a singleton, solvers may return
             # different points; compare objectives instead, and let the KKT
