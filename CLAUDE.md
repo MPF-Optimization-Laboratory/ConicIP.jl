@@ -56,6 +56,7 @@ julia --project -e 'using Pkg; Pkg.test()'
 
 - `benchmark/profile.jl` — profiling script (timing, allocation, type stability)
 - `benchmark/report.md` — performance analysis and improvement roadmap
+- `benchmark/large-scale-roadmap.md` — diagnosis of scale limits and the tranche plan to lift them; update a tranche's Status line when work lands
 - Run: `julia --project -e 'include("benchmark/profile.jl")'`
 
 ## Git Workflow

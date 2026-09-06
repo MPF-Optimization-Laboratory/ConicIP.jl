@@ -10,6 +10,9 @@
 > and the WP8 allocation fixes. Re-run `benchmark/profile.jl` before
 > quoting them. The type-stability findings in §3d were fixed the same
 > day this report was written (commits `1e4ae19`, `6682b8c`).
+>
+> For what remains between the current solver and a large-scale one, see
+> `benchmark/large-scale-roadmap.md` (2026-09-06).
 
 ## 1. Executive Summary
 
