@@ -7,7 +7,7 @@
 [![Version](https://juliahub.com/docs/General/ConicIP/stable/version.svg)](https://juliahub.com/ui/Packages/General/ConicIP)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/blob/master/LICENSE.md)
 
-[ConicIP.jl](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl) (Conic **I**nterior **P**oint) is a pure-Julia interior-point solver for quadratic programs with linear equality constraints and polyhedral, second-order cone, and (experimental) semidefinite cone constraints. It solves
+[ConicIP.jl](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl) (Conic **I**nterior **P**oint) is a pure-Julia interior-point solver for quadratic programs with linear equality constraints and polyhedral, second-order cone, and semidefinite cone constraints. It solves
 
 ```
 minimize    ½yᵀQy - cᵀy
@@ -26,7 +26,7 @@ where `Q ⪰ 0` and each `Kᵢ` is a nonnegative orthant, a second-order cone, o
   |------|------|-------------|
   | Nonnegative orthant | `("R", n)` | Linear inequalities |
   | Second-order cone | `("Q", n)` | Norm constraints |
-  | Semidefinite (experimental) | `("S", k)` | Matrix positivity |
+  | Semidefinite | `("S", k)` | Matrix positivity |
 
 - **Quadratic objectives.** Handled natively by the direct API, without reformulation to a second-order cone. Through JuMP, quadratic objectives are supported via MathOptInterface bridges.
 - **Custom KKT solvers.** Plug in your own factorization or iterative method at each interior-point iteration; built-in dense, sparse, and reduced 2×2 solvers with automatic selection.

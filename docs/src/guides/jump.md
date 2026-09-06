@@ -97,7 +97,7 @@ round(objective_value(model), digits=6)
 | Nonpositive | `@constraint(model, x in MOI.Nonpositives(n))` |
 | Zero (equality) | `@constraint(model, x .== 0)` or `@constraint(model, x in MOI.Zeros(n))` |
 | Second-order cone | `@constraint(model, [t; x] in SecondOrderCone())` |
-| PSD (experimental) | `@constraint(model, X in PSDCone())` |
+| PSD | `@constraint(model, X in PSDCone())` |
 | Scalar equal | `@constraint(model, x == 1)` |
 | Scalar greater | `@constraint(model, x >= 1)` |
 | Scalar less | `@constraint(model, x <= 1)` |
@@ -112,4 +112,3 @@ Other limitations:
 
 - No integer variables
 - No indicator or SOS constraints
-- Semidefinite support is experimental

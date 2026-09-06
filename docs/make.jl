@@ -31,7 +31,7 @@ makedocs(;
             "Linear Programs" => "tutorials/generated/lp.md",
             "Quadratic Programs" => "tutorials/generated/qp.md",
             "Second-Order Cone" => "tutorials/generated/socp.md",
-            "Semidefinite (Experimental)" => "tutorials/generated/sdp.md",
+            "Semidefinite Programs" => "tutorials/generated/sdp.md",
             "Reading the Iteration Log" => "tutorials/generated/verbose.md",
             "Detecting Infeasibility" => "tutorials/generated/infeasibility.md",
         ],
