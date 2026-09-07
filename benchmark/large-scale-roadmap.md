@@ -238,9 +238,26 @@ products. **Estimate was:** 1 week.
 
 ### Tranche 1: numerical core
 
-**Status:** not started. **Estimate:** 4–8 focused weeks for one experienced contributor,
-of which the LDLᵀ prototype is 1–2 weeks. Scaling, safeguards, and validation are the
-rest.
+**Status:** in progress on branch `large-scale-roadmap` (2026-09-06). Done: items 1–7
+(`kktsolver_ldl` with the lifted SOC form and QDLDL backend, flop-based default
+selection replacing the nnz/col rule, predictor and corrector refinement with
+relative/absolute tolerances, Ruiz equilibration with cone-uniform row scaling and
+original-coordinate residuals, relative gap test, `prFeas` includes equalities) and 9
+(`timeLimit`, `MOI.TimeLimitSec`). Open: 8 (dense gate still `size_min = 1000`;
+`kktsolver_2x2` untouched), 10 (step safeguards), 11 (callback contract).
+Measured so far: LDLᵀ is 5–25× faster than UMFPACK LU on banded LP/QP and large
+single SOCs at equal iteration counts, and 1.7× *slower* on the sum-of-norms SOCP at
+n = 6500 where fill is heavy (QDLDL is scalar code, UMFPACK's kernels are BLAS). The
+old absolute refinement threshold was hurting well-scaled problems: the Miles scaling
+instance at κ = 1 went from 89 iterations to 15 with the relative tolerance, and the
+κ = 10⁶–10⁸ variants from 30 to 21–23 with equilibration. A mixed SOC/LP with rows
+scaled over ten orders of magnitude stalls at 100 iterations unequilibrated and solves
+in 13 equilibrated. Two lessons for the remaining items: the retained best iterate must
+be judged on feasibility and complementarity only (a gap term hides the late iterate
+the certificate fallback needs), and predictor and corrector need separate refinement
+budgets.
+**Estimate was:** 4–8 focused weeks for one experienced contributor, of which the LDLᵀ
+prototype is 1–2 weeks. Scaling, safeguards, and validation are the rest.
 
 1. **Formulation.** Negate the third block row and its right-hand side and factor the
    symmetric quasi-definite matrix

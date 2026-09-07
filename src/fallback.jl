@@ -49,7 +49,7 @@ The returned pair is *not* validated and *not* normalized — pass it to
 """
 function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
                                     kktsolver = default_kktsolver,
-                                    maxIters = 50)
+                                    maxIters = 50, timeLimit = Inf)
 
   n = length(c)
   m = size(A, 1)
@@ -88,6 +88,7 @@ function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
     conicIP(Q_aux, c_aux, A_aux, b_aux, cone_dims, G_aux, d_aux;
             kktsolver = kktsolver,
             maxIters = maxIters,
+            timeLimit = timeLimit,
             verbose = false,
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
@@ -122,7 +123,7 @@ validated and *not* normalized — pass it to
 """
 function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
                                 kktsolver = default_kktsolver,
-                                maxIters = 50)
+                                maxIters = 50, timeLimit = Inf)
 
   n = length(c)
   m = size(A, 1)
@@ -160,6 +161,7 @@ function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
     conicIP(Q_aux, c_aux, A_aux, b_aux, cone_dims, G_aux, d_aux;
             kktsolver = kktsolver,
             maxIters = maxIters,
+            timeLimit = timeLimit,
             verbose = false,
             staticReg = 1e-8,
             certFallback = false)   # recursion guard

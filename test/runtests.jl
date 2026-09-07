@@ -118,7 +118,9 @@ end
             function solve2x2gen(F, F⁻¹)
                 v = inv(F[1] * F[1]).diag
                 D = Diagonal(v[1:n] + v[n+1:end])
-                invHD = inv(Diagonal(H.diag + D.diag))
+                # Q, not H: with equilibration the solver receives the
+                # scaled Hessian, and a custom kktsolver must use it.
+                invHD = inv(Diagonal(Q.diag + D.diag))
                 return (rhs, rhs2) -> (invHD * rhs, zeros(0))
             end
             return solve2x2gen
@@ -965,8 +967,10 @@ end
         Gu = spzeros(0, 2); du = Float64[]
 
         @testset "Unbounded — fallback certifies a stalled solve" begin
+            # maxIters is tuned to the trajectory: the gate opens from
+            # iteration 6 on with equilibration (5 without).
             s = conicIP(Qu, cu, Au, bu, Ku, Gu, du;
-                        verbose = false, maxIters = 5, certFallback = true)
+                        verbose = false, maxIters = 6, certFallback = true)
             @test s.status == :DualInfeasible
             @test s.has_certificate
 
@@ -1460,10 +1464,10 @@ end
     # ──────────────────────────────────────────────────────────────
 
     @testset "choose_kktsolver" begin
-        # #10-shaped: large, very sparse, no SDP → sparse solver
+        # #10-shaped: large, very sparse, no SDP → LDLᵀ
         pg = socp_sum_of_norms(150; d = 200)
         @test choose_kktsolver(pg.Q, pg.A, pg.G, pg.cone_dims) ===
-              ConicIP.kktsolver_sparse
+              ConicIP.kktsolver_ldl
         # SDP anywhere → qr, regardless of sparsity
         @test choose_kktsolver(pg.Q, pg.A, pg.G, [("Q",3), ("S",6)]) ===
               ConicIP.kktsolver_qr
@@ -1691,17 +1695,19 @@ end
         end
 
         # The four cases above stop at the initial-point, predictor and
-        # corrector screens: with the default refinementThreshold the
+        # corrector screens: with the default refinement tolerances the
         # refinement loop breaks on its first residual check, so no
         # refinement solve ever runs. Force the loop to solve by asking
         # for a residual it can never reach, and the refinement screen is
-        # the one that fires (solves #4..#6 of iteration 1).
-        for k in (4, 5, 6)
+        # the one that fires. The predictor is refined too now, so solve
+        # #3 is the predictor's first correction and #4.. are the rest.
+        for k in (3, 4, 5)
             s = conicIP(Qm, cm, Am, bm, Km; verbose = false,
-                        refinementThreshold = 0.0, kktsolver = nan_after(k))
+                        refineAbsTol = 0.0, refineRelTol = 0.0,
+                        kktsolver = nan_after(k))
             @test s.status == :Error
             @test occursin("refinement direction", s.message)
-            @test occursin("refinement, iteration 1", s.message)
+            @test occursin("refinement, ", s.message) && occursin("iteration 1", s.message)
         end
 
         # The iterate screen after axpy4! is the last line of defence, and
@@ -1914,13 +1920,164 @@ end
         mixes = ([("R", 4), ("Q", 3), ("Q", 5)],
                  [("R", 3), ("Q", 4), ("S", 6)],
                  [("Q", 8), ("S", 6)],
-                 [("S", 6), ("S", 10)])
+                 [("S", 6), ("S", 10)],
+                 [("Q", 12), ("Q", 7), ("R", 5)],     # lifted SOCs (k ≥ 6)
+                 [("Q", 30)])
         for kktsolver = (ConicIP.kktsolver_qr,
                          ConicIP.kktsolver_sparse,
+                         ConicIP.kktsolver_ldl,
                          pivot(ConicIP.kktsolver_2x2)),
             cone_mix in mixes
             @test contract_residual(kktsolver, cone_mix) < 1e-10
         end
+    end
+
+    @testset "kktsolver_ldl" begin
+        # soc_uv reproduces FᵀF = D² + uuᵀ − vvᵀ for a genuine NT scaling of
+        # a large SOC, with the sign structure the lifted system relies on.
+        Random.seed!(5)
+        for k in (6, 30, 200)
+            # interior: ‖randn(k−1)‖ ≈ √k, well inside a first entry of 2√k
+            v = [2sqrt(k); randn(k - 1)]; s = [2.5sqrt(k); randn(k - 1)]
+            F = ConicIP.nestod_soc(v, s)
+            (d², u, w) = ConicIP.soc_uv(F)
+            M = Matrix(F)
+            @test norm(M'M - (Diagonal(d²) + u*u' - w*w')) < 1e-12 * norm(M'M)
+            @test abs(dot(u, w)) < 1e-10 * (norm(u) * norm(w) + 1)
+            @test dot(w, w) < d²[end]          # β²I − vvᵀ ≻ 0
+        end
+        # Identity block (initial point) and the diagonal-parallel degenerate case
+        @test ConicIP.soc_uv(Diagonal(ones(4))) == (ones(4), zeros(4), zeros(4))
+        Fd = ConicIP.WoodburyMatrices.SymWoodbury(Diagonal(2.0*ones(5)), ones(5), 1.0)
+        (d², u, w) = ConicIP.soc_uv(Fd)
+        Md = Matrix(Diagonal(2.0*ones(5)) + ones(5)*ones(5)')
+        @test norm(Md'Md - (Diagonal(d²) + u*u' - w*w')) < 1e-12 * norm(Md'Md)
+
+        # Dependent equality rows: conicIP with kktsolver_ldl solves what the
+        # unregularized solvers cannot factor, without the preprocessor.
+        Q = sparse(1.0I, 4, 4); c = [1.0, 2.0, 3.0, 4.0]
+        A = sparse(1.0I, 4, 4); b = zeros(4)
+        g = sparse([1.0 1.0 1.0 1.0]); G = [g; 2g; g]; d = [2.0, 4.0, 2.0]
+        sol = conicIP(Q, c, A, b, [("R", 4)], G, d;
+                      kktsolver = ConicIP.kktsolver_ldl, verbose = false)
+        @test sol.status == :Optimal
+        @test norm(G*sol.y - d) < 1e-6
+        ref = conicIP(Q, c, A, b, [("R", 4)], g, [2.0]; verbose = false)
+        @test norm(sol.y - ref.y) < 1e-5
+
+        # Same solution as the other solvers on a mixed problem with a large SOC
+        n = 60
+        Am = [sparse(1.0I, n, n); -sparse(1.0I, n, n)]; bm = [zeros(n); fill(-5.0, n)]
+        cm = randn(n); cm[1] = -3.0
+        s_ldl = conicIP(spzeros(n, n), cm, Am, bm, [("Q", n), ("R", n)];
+                        kktsolver = ConicIP.kktsolver_ldl, verbose = false)
+        s_qr  = conicIP(spzeros(n, n), cm, Am, bm, [("Q", n), ("R", n)];
+                        kktsolver = ConicIP.kktsolver_qr, verbose = false)
+        @test s_ldl.status == :Optimal
+        @test abs(s_ldl.pobj - s_qr.pobj) < 1e-6 * (1 + abs(s_qr.pobj))
+
+        # Through MOI by name
+        import MathOptInterface as MOI
+        opt = ConicIP.Optimizer(kktsolver = "ldl")
+        @test ConicIP._resolve_kktsolver("ldl") === ConicIP.kktsolver_ldl
+        @test_throws ArgumentError ConicIP._resolve_kktsolver("nope")
+    end
+
+    @testset "Equilibration" begin
+        import MathOptInterface as MOI
+        Random.seed!(2)
+        # A mixed SOC/LP with rows scaled over ten orders of magnitude (the
+        # SOC block uniformly, as any row scaling of a cone block must be).
+        n = 40
+        A = [sprandn(30, n, 0.3); sparse(1.0I, n, n); -sparse(1.0I, n, n)]
+        x0 = randn(n)
+        b = [A[1:30, :]*x0 .- rand(30); fill(-10.0, n); fill(-10.0, n)]
+        c = randn(n)
+        cd = [("Q", 3), ("R", 27), ("R", 2n)]
+        D = Diagonal([fill(1e6, 3); 1e3 .* rand(27) .+ 1; fill(1e-4, 2n)])
+        s_ref = conicIP(spzeros(n, n), c, A, b, cd; verbose = false)
+        s_eq  = conicIP(spzeros(n, n), c, D*A, D*b, cd; verbose = false)
+        s_raw = conicIP(spzeros(n, n), c, D*A, D*b, cd; verbose = false,
+                        equilibrate = false)
+        @test s_ref.status == :Optimal
+        @test s_eq.status == :Optimal
+        @test s_eq.Iter <= s_ref.Iter + 3
+        @test norm(s_eq.y - s_ref.y) < 1e-4 * (1 + norm(s_ref.y))
+        @test abs(s_eq.pobj - s_ref.pobj) < 1e-6 * (1 + abs(s_ref.pobj))
+        # Reported residuals are in the original coordinates of the scaled
+        # problem: stationarity −(DA)ᵀv = c and primal feasibility hold there.
+        @test norm((D*A)' * s_eq.v + c) / (1 + norm(c)) < 1e-6
+        @test norm((D*A) * s_eq.y - s_eq.s - D*b) / (1 + norm(D*b)) < 1e-6
+        @test ConicIP.cone_margin(s_eq.s, cd) >= -1e-9
+        # Without equilibration this instance does not reach the tolerance.
+        @test s_raw.status != :Optimal
+
+        # The scaling itself: cone blocks uniform, factors bounded, exact inverse
+        eq = ConicIP.equilibrate_conicIP(spzeros(n, n), c, D*A, D*b, cd, spzeros(0, n), zeros(0))
+        @test all(==(eq.Dr[1]), eq.Dr[1:3])
+        @test all(1e-6 .<= eq.Dc .<= 1e6) && all(1e-6 .<= eq.Dr .<= 1e6)
+        @test norm(Diagonal(1 ./ eq.Dr) * eq.A * Diagonal(1 ./ eq.Dc) - D*A) < 1e-10 * norm(D*A)
+        @test norm(eq.c ./ eq.Dc ./ eq.σ - c) < 1e-12 * norm(c)
+
+        # Certificates come back normalized in the original coordinates.
+        Qi = Matrix(1.0I, 2, 2); ci = zeros(2)
+        Ai = [sparse(1.0I, 2, 2); sparse(-ones(1, 2))]; bi = [0.0, 0.0, 0.01]
+        Di = Diagonal([1e4, 1e-3, 1.0])
+        s = conicIP(Qi, ci, Di*Ai, Di*bi, [("R", 3)]; verbose = false, maxIters = 7)
+        @test s.status == :Infeasible && s.has_certificate
+        @test abs(dot(Di*bi, s.v) - 1) < 1e-8
+        chk, _, _ = ConicIP.validate_infeasibility_certificate(
+            Qi, ci, Di*Ai, Di*bi, [("R", 3)], spzeros(0, 2), Float64[], s.w, s.v;
+            abstol = 1e-9, reltol = 1e-7)
+        @test chk.valid
+        s = conicIP(spzeros(1, 1), [1.0], sparse([1e5;;]), [0.0], [("R", 1)]; verbose = false)
+        @test s.status == :DualInfeasible && s.has_certificate
+        @test abs(dot([1.0], s.y) - 1) < 1e-12
+
+        # MOI option round-trips
+        opt = ConicIP.Optimizer()
+        @test MOI.get(opt, MOI.RawOptimizerAttribute("equilibrate")) == true
+        MOI.set(opt, MOI.RawOptimizerAttribute("equilibrate"), false)
+        @test MOI.get(opt, MOI.RawOptimizerAttribute("equilibrate")) == false
+    end
+
+    @testset "Time limit" begin
+        import MathOptInterface as MOI
+        pg = socp_sum_of_norms(30; d = 40)
+        # An exhausted budget stops at the first iteration check: the
+        # initial point is returned as the best iterate, finite, unclaimed.
+        s = conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                    verbose = false, timeLimit = 0.0)
+        @test s.status == :TimeLimit
+        @test s.Iter == 0 && s.kkt_solves == 1
+        @test all(isfinite, s.y) && !s.has_certificate
+        # The budget covers preprocessing and the fallback solves.
+        s = preprocess_conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                               verbose = false, timeLimit = 0.0)
+        @test s.status == :TimeLimit
+        # A generous budget changes nothing.
+        s = conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                    verbose = false, timeLimit = 1e6)
+        @test s.status == :Optimal
+        # MOI: TimeLimitSec round-trips and maps to TIME_LIMIT.
+        opt = ConicIP.Optimizer()
+        @test MOI.supports(opt, MOI.TimeLimitSec())
+        @test MOI.get(opt, MOI.TimeLimitSec()) === nothing
+        MOI.set(opt, MOI.TimeLimitSec(), 2.5)
+        @test MOI.get(opt, MOI.TimeLimitSec()) == 2.5
+        MOI.set(opt, MOI.TimeLimitSec(), nothing)
+        @test MOI.get(opt, MOI.TimeLimitSec()) === nothing
+        model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(model, MOI.Silent(), true)
+        MOI.set(model, MOI.TimeLimitSec(), 0.0)
+        x = MOI.add_variables(model, 3)
+        MOI.add_constraint.(model, x, MOI.GreaterThan(0.0))
+        MOI.add_constraint(model, 1.0*x[1] + 1.0*x[2] + 1.0*x[3], MOI.EqualTo(1.0))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                1.0*x[1] + 2.0*x[2] + 3.0*x[3])
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.TIME_LIMIT
     end
 
     @testset "mat!/vecm! and VecCongurance on matrices" begin
@@ -1993,14 +2150,28 @@ end
         nb = 50_000
         A11 = sprand(nb, nb, 11/nb)
         @test choose_kktsolver(spzeros(nb, nb), A11, spzeros(0, nb), [("R", nb)]) ===
-              ConicIP.kktsolver_sparse
+              ConicIP.kktsolver_ldl
+        # With an unlimited dense budget the flop rule prefers dense QR here:
+        # a random 11-nnz/col pattern fills catastrophically under any
+        # ordering, so it is the 20 GB memory guard, not the flop count,
+        # that keeps such problems on the sparse solver.
         @test choose_kktsolver(spzeros(nb, nb), A11, spzeros(0, nb), [("R", nb)];
                                dense_bytes_max = typemax(Int)) ===
               ConicIP.kktsolver_qr
         # The guard precedes the SDP rule.
         @test choose_kktsolver(spzeros(20, 20), sprandn(21, 20, 0.5), spzeros(0, 20),
                                [("S", 6)]; dense_bytes_max = 1) ===
-              ConicIP.kktsolver_sparse
+              ConicIP.kktsolver_ldl
+        # Banded LP with box rows (13 nnz/col): dense QR by the old rule,
+        # 20× slower than LDLᵀ. The flop rule must choose LDLᵀ.
+        let n = 1200, w = 5
+            I_ = Int[]; J_ = Int[]
+            for i in 1:n, j in max(1, i - w):min(n, i + w); push!(I_, i); push!(J_, j); end
+            B = sparse(I_, J_, randn(length(I_)), n, n)
+            Ab = [B; sparse(1.0I, n, n); -sparse(1.0I, n, n)]
+            @test choose_kktsolver(spzeros(n, n), Ab, spzeros(0, n), [("R", 3n)]) ===
+                  ConicIP.kktsolver_ldl
+        end
 
         # A recession ray certifies dual infeasibility, not primal
         # unboundedness: this problem (0·y ≥ 1) is infeasible, and the

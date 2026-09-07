@@ -80,6 +80,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   # Certificate tolerances: honour whatever is forwarded to conicIP, and
   # otherwise fall back on conicIP's own defaults.
+  t_start = time()
   opts   = (; options...)
   reltol = get(opts, :infeasTol,    1e-7)
   abstol = get(opts, :infeasAbsTol, 1e-9)
@@ -156,11 +157,17 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # keyword argument).
   reg  = haskey(opts, :staticReg) ? opts[:staticReg] :
          (length(ID) < n ? 1e-8 : 0.0)
-  rest = Base.structdiff(opts, NamedTuple{(:staticReg,)})
+  rest = Base.structdiff(opts, NamedTuple{(:staticReg, :timeLimit)})
+
+  # The wall-clock budget covers the rank detection above and any retry
+  # below, not just the solve.
+  timeLimit = get(opts, :timeLimit, Inf)
+  time_left() = timeLimit - (time() - t_start)
 
   sol = conicIP(Q, c, A, b, cone_dims, G[IP,:], d[IP];
     verbose = verbose,       #                   |
     staticReg = reg,         # Removed redundant linear constraints
+    timeLimit = time_left(),
     rest...)                 # TODO : (use view?)
 
   # One retry with static regularization on a numerical (:Error) failure,
@@ -168,10 +175,11 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # pin staticReg themselves. A rank-deficient G is deliberately NOT
   # retried this way: staticReg touches only the Q block and cannot cure
   # it (imcols already trimmed dependent rows above).
-  if sol.status == :Error && reg == 0.0 && !haskey(opts, :staticReg)
+  if sol.status == :Error && reg == 0.0 && !haskey(opts, :staticReg) &&
+     time_left() > 0
     if verbose; println("   - KKT failure; retrying once with staticReg = 1e-8"); end
     sol = conicIP(Q, c, A, b, cone_dims, G[IP,:], d[IP];
-      verbose = verbose, staticReg = 1e-8, rest...)
+      verbose = verbose, staticReg = 1e-8, timeLimit = time_left(), rest...)
   end
 
   # Re-expand the equality duals over the original rows, zero on the dropped

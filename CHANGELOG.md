@@ -20,9 +20,41 @@ uses [Semantic Versioning](https://semver.org/).
   checks, so a converged iterate no longer pays for one, and a factorization
   failure cannot mask convergence.
 - Iterative refinement re-evaluates the step residual after the last
-  correction, so the reported residual describes the step taken.
+  correction, so the reported residual describes the step taken, and the
+  predictor step is refined as well as the corrector.
+- **Breaking (direct API):** the `refinementThreshold` keyword (an absolute
+  bound on a size-scaled residual) is replaced by `refineRelTol = 1e-13`
+  and `refineAbsTol = 1e-12`: refinement stops when
+  `‖r − KΔz‖ ≤ refineAbsTol + refineRelTol·‖r‖`.
+- Termination also requires the relative duality gap
+  `|pobj − dobj|/(1 + |pobj|) < optTol`; the complementarity residual alone
+  is a 2-norm whose enforced accuracy drifted with the number of cones.
+  `Solution.prFeas` now includes the equality residual.
 
 ### Added
+- `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
+  quasi-definite KKT system (QDLDL.jl backend, pure Julia). Fixed pattern
+  with AMD ordering analysed once, numeric refactorization in place each
+  iteration, second-order cones of dimension ≥ 6 lifted to diagonal plus
+  two columns, static and dynamic regularization with refinement against
+  the unregularized matrix. Dependent equality rows no longer need the
+  preprocessor. It is the new automatic choice for large non-SDP problems:
+  `choose_kktsolver` now decides between dense QR and LDLᵀ by predicted
+  flops from a symbolic analysis instead of nonzeros per column, and
+  `kktsolver_sparse` (UMFPACK LU) is no longer selected automatically.
+  New dependency: QDLDL.jl.
+- Ruiz equilibration of the problem data (`equilibrate = true` by default,
+  also an MOI option), with uniform scaling inside each second-order and
+  semidefinite block, and an objective rescale applied only when `‖c‖∞`
+  is outside `[1e-3, 1e3]` (the iteration is not invariant to it, and on
+  well-scaled problems it costs iterations). Termination is tested on
+  residuals mapped back to the original coordinates, so `optTol` keeps
+  its meaning; the solution and rays are mapped back as well. A custom
+  `kktsolver` now receives the scaled data.
+- `timeLimit` keyword (seconds) and `MOI.TimeLimitSec`: checked once per
+  iteration, covering preprocessing and retries; returns `:TimeLimit`
+  (`MOI.TIME_LIMIT`) with the best iterate, and skips the certificate
+  fallback solves.
 - `Solution.kkt_solves`: the number of KKT back-solves the main loop
   performed (initial point, predictor, corrector, refinements).
 - `benchmark/suite.jl`: reproducible harness with phase timings, solve

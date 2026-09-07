@@ -258,10 +258,12 @@ point but the duality gap hasn't closed — try more iterations (`maxIters`).
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `optTol` | `1e-6` | Convergence tolerance for all three residuals |
+| `optTol` | `1e-6` | Convergence tolerance for the primal, dual, equality, complementarity residuals and the relative duality gap |
 | `maxIters` | `100` | Maximum interior-point iterations |
 | `DTB` | `0.01` | Distance-to-boundary parameter; controls step conservatism |
-| `maxRefinementSteps` | `3` | Iterative refinement steps for KKT solve |
+| `maxRefinementSteps` | `3` | Iterative refinement corrections per KKT solve (predictor and corrector) |
+| `refineRelTol`, `refineAbsTol` | `1e-13`, `1e-12` | Refinement stops when `‖r − KΔz‖ ≤ abs + rel·‖r‖` |
+| `timeLimit` | `Inf` | Wall-clock budget in seconds; returns `:TimeLimit` with the best iterate |
 | `infeasTol` | `1e-7` | Relative tolerance for certificate screening and validation |
 | `infeasAbsTol` | `1e-9` | Absolute floor for certificate validation |
 | `staticReg` | `0` | Static regularization of the KKT factorization |

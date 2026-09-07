@@ -46,6 +46,7 @@ Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/
 
 include("blockmatrices.jl")
 include("kktsolvers.jl")
+include("kktsolver_ldl.jl")
 
 ViewTypes   = Union{SubArray}
 VectorTypes = Union{Vector, ViewTypes}
@@ -451,7 +452,8 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 - `v::Vector{Float64}` -- dual variables for inequality constraints (Ay ≥_K b)
 - `s::Vector{Float64}` -- cone slack variables (Ay - s = b, s ∈ K)
 - `status::Symbol` -- `:Optimal`, `:Infeasible`, `:DualInfeasible`,
-  `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:Abandoned`, or `:Error`
+  `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:Abandoned`, `:TimeLimit`,
+  or `:Error`
 - `Iter::Integer` -- number of interior-point iterations
 - `Mu::Real` -- final complementarity gap parameter
 - `prFeas::Real` -- primal feasibility residual
@@ -470,7 +472,7 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 | `:Infeasible` *with ray* | all `NaN` | ray `w̄` | ray `v̄` ∈ K | all `NaN` | `NaN` | `true` |
 | `:DualInfeasible` *with ray* | ray `ȳ` | all `NaN` | all `NaN` | `A*ȳ` | `NaN` | `true` |
 | `:Infeasible`/`:DualInfeasible` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
-| `:Abandoned`, `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
+| `:Abandoned`, `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:TimeLimit`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
 
 The infeasibility ray is normalized so that `dᵀw̄ - bᵀv̄ = -1` with
 `Gᵀw̄ - Aᵀv̄ ≈ 0`; the unboundedness ray is normalized so that `cᵀȳ = +1`
@@ -588,7 +590,9 @@ structurally_zero_cols(M::AbstractMatrix) =
   staticReg = 0.0,
   certFallback = true,
   certFallbackIters = 50,
-  refinementThreshold = optTol/1e7)
+  refineRelTol = 1e-13,
+  refineAbsTol = 1e-12,
+  timeLimit = Inf)
 
 Interior point solver for the system
 
@@ -623,6 +627,7 @@ Returns a [`Solution`](@ref) whose `status` is one of
   when the best iterate carries a ray that validates at `100*infeasTol`
   but not at `infeasTol`. The best iterate is retained.
 - `:Abandoned` — iteration limit reached with no verdict.
+- `:TimeLimit` — `timeLimit` seconds elapsed; the best iterate is retained.
 - `:Error` — nonfinite residuals, a nonfinite search direction or
   iterate, or a KKT factorization failure (the reason is recorded in
   `sol.message`). Rank-deficient `G` handed directly to `conicIP`
@@ -651,6 +656,13 @@ Selected keyword arguments:
 - `staticReg` — static KKT regularization scale; `0` (default) disables it.
   `preprocess_conicIP` enables it when it detects rank deficiency.
 - `certFallback` — enable fallback certificate solve on stall.
+- `maxRefinementSteps`, `refineRelTol`, `refineAbsTol` — the predictor and
+  corrector steps are refined against the 4×4 KKT system until
+  `‖r − KΔz‖ ≤ refineAbsTol + refineRelTol·‖r‖` or the step budget is spent.
+- `timeLimit` — wall-clock budget in seconds, checked once per iteration
+  (a single factorization can overrun it). On expiry the status is
+  `:TimeLimit` and the solution holds the best iterate so far; the
+  certificate-fallback solves are skipped.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -687,8 +699,27 @@ solves the system
 │ G                   │ │ b │   │ w │
 └                     ┘ └   ┘   └   ┘
 ```
+
+`equilibrate = true` (default) applies Ruiz equilibration to the data
+before solving and maps the solution, rays, and residuals back to the
+original coordinates; see [`equilibrate_conicIP`](@ref). A custom
+`kktsolver` then receives the scaled data.
 """
-function conicIP(
+function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
+                 G = spzeros(0, length(c)), d = zeros(0);
+                 equilibrate = true, kwargs...)
+  equilibrate || return _conicIP(Q, c, A, b, cone_dims, G, d; kwargs...)
+  eq  = equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
+  # The core tests termination on residuals mapped back to the original
+  # coordinates, so optTol keeps its meaning under any scaling.
+  scaling = (Dc = eq.Dc, Dr = eq.Dr, De = eq.De, σ = eq.σ,
+             normc = norm(c), normb = normsafe(b), normd = normsafe(d))
+  sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
+                 scaling = scaling, kwargs...)
+  return unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d)
+end
+
+function _conicIP(
 
   # ½xᵀQx - cᵀx
   Q, c::AbstractVector,
@@ -735,8 +766,17 @@ function conicIP(
                            # detects rank deficiency in [Q A' G'])
   certFallback = true,     # enables fallback certificate solve (WP5)
   certFallbackIters = 50,  # iteration budget for each fallback solve
-  refinementThreshold = optTol/1e7 # Accuracy of refinement steps
+  refineRelTol = 1e-13,    # refinement stops when ‖r − KΔz‖ ≤ refineAbsTol + refineRelTol‖r‖
+  refineAbsTol = 1e-12,
+  timeLimit = Inf,         # wall-clock budget in seconds, checked once per iteration
+  scaling = nothing        # set by conicIP when the data are equilibrated: the
+                           # termination residuals are evaluated in the
+                           # original coordinates (see equilibrate.jl)
   )
+
+  t_start = time()
+  over_time() = time() - t_start > timeLimit
+  time_left() = timeLimit - (time() - t_start)
 
   # Precomputed transposition matrices
   Aᵀ = A'; Gᵀ = G'
@@ -755,6 +795,10 @@ function conicIP(
   _div_buf   = zeros(m)
   _prod_buf1 = zeros(m)
   _prod_buf2 = zeros(m)
+  # Scratch for the step-residual evaluation only: _prod_buf1 is aliased by
+  # rleft.s / r0.s for the whole iteration and must not be overwritten.
+  _res_buf1  = zeros(m)
+  _res_buf2  = zeros(m)
   _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
 
@@ -827,7 +871,7 @@ function conicIP(
   if any(Gzr) || any(Zc)
     keep_r = findall(.!Gzr)
     keep_c = findall(.!Zc)
-    solr = conicIP(Q[keep_c, keep_c], c[keep_c], A[:, keep_c], b, cone_dims,
+    solr = _conicIP(Q[keep_c, keep_c], c[keep_c], A[:, keep_c], b, cone_dims,
                    G[keep_r, keep_c], d[keep_r];
                    kktsolver = kktsolver, optTol = optTol, DTB = DTB,
                    verbose = verbose, maxRefinementSteps = maxRefinementSteps,
@@ -835,12 +879,16 @@ function conicIP(
                    infeasTol = infeasTol, infeasAbsTol = infeasAbsTol,
                    staticReg = staticReg, certFallback = certFallback,
                    certFallbackIters = certFallbackIters,
-                   refinementThreshold = refinementThreshold)
+                   refineRelTol = refineRelTol, refineAbsTol = refineAbsTol,
+                   timeLimit = time_left(),
+                   scaling = scaling === nothing ? nothing :
+                             (; scaling..., Dc = scaling.Dc[keep_c],
+                                            De = scaling.De[keep_r]))
     # Re-expand, inserting zeros at deflated positions when the block is
     # meaningful for the returned status (see the Solution field table);
     # blocks the convention leaves NaN stay all-NaN.
     best_iter = solr.status in (:Optimal, :Abandoned, :AlmostInfeasible,
-                                :AlmostDualInfeasible, :Error, :None)
+                                :AlmostDualInfeasible, :TimeLimit, :Error, :None)
     w_ok = best_iter || (solr.status == :Infeasible && solr.has_certificate)
     y_ok = best_iter || (solr.status == :DualInfeasible && solr.has_certificate)
     w = fill(NaN, p); y = fill(NaN, n)
@@ -1101,6 +1149,12 @@ function conicIP(
     # termination returns below happen before this iteration's first solve.
     sol.kkt_solves = _nsolve[]
 
+    if over_time()
+      if verbose; print("\n > EXIT -- Time limit reached ($(timeLimit) s)\n\n"); end
+      sol.status = :TimeLimit
+      return sol
+    end
+
     # Nesterov-Todd scaling matrix. nestod_sdc factors both cone iterates,
     # so a boundary iterate surfaces here as a PosDefException.
     Fλ = guarded("NT scaling, iteration $Iter") do
@@ -1150,21 +1204,46 @@ function conicIP(
     #  Print iterate status, save best iterate
     # ────────────────────────────────────────────────────────────
 
-    cᵀy = dot(c,z.y)
-    rDu = norm(r0.y)/(1+normc)
-    rPr = normsafe(r0.v)/(1+normb)
-    rCp = normsafe(r0.s)/(1+abs(cᵀy));
-    rEq = normsafe(r0.w)/(1+normdsafe)   # Gy - d
-
+    cᵀy  = dot(c,z.y)
     pobj = 0.5*dot(z.y, Qy) - dot(c, z.y)
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
 
-    if max(rDu, rPr, rCp, rEq) < optBest
+    if scaling === nothing
+      rDu = norm(r0.y)/(1+normc)
+      rPr = normsafe(r0.v)/(1+normb)
+      rCp = normsafe(r0.s)/(1+abs(cᵀy));
+      rEq = normsafe(r0.w)/(1+normdsafe)   # Gy - d
+      rGap = abs(pobj - dobj)/(1 + abs(pobj))
+    else
+      # Residuals of the equilibrated iterate in the original coordinates:
+      # r_y = r̃_y/(σDc), r_v = r̃_v/Dr, r_w = r̃_w/De, and every
+      # complementarity quantity (λ∘λ, ⟨v,s⟩, the objectives) is 1/σ times
+      # its scaled value.
+      σs = scaling.σ
+      rDu = norm(r0.y ./ scaling.Dc)/σs/(1+scaling.normc)
+      rPr = normsafe(r0.v ./ scaling.Dr)/(1+scaling.normb)
+      rCp = normsafe(r0.s)/σs/(1+abs(cᵀy)/σs)
+      rEq = normsafe(r0.w ./ scaling.De)/(1+scaling.normd)
+      rGap = abs(pobj - dobj)/(σs + abs(pobj))
+    end
+    # rGap is the relative duality gap. rCp measures the complementarity
+    # vector in 2-norm, which is √(cones) smaller than the aggregate gap
+    # ⟨v,s⟩ for equal components; the explicit gap test keeps the enforced
+    # accuracy independent of problem size.
+
+    # The retained "best" iterate is judged on feasibility and
+    # complementarity only: on an infeasible or unbounded problem the gap
+    # diverges while the iterate sharpens into a certificate, and the
+    # post-loop screens and fallback need that late iterate, not an early
+    # one with a small gap.
+    bestMeasure = max(rDu, rPr, rCp, rEq)
+    optMeasure  = max(bestMeasure, rGap)
+    if bestMeasure < optBest
       sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v; sol.s[:] = z.s
       sol.Iter = Iter; sol.Mu = μ;
-      sol.duFeas = rDu; sol.prFeas = rPr; sol.muFeas = rCp
+      sol.duFeas = rDu; sol.prFeas = max(rPr, rEq); sol.muFeas = rCp
       sol.pobj = pobj; sol.dobj = dobj
-      optBest = max(rDu, rPr, rCp, rEq)
+      optBest = bestMeasure
     end
 
     # ────────────────────────────────────────────────────────────
@@ -1177,7 +1256,7 @@ function conicIP(
     #  original problem data, and the claim returns immediately.
     # ────────────────────────────────────────────────────────────
 
-    optimal = max(rDu, rPr, rCp, rEq) < optTol
+    optimal = optMeasure < optTol
 
     # Defined even when no screen runs (verbose row below reads them)
     p_infeas = NaN
@@ -1311,12 +1390,60 @@ function conicIP(
     #  Predictor
     # ────────────────────────────────────────────────────────────
 
+    # Scaled KKT residual of the step Δz against the right-hand side r,
+    # left in the preallocated _rIr:
+    #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
+    function step_residual!(Δz, r)
+      cone_prod!(_res_buf1, λ, F*Δz.v)
+      cone_prod!(_res_buf2, λ, F⁻ᵀ*Δz.s)
+      mul!(_rkkt.y, Q, Δz.y)
+      mul!(_rkkt.y, Gᵀ, Δz.w, 1.0, 1.0)
+      mul!(_rkkt.y, Aᵀ, Δz.v, -1.0, 1.0)
+      mul!(_rkkt.w, G, Δz.y)
+      mul!(_rkkt.v, A, Δz.y); _rkkt.v .-= Δz.s
+      _rkkt.s .= _res_buf1 .+ _res_buf2
+      sub4!(_rIr, r, _rkkt)
+      return norm(_rIr)
+    end
+
+    # Iterative refinement of a step Δz for the right-hand side r: at most
+    # maxRefinementSteps corrections, each one more back-solve with the
+    # same factorization, until ‖r − KΔz‖ ≤ refineAbsTol + refineRelTol‖r‖.
+    # The residual is re-evaluated after the last correction so that
+    # `rnorm` (relative, shown in red in the verbose row when large)
+    # describes the step actually taken. Returns false after stamping sol
+    # when a correction solve fails.
+    function refine!(Δz, r, stage)
+      nr   = norm(r)
+      rtol = refineAbsTol + refineRelTol * nr
+      rres = step_residual!(Δz, r)
+      k    = 0                          # this call's own budget
+      while k < maxRefinementSteps && rres > rtol
+        Δzr = guarded("refinement, $stage") do
+          solve(_rIr)
+        end
+        Δzr === nothing && return false
+        if !isfinite4(Δzr)
+          nonfinite!("refinement direction", "refinement, $stage")
+          return false
+        end
+        axpy4!(1.0, Δzr, Δz)
+        k += 1
+        rres = step_residual!(Δz, r)
+      end
+      nref += k                         # iteration total, for the verbose row
+      rnorm = rres / (1 + nr)
+      return true
+    end
+    nref = 0
+
     d_aff = guarded("predictor, iteration $Iter") do
       solve(r0)
     end
     d_aff === nothing && return sol
     isfinite4(d_aff) ||
       return nonfinite!("predictor direction", "predictor, iteration $Iter")
+    refine!(d_aff, r0, "predictor, iteration $Iter") || return sol
 
     α_aff_vs = guarded("predictor line search, iteration $Iter") do
       ( min( maxstep( z.v, d_aff.v ) , 1 ),
@@ -1356,39 +1483,7 @@ function conicIP(
     isfinite4(Δz) ||
       return nonfinite!("corrector direction", "corrector, iteration $Iter")
 
-    # Scaled KKT residual of the step Δz against the right-hand side r,
-    # left in the preallocated _rIr:
-    #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
-    function step_residual!(Δz, r)
-      cone_prod!(_prod_buf1, λ, F*Δz.v)
-      cone_prod!(_prod_buf2, λ, F⁻ᵀ*Δz.s)
-      mul!(_rkkt.y, Q, Δz.y)
-      mul!(_rkkt.y, Gᵀ, Δz.w, 1.0, 1.0)
-      mul!(_rkkt.y, Aᵀ, Δz.v, -1.0, 1.0)
-      mul!(_rkkt.w, G, Δz.y)
-      mul!(_rkkt.v, A, Δz.y); _rkkt.v .-= Δz.s
-      _rkkt.s .= _prod_buf1 .+ _prod_buf2
-      sub4!(_rIr, r, _rkkt)
-      return norm(_rIr)/(n + p + 2*m)
-    end
-
-    # Iterative refinement: at most maxRefinementSteps corrections, each
-    # one more back-solve with the same factorization. The residual is
-    # re-evaluated after the last correction so that `rnorm` (and the red
-    # highlight in the verbose row) describes the step actually taken.
-    nref  = 0
-    rnorm = step_residual!(Δz, r)
-    while nref < maxRefinementSteps && rnorm >= refinementThreshold
-      Δzr = guarded("refinement, iteration $Iter") do
-        solve(_rIr)
-      end
-      Δzr === nothing && return sol
-      isfinite4(Δzr) ||
-        return nonfinite!("refinement direction", "refinement, iteration $Iter")
-      axpy4!(1.0, Δzr, Δz)
-      nref += 1
-      rnorm = step_residual!(Δz, r)
-    end
+    refine!(Δz, r, "corrector, iteration $Iter") || return sol
     isfinite4(Δz) ||
       return nonfinite!("search direction", "search direction, iteration $Iter")
 
@@ -1462,14 +1557,15 @@ function conicIP(
   #  default_kktsolver rather than the caller's solver: they have a
   #  different structure (min-norm, wide equalities, regularized), so
   #  the selection heuristic is re-run on the auxiliary data.
-  if certFallback && !pchk.valid && !dchk.valid &&
+  if certFallback && !over_time() && !pchk.valid && !dchk.valid &&
      (pchk100.valid || dchk100.valid || μ_collapsed || μ_diverged)
 
     # The auxiliary solves use their own iteration budget: the outer
     # maxIters is small in exactly the regime the fallback exists for.
     if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0
       ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
-                                       maxIters = certFallbackIters)
+                                       maxIters = certFallbackIters,
+                                       timeLimit = time_left())
       if ray !== nothing
         (fchk, fw̄, fv̄) = validate_infeasibility_certificate(
                             Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
@@ -1483,7 +1579,8 @@ function conicIP(
 
     if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0
       ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
-                                   maxIters = certFallbackIters)
+                                   maxIters = certFallbackIters,
+                                   timeLimit = time_left())
       if ray !== nothing
         (fchk, fȳ) = validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, ray;
@@ -1515,6 +1612,7 @@ function conicIP(
 
 end
 
+include("equilibrate.jl")
 include("certificates.jl")
 include("fallback.jl")
 include("preprocessor.jl")

@@ -19,57 +19,87 @@ iteration (`W` and `Lmat`). Float64 throughout.
 dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
 
 """
-    choose_kktsolver(Q, A, G, cone_dims;
-                     nnz_per_col_max = 10, size_min = 1000,
-                     dense_bytes_max = 4 * 2^30)
+    dense_kkt_flops(n, m, p)
 
-Pick a KKT solver from the problem's cone mix, size, and sparsity
-(issue #10). Returns one of the solver constructors, chosen by:
+Per-iteration flop estimate for [`kktsolver_qr`](@ref): forming the
+reduced Hessian `S22 + WᵀW` (`m(n−p)²`) plus its Cholesky (`(n−p)³/3`).
+"""
+dense_kkt_flops(n, m, p) = (r = max(n - p, 0); m*r^2 + r^3/3)
+
+# Per-iteration flop estimate for kktsolver_ldl from the symbolic
+# factorization: Σⱼ (column count of L)², the cost of the rank-1 updates.
+function _ldl_flops(pat)
+  Fl = qdldl(pat.K; logical = true)
+  return sum(abs2, Float64.(Fl.workspace.Lnz))
+end
+
+"""
+    choose_kktsolver(Q, A, G, cone_dims;
+                     size_min = 1000, dense_bytes_max = 4 * 2^30,
+                     ldl_flop_weight = 10.0)
+
+Pick a KKT solver from the problem's cone mix, size, and predicted
+factorization cost (issue #10). Returns one of the solver constructors,
+chosen by:
 
 0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
-   `dense_bytes_max` ⇒ [`kktsolver_sparse`](@ref), whatever the rules
+   `dense_bytes_max` ⇒ [`kktsolver_ldl`](@ref), whatever the rules
    below would say — dense QR at that size is an out-of-memory error,
    not a slow solve;
 1. any SDP cone ⇒ [`kktsolver_qr`](@ref) — the dense double-QR method is
-   the numerically robust choice for the dense SDP scaling blocks;
+   the numerically robust choice for the dense SDP scaling blocks, and
+   the sparse solver's SDP path is dense in `k(k+1)/2`;
 2. `n + m + p < size_min` ⇒ `kktsolver_qr` — dense factorization wins at
    small sizes and matches the historical default exactly;
-3. average structural nonzeros per column of `[Q; A; G]` above
-   `nnz_per_col_max` ⇒ `kktsolver_qr` — sparse-typed but dense-ish data
-   (e.g. many small SOCs with a 10%-dense `A`) factors faster densely;
-4. otherwise ⇒ [`kktsolver_sparse`](@ref).
+3. otherwise the two per-iteration flop estimates decide:
+   `kktsolver_qr` if [`dense_kkt_flops`](@ref) is below
+   `ldl_flop_weight` times the LDLᵀ estimate `Σⱼ nnz(L₍:,ⱼ₎)²` taken from
+   a symbolic analysis of the quasi-definite KKT pattern, else
+   `kktsolver_ldl`. The weight accounts for the dense path running in
+   BLAS and the LDLᵀ in scalar code; 10 reproduces the measured
+   crossover on the benchmark set (many small SOCs over a 10%-dense `A`
+   go dense, banded and block-structured problems go sparse).
 
-The decision is by *structural* nonzero counts, never by storage type.
+[`kktsolver_sparse`](@ref) (UMFPACK LU) is no longer selected
+automatically; it remains available explicitly.
 """
-function choose_kktsolver(Q, A, G, cone_dims;
-                          nnz_per_col_max = 10, size_min = 1000,
-                          dense_bytes_max = 4 * 2^30)
-  n = size(Q,1)
-  if dense_kkt_bytes(n, size(A,1), size(G,1)) > dense_bytes_max
-    return kktsolver_sparse
+choose_kktsolver(Q, A, G, cone_dims; kw...) =
+  _choose_kktsolver(Q, A, G, cone_dims; kw...)[1]
+
+function _choose_kktsolver(Q, A, G, cone_dims;
+                           size_min = 1000, dense_bytes_max = 4 * 2^30,
+                           ldl_flop_weight = 10.0)
+  n = size(Q,1); m = size(A,1); p = size(G,1)
+  if dense_kkt_bytes(n, m, p) > dense_bytes_max
+    return (kktsolver_ldl, nothing)
   end
   if any(cd[1] == "S" for cd in cone_dims)
-    return kktsolver_qr
+    return (kktsolver_qr, nothing)
   end
-  if n + size(A,1) + size(G,1) < size_min
-    return kktsolver_qr
+  if n + m + p < size_min
+    return (kktsolver_qr, nothing)
   end
-  total = _structural_nnz(Q) + _structural_nnz(A) + _structural_nnz(G)
-  if total > nnz_per_col_max * n
-    return kktsolver_qr
+  pat = _ldl_pattern(Q, A, G, cone_dims)
+  if dense_kkt_flops(n, m, p) < ldl_flop_weight * _ldl_flops(pat)
+    return (kktsolver_qr, nothing)
   end
-  return kktsolver_sparse
+  return (kktsolver_ldl, pat)
 end
 
 """
     default_kktsolver(Q, A, G, cone_dims)
 
 The default `kktsolver` for [`conicIP`](@ref): dispatches to the solver
-picked by [`choose_kktsolver`](@ref). Satisfies the standard kktsolver
-interface, so it can be passed anywhere a concrete solver can.
+picked by [`choose_kktsolver`](@ref), reusing the KKT pattern the choice
+analysed when the answer is [`kktsolver_ldl`](@ref). Satisfies the
+standard kktsolver interface, so it can be passed anywhere a concrete
+solver can.
 """
-default_kktsolver(Q, A, G, cone_dims) =
-  choose_kktsolver(Q, A, G, cone_dims)(Q, A, G, cone_dims)
+function default_kktsolver(Q, A, G, cone_dims)
+  (ks, pat) = _choose_kktsolver(Q, A, G, cone_dims)
+  return pat === nothing ? ks(Q, A, G, cone_dims) :
+                           kktsolver_ldl(Q, A, G, cone_dims; pattern = pat)
+end
 
 """
 Solves the 3x3 system

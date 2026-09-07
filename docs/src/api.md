@@ -44,6 +44,7 @@ ConicIP.Solution
 | `:AlmostInfeasible` | Iteration limit with a near-validating infeasibility candidate (no certificate) |
 | `:AlmostDualInfeasible` | Iteration limit with a near-validating recession-ray candidate (no certificate) |
 | `:Abandoned` | Solver stalled (step size too small or numerical issues) |
+| `:TimeLimit` | `timeLimit` seconds elapsed; the solution holds the best iterate so far |
 | `:Error` | Solver encountered an error |
 
 See [Troubleshooting Solver Output](@ref) in the Mathematical Background
@@ -83,9 +84,13 @@ them automatically per problem. See the [KKT Solvers](@ref) guide
 for detailed usage and custom solver development.
 
 ```@docs
+ConicIP.equilibrate_conicIP
 ConicIP.default_kktsolver
 ConicIP.choose_kktsolver
 ConicIP.dense_kkt_bytes
+ConicIP.dense_kkt_flops
+ConicIP.kktsolver_ldl
+ConicIP.soc_uv
 ConicIP.kktsolver_qr
 ConicIP.kktsolver_sparse
 ConicIP.kktsolver_2x2

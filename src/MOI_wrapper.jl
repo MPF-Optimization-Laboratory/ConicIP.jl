@@ -63,22 +63,24 @@ end
 # Options settable via MOI.RawOptimizerAttribute (and Optimizer kwargs)
 const _SUPPORTED_OPTIONS = (
     "verbose", "optTol", "maxIters", "infeasTol", "infeasAbsTol", "DTB",
-    "maxRefinementSteps", "staticReg", "certFallback", "certFallbackIters",
-    "cache_nestodd", "kktsolver", "preprocess",
+    "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
+    "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
+    "preprocess", "timeLimit", "equilibrate",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the constructor
-# itself, or "auto" | "qr" | "sparse" | "2x2"/"pivot".
+# itself, or "auto" | "ldl" | "qr" | "sparse" | "2x2"/"pivot".
 function _resolve_kktsolver(v)
     v isa Function && return v
     s = lowercase(string(v))
     s == "auto"             && return default_kktsolver
+    s == "ldl"              && return kktsolver_ldl
     s == "qr"               && return kktsolver_qr
     s == "sparse"           && return kktsolver_sparse
     s in ("2x2", "pivot")   && return pivot(kktsolver_2x2)
     throw(ArgumentError(
-        "unknown kktsolver \"$v\" (expected \"auto\", \"qr\", \"sparse\", " *
-        "\"2x2\", or a solver function)"))
+        "unknown kktsolver \"$v\" (expected \"auto\", \"ldl\", \"qr\", " *
+        "\"sparse\", \"2x2\", or a solver function)"))
 end
 
 function Optimizer(; kwargs...)
@@ -116,11 +118,27 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
     defaults = Dict{String, Any}(
         "verbose" => false, "optTol" => 1e-6, "maxIters" => 100,
         "infeasTol" => 1e-7, "infeasAbsTol" => 1e-9, "DTB" => 0.01,
-        "maxRefinementSteps" => 3, "staticReg" => 0.0,
+        "maxRefinementSteps" => 3, "refineRelTol" => 1e-13,
+        "refineAbsTol" => 1e-12, "staticReg" => 0.0,
         "certFallback" => true, "certFallbackIters" => 50,
         "cache_nestodd" => false, "kktsolver" => "auto",
-        "preprocess" => true)
+        "preprocess" => true, "timeLimit" => Inf, "equilibrate" => true)
     return get(model.options, attr.name, defaults[attr.name])
+end
+
+# MOI.TimeLimitSec is the "timeLimit" option; `nothing` clears it.
+MOI.supports(::Optimizer, ::MOI.TimeLimitSec) = true
+function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, value::Union{Nothing, Real})
+    if value === nothing
+        delete!(model.options, "timeLimit")
+    else
+        model.options["timeLimit"] = Float64(value)
+    end
+    return
+end
+function MOI.get(model::Optimizer, ::MOI.TimeLimitSec)
+    v = get(model.options, "timeLimit", Inf)
+    return isfinite(v) ? v : nothing
 end
 
 MOI.supports(::Optimizer, ::MOI.Silent) = true
@@ -525,6 +543,8 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
         return MOI.ALMOST_DUAL_INFEASIBLE
     elseif status == :Abandoned
         return MOI.ITERATION_LIMIT
+    elseif status == :TimeLimit
+        return MOI.TIME_LIMIT
     elseif status == :Error
         return MOI.NUMERICAL_ERROR
     else
