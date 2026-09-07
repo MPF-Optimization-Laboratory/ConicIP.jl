@@ -601,8 +601,11 @@ e.g. [("R",2),("Q",4)] means
 (y₃, y₄, y₅, y₆)  in  Q
 ```
 
-SDP Cones are NOT supported and purely experimental at this
-point.
+A semidefinite block is `("S", k)` with `k = n(n+1)/2` for an `n × n`
+symmetric matrix. Those `k` rows carry the matrix in the `vecm` form:
+the upper triangle read row by row, with the off-diagonal entries
+scaled by `√2`, so that `dot(vecm(X), vecm(Y)) == tr(X*Y)`. See
+[`vecm`](@ref) and [`mat`](@ref).
 
 Returns a [`Solution`](@ref) whose `status` is one of
 

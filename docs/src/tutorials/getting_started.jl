@@ -35,7 +35,7 @@
 #
 # - `("R", n)` -- nonnegative orthant: the first `n` rows satisfy `Ay - b ≥ 0`
 # - `("Q", m)` -- second-order cone: the next `m` rows satisfy `‖(Ay-b)[2:end]‖ ≤ (Ay-b)[1]`
-# - `("S", k)` -- semidefinite cone (experimental): the next `k` rows represent a vectorized
+# - `("S", k)` -- semidefinite cone: the next `k` rows represent a vectorized
 #   symmetric matrix that must be positive semidefinite, where `k = n(n+1)/2`
 #
 # For example, `[("R", 3), ("Q", 5)]` means the first 3 rows of `Ay ≥ b`

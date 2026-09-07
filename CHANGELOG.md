@@ -4,14 +4,28 @@ All notable changes to ConicIP.jl are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-06
 
 ### Added
+- KKT-validated SDP test suite with known-answer instances
+  (`test/sdp_tests.jl`, `test/sdp_problems.jl`).
+- SDPLIB validation gate: an SDPLIB 1.2 subset fetched on demand from a
+  pinned upstream commit, sha256-verified and cached, read through
+  `MOI.FileFormats.SDPA` (`test/sdplib_tests.jl`; skipped offline), plus
+  `benchmark/sdplib.jl` for the larger instances.
+- JuMP `PSDCone()` tutorial (Lovász theta of `C₅`), a semidefinite scope and
+  cost-model section, and a note on reading the semidefinite dual.
 - README: Features, Quick start, Citing, and Contributing sections; version badge.
 - `CHANGELOG.md`, GitHub issue forms, and `codecov.yml`.
 - Enriched `CITATION.cff` (version, release date, abstract, keywords).
 
 ### Changed
+- Semidefinite support is no longer labelled experimental; its scope, cost
+  model and measured SDPLIB accuracy are stated in the semidefinite tutorial.
+- Iteration counts and the complementarity residual on `"S"` blocks differ
+  from 0.3.x, because the corrector now centres semidefinite blocks correctly.
+- `maxstep_sdc` performs one generalized symmetric-definite eigen-solve
+  instead of three decompositions.
 - CI: coverage upload now fails loudly if the Codecov token is missing;
   Julia nightly failures no longer fail the workflow.
 - `fallback_infeasibility_ray` / `fallback_unbounded_ray` now catch only KKT
@@ -21,6 +35,18 @@ uses [Semantic Versioning](https://semver.org/).
   MOI status mapping and metadata, `Block` `inv`/`Adjoint` products.
 
 ### Fixed
+- The semidefinite cone product was `XY + YX`, twice the Jordan product,
+  while the cone identity `e = vecm(I)` assumed the true Jordan product. The
+  Mehrotra corrector therefore centred `"S"` blocks at `σ/2`, so a mixed-cone
+  problem was centred inconsistently across its blocks.
+- `maxstep_sdc` returned `-Inf` on a signed-zero search direction — which
+  `kktsolver_sparse` produces — breaking multi-block semidefinite problems on
+  the sparse solver.
+- Nesterov-Todd scaling, the cone line searches, and the iterative refinement
+  solve now honour the `:Error` contract: a boundary iterate no longer
+  escapes as a raw `PosDefException`.
+- Non-finite search directions and iterates are screened before they reach
+  LAPACK.
 - `preprocess_conicIP` reported `:Infeasible`/`:Unbounded` (without a
   certificate) when the reduced problem's ray failed revalidation against the
   original data, e.g. on a bounded problem whose equality rows are dependent
@@ -62,7 +88,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.2.0...v0.3.0

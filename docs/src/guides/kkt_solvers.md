@@ -34,7 +34,10 @@ using cone mix, size, and *structural* sparsity — never the storage
 type of the inputs:
 
 1. **Any SDP cone → `kktsolver_qr`.** The dense double-QR method is the
-   numerically robust choice for the dense SDP scaling blocks.
+   numerically robust choice for the dense SDP scaling blocks. This routing
+   sets the cost of a semidefinite solve; see
+   [Semidefinite support](@ref) for the cost model and for what the
+   solver does and does not handle.
 2. **Small problems (`n + m + p < 1000`) → `kktsolver_qr`.** Dense
    factorization wins at small sizes; behavior matches the historical
    default exactly.

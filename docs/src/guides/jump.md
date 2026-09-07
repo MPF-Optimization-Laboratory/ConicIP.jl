@@ -97,19 +97,22 @@ round(objective_value(model), digits=6)
 | Nonpositive | `@constraint(model, x in MOI.Nonpositives(n))` |
 | Zero (equality) | `@constraint(model, x .== 0)` or `@constraint(model, x in MOI.Zeros(n))` |
 | Second-order cone | `@constraint(model, [t; x] in SecondOrderCone())` |
-| PSD (experimental) | `@constraint(model, X in PSDCone())` |
+| PSD | `@constraint(model, X in PSDCone())` |
 | Scalar equal | `@constraint(model, x == 1)` |
 | Scalar greater | `@constraint(model, x >= 1)` |
 | Scalar less | `@constraint(model, x <= 1)` |
 
 ## Limitations
 
-!!! warning "No quadratic objectives through JuMP"
-    The MOI wrapper currently supports only **linear objectives**. For quadratic
-    programs, use the direct [`conicIP`](@ref) interface.
+!!! note "Quadratic objectives through JuMP are bridged"
+    The MOI wrapper itself accepts only affine objectives. A quadratic
+    objective in JuMP still works: MathOptInterface bridges reformulate it as
+    an epigraph over a second-order cone before it reaches the solver. The
+    direct [`conicIP`](@ref) interface handles a quadratic term in the
+    objective natively, without that reformulation, which is usually faster
+    and more accurate for large quadratic programs.
 
-Other limitations:
+Limitations:
 
 - No integer variables
 - No indicator or SOS constraints
-- Semidefinite support is experimental

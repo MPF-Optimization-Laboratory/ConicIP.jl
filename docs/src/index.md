@@ -1,8 +1,7 @@
 # ConicIP.jl
 
 **ConicIP.jl** is a pure-Julia conic interior-point solver for optimization
-problems with linear, second-order cone, and (experimental) semidefinite
-constraints.
+problems with linear, second-order cone, and semidefinite constraints.
 
 ## Why ConicIP?
 
@@ -28,7 +27,7 @@ where `Q ≽ 0` and `K` is a Cartesian product of cones:
 |------|------|-------------|
 | Nonnegative orthant | `("R", n)` | Linear inequalities |
 | Second-order cone | `("Q", n)` | Norm constraints |
-| Semidefinite (experimental) | `("S", k)` | Matrix positivity |
+| Semidefinite | `("S", k)` | Matrix positivity |
 
 ## Quick Example
 
@@ -80,13 +79,13 @@ ConicIP is a good fit when you need:
 
 - A **pure-Julia** solver with no binary dependencies
 - **Custom KKT solver callbacks** to exploit problem structure
-- A solver for **moderate-size** LP/QP/SOCP problems
+- A solver for **moderate-size** LP/QP/SOCP/SDP problems
 
 For large-scale production use, consider:
 
 | Solver | Pure Julia | QP | SOCP | SDP | Custom KKT |
 |--------|-----------|-----|------|-----|------------|
-| **ConicIP** | ✓ | ✓ | ✓ | experimental | ✓ |
+| **ConicIP** | ✓ | ✓ | ✓ | ✓ | ✓ |
 | [COSMO.jl](https://github.com/oxfordcontrol/COSMO.jl) | ✓ | ✓ | ✓ | ✓ | ✗ |
 | [Hypatia.jl](https://github.com/chriscoey/Hypatia.jl) | ✓ | ✓ | ✓ | ✓ | ✗ |
 | [SCS](https://github.com/jump-dev/SCS.jl) | ✗ (C) | ✗ | ✓ | ✓ | ✗ |

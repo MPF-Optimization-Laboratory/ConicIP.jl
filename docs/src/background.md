@@ -24,7 +24,7 @@ where `K` is a Cartesian product of cones and `Q` is positive semidefinite.
 **Second-order cone** (`"Q"`): also called the Lorentz cone,
 `Qⁿ = { (t, x) ∈ R × Rⁿ⁻¹ : ‖x‖₂ ≤ t }`.
 
-**Positive semidefinite cone** (`"S"`, experimental):
+**Positive semidefinite cone** (`"S"`):
 `Sⁿ₊ = { X ∈ Sⁿ : X ≽ 0 }`.
 Matrices are stored in vectorized form using [`vecm`](@ref ConicIP.vecm),
 which scales off-diagonal entries by `√2` to preserve inner products.
