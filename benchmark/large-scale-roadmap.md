@@ -64,7 +64,12 @@ precision.
   rule has no size guard: a million-variable problem with 11 nnz/col is routed to a
   solver that materializes an n×n dense orthogonal factor (`src/kktsolvers.jl:85`). That
   is a hazard, not a tuning question. The per-iteration cost is a dense (n−p)² Cholesky
-  plus m×(n−p) dense products (`src/kktsolvers.jl:99-106`). **Verified.**
+  plus m×(n−p) dense products (`src/kktsolvers.jl:99-106`). **Verified.** The rule also
+  misfires well below the memory guard: `benchmark/suite.jl`'s banded LP at n=2000
+  (13 nnz/col once the box-constraint identity rows are counted, factor fill 1.8× the
+  KKT nonzeros) takes about 5 s and 6 GiB of allocation through dense QR; forcing
+  `kktsolver_sparse` on the same instance takes 0.27 s at the same iteration count, a
+  23× difference. **Measured.**
 - **`kktsolver_2x2`** re-runs symbolic and numeric `lu` and re-forms an explicit Schur
   complement every iteration (`src/kktsolvers.jl:361-367`). No caching. **Verified.**
 - **`lift` is not reusable as-is for a quasi-definite system.** It inserts `−inv(D)` for
@@ -199,7 +204,10 @@ Tranches 1–2.
 
 ### Tranche 0: harness, safety, and status correctness
 
-**Status:** not started. **Estimate:** 1 week.
+**Status:** done on branch `large-scale-roadmap` (2026-09-06): `benchmark/suite.jl`,
+the `dense_bytes_max` guard in `choose_kktsolver`, factorization after the termination
+checks, `:DualInfeasible`, `Solution.kkt_solves`, the refine counter, and cached
+products. **Estimate was:** 1 week.
 
 1. `benchmark/suite.jl`: a small reproducible set (the issue-#10 instance, a few
    Maros–Mészáros QPs, a few CBLIB SOCPs, synthetic families at several sizes) with
