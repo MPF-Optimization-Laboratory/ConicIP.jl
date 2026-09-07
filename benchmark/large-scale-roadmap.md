@@ -379,6 +379,24 @@ as the right-hand side, since a homogeneous equality row under a 10⁸ scale was
 absolute test. Not done: bound tightening, duplicate-row detection, and general
 singleton substitution beyond equality rows. **Estimate was:** 2–4 weeks.
 
+**Measured 2026-09-07** (full harness, same machine as the Tranche 1 table; all 23
+instances solve, residuals and gaps below `1e-6` in original coordinates):
+
+| instance | Tranche 1 | Tranche 2 |
+|---|---|---|
+| issue #10 (6 010 vars) | 25 it, 0.34 s | 25 it, 0.21 s |
+| CBLIB nb | 19 it, 2.03 s | 19 it, 0.76 s |
+| CBLIB chainsing-1000-1 | 11 it, 0.88 s | 11 it, 0.22 s |
+| CBLIB nql30 / qssp30 / sched_50_50 | 0.36 / 0.65 / 0.36 s | 0.18 / 0.30 / 0.16 s |
+| Maros–Mészáros primal1 | 32 it | 13 it |
+| Maros–Mészáros qafiro / qpcblend / dual1 | 23 / 24 / 17 it | 14 / 17 / 12 it |
+| Maros–Mészáros cvxqp1_s | bridge failure | 10 it, 0.001 s |
+| banded LP / QP families | | unchanged |
+
+The CBLIB gains come from the front end (triplet assembly, no rank detection before
+an LDLᵀ solve), the Maros–Mészáros iteration drops from the native quadratic objective
+replacing the SOC epigraph. Issue #10 now stands at 1.2× ECOS.
+
 1. MOI assembly directly into the global `A` and `G` by triplet accumulation (one
    `sparse(I, J, V, m, n)` per matrix, not per constraint object); merge compatible
    orthant blocks; PSD input scaling as a diagonal multiply; result lookup through
