@@ -35,7 +35,7 @@ end
 
 """
     choose_kktsolver(Q, A, G, cone_dims;
-                     size_min = 1000, dense_bytes_max = 4 * 2^30,
+                     size_min = 200, dense_bytes_max = 4 * 2^30,
                      ldl_flop_weight = 10.0)
 
 Pick a KKT solver from the problem's cone mix, size, and predicted
@@ -50,7 +50,8 @@ chosen by:
    the numerically robust choice for the dense SDP scaling blocks, and
    the sparse solver's SDP path is dense in `k(k+1)/2`;
 2. `n + m + p < size_min` ⇒ `kktsolver_qr` — dense factorization wins at
-   small sizes and matches the historical default exactly;
+   small sizes (the symbolic analysis below would cost more than it
+   saves there);
 3. otherwise the two per-iteration flop estimates decide:
    `kktsolver_qr` if [`dense_kkt_flops`](@ref) is below
    `ldl_flop_weight` times the LDLᵀ estimate `Σⱼ nnz(L₍:,ⱼ₎)²` taken from
@@ -67,7 +68,7 @@ choose_kktsolver(Q, A, G, cone_dims; kw...) =
   _choose_kktsolver(Q, A, G, cone_dims; kw...)[1]
 
 function _choose_kktsolver(Q, A, G, cone_dims;
-                           size_min = 1000, dense_bytes_max = 4 * 2^30,
+                           size_min = 200, dense_bytes_max = 4 * 2^30,
                            ldl_flop_weight = 10.0)
   n = size(Q,1); m = size(A,1); p = size(G,1)
   if dense_kkt_bytes(n, m, p) > dense_bytes_max
@@ -406,6 +407,22 @@ function kktsolver_2x2(Q, A, G, cone_dims)
   m = size(A,1) # Number of inequality constraints
   p = size(G,1) # Number of equality constraints
 
+  Q = sparse(Q); A = sparse(A); G = sparse(G)
+
+  # Symbolic-factorization reuse, as in kktsolver_sparse: the Schur
+  # complement's pattern is fixed once the scaling has left the identity.
+  Zfact = nothing
+  Zpat  = nothing
+  function factor!(Z)
+    if Zfact !== nothing && identical_sparse_structure(Z, Zpat)
+      lu!(Zfact, Z)
+    else
+      Zfact = lu(Z)
+      Zpat  = Z
+    end
+    return Zfact
+  end
+
   function solve2x2gen(F, F⁻ᵀ)
 
     F⁻ᵀ = sparse(F⁻ᵀ)
@@ -414,11 +431,11 @@ function kktsolver_2x2(Q, A, G, cone_dims)
     Z = [ Q + AᵀF⁻¹F⁻ᵀA   G'
           G               spzeros(p,p) ]
 
-    Z = lu(Z)
+    Zᶠ = factor!(Z)
 
     function solve2x2(Δy, Δw)
 
-      z = Z\[Δy; Δw]
+      z = Zᶠ\[Δy; Δw]
       return (z[1:n], z[n+1:end])
 
     end

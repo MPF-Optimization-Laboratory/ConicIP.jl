@@ -19,6 +19,15 @@ uses [Semantic Versioning](https://semver.org/).
 - The KKT factorization is performed after the termination and certificate
   checks, so a converged iterate no longer pays for one, and a factorization
   failure cannot mask convergence.
+- The dense-QR gate in `choose_kktsolver` drops from 1000 to 200 total
+  dimension; `kktsolver_2x2` reuses its symbolic factorization across
+  iterations like `kktsolver_sparse`.
+- Line search: the trial iterate is checked for strict interiority with
+  the same quantities the NT scaling computes, backing the step off
+  geometrically if needed, so an accepted step can no longer fail the next
+  scaling. Three consecutive steps below 1e-8 end the loop as a stall
+  (`sol.message` says so) and hand over to the post-loop certificate
+  screens instead of spinning to `maxIters`.
 - Iterative refinement re-evaluates the step residual after the last
   correction, so the reported residual describes the step taken, and the
   predictor step is refined as well as the corrector.
@@ -62,6 +71,9 @@ uses [Semantic Versioning](https://semver.org/).
   recomputed from the original data.
 - `benchmark/large-scale-roadmap.md`: diagnosis of the scale limits and the
   tranche plan to lift them.
+- The KKT-solver guide documents the callback contract: data and signs,
+  the scaling-block types, calls per iteration, ownership of returned
+  arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
 - The verbose "refine" column always printed 1; it now reports the number of

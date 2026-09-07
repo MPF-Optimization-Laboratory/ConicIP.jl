@@ -238,13 +238,17 @@ products. **Estimate was:** 1 week.
 
 ### Tranche 1: numerical core
 
-**Status:** in progress on branch `large-scale-roadmap` (2026-09-06). Done: items 1–7
-(`kktsolver_ldl` with the lifted SOC form and QDLDL backend, flop-based default
-selection replacing the nnz/col rule, predictor and corrector refinement with
-relative/absolute tolerances, Ruiz equilibration with cone-uniform row scaling and
-original-coordinate residuals, relative gap test, `prFeas` includes equalities) and 9
-(`timeLimit`, `MOI.TimeLimitSec`). Open: 8 (dense gate still `size_min = 1000`;
-`kktsolver_2x2` untouched), 10 (step safeguards), 11 (callback contract).
+**Status:** done on branch `large-scale-roadmap` (2026-09-07), all eleven items:
+`kktsolver_ldl` with the lifted SOC form and QDLDL backend; flop-based default
+selection replacing the nnz/col rule, dense gate at 200, `kktsolver_2x2` with a
+factorization cache; predictor and corrector refinement with relative/absolute
+tolerances; Ruiz equilibration with cone-uniform row scaling, an objective rescale only
+outside `[1e-3, 1e3]`, and termination on original-coordinate residuals; relative gap
+test and `prFeas` including equalities; `timeLimit` / `MOI.TimeLimitSec`; verified
+interiority with geometric back-off and stall detection in the line search; and the
+callback contract in the KKT-solver guide. Not done from the verification list: the
+n = 10⁵–10⁶ synthetic families and the issue-#10 timing have not been run through the
+harness yet.
 Measured so far: LDLᵀ is 5–25× faster than UMFPACK LU on banded LP/QP and large
 single SOCs at equal iteration counts, and 1.7× *slower* on the sum-of-norms SOCP at
 n = 6500 where fill is heavy (QDLDL is scalar code, UMFPACK's kernels are BLAS). The

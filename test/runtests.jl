@@ -2041,6 +2041,33 @@ end
         @test MOI.get(opt, MOI.RawOptimizerAttribute("equilibrate")) == false
     end
 
+    @testset "Step safeguards" begin
+        # A solver whose directions are scaled up by 1e12 forces the line
+        # search to steps of order 1e-12: three of those in a row must end
+        # the loop as a stall (through the post-loop screens), not spin to
+        # maxIters.
+        inflate(inner) = (Q, A, G, cd) -> begin
+            gen = inner(Q, A, G, cd)
+            (F, Fi) -> begin
+                s = gen(F, Fi)
+                (a, b, c) -> begin
+                    (x, y, z) = s(a, b, c)
+                    (1e12 .* x, 1e12 .* y, 1e12 .* z)
+                end
+            end
+        end
+        pg = socp_sum_of_norms(20; d = 20)
+        s = conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                    verbose = false, kktsolver = inflate(ConicIP.kktsolver_ldl))
+        @test s.status == :Abandoned
+        @test s.Iter <= 4
+        @test occursin("stalled", s.message)
+        @test all(isfinite, s.y)
+        # The iterate stays strictly interior after every accepted step
+        # (checked by the solver before the step); the returned slack is.
+        @test ConicIP.cone_margin(s.s, pg.cone_dims) > 0
+    end
+
     @testset "Time limit" begin
         import MathOptInterface as MOI
         pg = socp_sum_of_norms(30; d = 40)

@@ -44,9 +44,9 @@ type of the inputs:
    sets the cost of a semidefinite solve; see
    [Semidefinite support](@ref) for the cost model and for what the
    solver does and does not handle.
-2. **Small problems (`n + m + p < 1000`) → `kktsolver_qr`.** Dense
-   factorization wins at small sizes; behavior matches the historical
-   default exactly.
+2. **Small problems (`n + m + p < 200`) → `kktsolver_qr`.** Dense
+   factorization wins at small sizes, and the symbolic analysis below
+   would cost more than it saves.
 3. **Otherwise, predicted flops decide.** A symbolic analysis of the
    quasi-definite KKT pattern gives the LDLᵀ cost `Σⱼ nnz(L₍:,ⱼ₎)²`; the
    dense cost is `m(n−p)² + (n−p)³/3`
@@ -208,6 +208,46 @@ Pass it to the solver via the `kktsolver` keyword:
 ```julia
 sol = conicIP(Q, c, A, b, cone_dims; kktsolver=my_kktsolver)
 ```
+
+### The contract
+
+What `conicIP` guarantees to a custom solver, and what it expects back:
+
+- **Data.** `Q`, `A`, `G` are whatever `conicIP` was given, after
+  equilibration (dense stays dense, sparse stays sparse; `Q` is
+  symmetric). Level 1 runs once per solve, before the initial point.
+- **Signs.** Level 3 solves exactly the system in the skeleton above:
+  `−Aᵀ` in the first block row and `+A`, `+FᵀF` in the third. A
+  symmetric formulation must negate the third row and `z` internally, as
+  `kktsolver_ldl` does.
+- **Scaling blocks.** `F` is a `Block` whose elements are `Diagonal`
+  (`"R"` cones, and *every* cone at the identity-scaled initial point),
+  `SymWoodbury` (`"Q"`), or `VecCongurance` (`"S"`); `F⁻ᵀ` is its
+  inverse adjoint. `FᵀF` is symmetric positive definite; `F` itself is
+  not self-adjoint for `"S"` blocks. Level 2 runs once per iteration
+  (plus once for the initial point) and may keep any state across
+  iterations; the sparsity pattern of `FᵀF` is fixed after the initial
+  point.
+- **Calls per iteration.** Level 3 is called for the predictor, the
+  corrector, and up to `maxRefinementSteps` refinements of each: between
+  two and `2 + 2·maxRefinementSteps` times per factorization.
+- **Ownership of the result.** Return fresh arrays. `conicIP` builds
+  its step from them and updates it in place during refinement; a view
+  into a buffer that the next call overwrites corrupts the step.
+- **Accuracy.** No tolerance is passed down. `conicIP` measures the 4×4
+  residual of every step and refines it against `refineAbsTol +
+  refineRelTol·‖r‖`, so a solver may regularize its factorization
+  (`kktsolver_ldl` does) as long as each solve is reasonably accurate
+  for the *unregularized* system; the refinement recovers the rest.
+  A solver that returns a poor solve every time will show as three
+  refinements per step in the verbose `refine` column and a red row.
+- **Failure.** Throw one of `ConicIP.KKT_FAILURES`
+  (`SingularException`, `PosDefException`, `LAPACKException`,
+  `ZeroPivotException`) from level 2 or level 3 to report a
+  factorization failure; `conicIP` returns `status = :Error` with the
+  stage in `sol.message`. Any other exception propagates as a bug.
+  Return non-finite values and `conicIP` reports
+  `"non-finite ... direction"` the same way.
 
 ### Example: Diagonal QP
 

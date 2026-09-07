@@ -799,6 +799,9 @@ function _conicIP(
   # rleft.s / r0.s for the whole iteration and must not be overwritten.
   _res_buf1  = zeros(m)
   _res_buf2  = zeros(m)
+  # Trial iterate for the interiority check of the line search
+  _trial_v   = zeros(m)
+  _trial_s   = zeros(m)
   _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
 
@@ -943,6 +946,24 @@ function _conicIP(
 
     return min_α;
 
+  end
+
+  # Strict interiority of x with respect to the cone product, tested with
+  # the same quantities the NT scaling will compute (QF for SOC blocks,
+  # a Cholesky for SDP blocks), so that an accepted step cannot fail the
+  # next iteration's scaling.
+  function interior(x)
+    @inbounds for (btype, I, i) = block_data
+      xI = view(x, I)
+      if btype == "R"
+        all(>(0.0), xI) || return false
+      elseif btype == "Q"
+        (xI[1] > 0 && QF(xI) > 0) || return false
+      elseif btype == "S"
+        isposdef(Symmetric(mat(xI))) || return false
+      end
+    end
+    return true
   end
 
   function nt_scaling(x, y)
@@ -1109,6 +1130,7 @@ function _conicIP(
   optBest = Inf
   nref    = 0      # refinement corrections applied in the previous iteration
   rnorm   = 0
+  nstall  = 0      # consecutive iterations with a negligible step
   μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
 
   # ── Guards ──
@@ -1501,12 +1523,44 @@ function _conicIP(
     α_vs === nothing && return sol
     α = min( α_vs[1], α_vs[2] )
 
+    # Verified interiority. maxstep is exact in exact arithmetic, but a
+    # step that lands within rounding of the boundary makes the next
+    # NT scaling fail (a terminal :Error today). Check the trial iterate
+    # exactly and back off geometrically before accepting it.
+    ok = false
+    for _ in 1:30
+      _trial_v .= z.v .- α .* Δz.v
+      _trial_s .= z.s .- α .* Δz.s
+      if interior(_trial_v) && interior(_trial_s)
+        ok = true
+        break
+      end
+      α /= 2
+    end
+    if !ok
+      sol.status = :Error
+      sol.message = "no interior point along the search direction (line search, iteration $Iter)"
+      sol.kkt_solves = _nsolve[]
+      if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
+      return sol
+    end
+
     # >> z = z - α*Δz;
     axpy4!(-α, Δz, z)
 
     # The next iteration's nt_scaling factors this iterate.
     isfinite4(z) ||
       return nonfinite!("iterate", "line search, iteration $Iter")
+
+    # Stall: three consecutive negligible steps mean the iteration is no
+    # longer moving. Leave the loop and let the post-loop screens decide
+    # between a certificate, an "almost" verdict, and :Abandoned.
+    nstall = α < 1e-8 ? nstall + 1 : 0
+    if nstall >= 3
+      sol.message = "stalled: step length below 1e-8 for 3 consecutive iterations (iteration $Iter)"
+      if verbose; print("\n > Stalled: step length below 1e-8 for 3 iterations\n"); end
+      break
+    end
 
   end
 
