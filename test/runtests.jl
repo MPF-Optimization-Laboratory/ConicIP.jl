@@ -88,10 +88,13 @@ end
         @test size(Z, 1) == 6
         @test sparse(Z) ≈ Matrix(Z)
 
-        # Test conic steplength - if steplength is infinity
+        # Conic steplength from a point outside the cone: the generalized
+        # eigen form factors X, so X ⋡ 0 is a factorization failure (which
+        # conicIP reports as :Error) rather than an infinite step.
         X = -Matrix{Float64}(I, 3, 3)
         D = Matrix{Float64}(I, 3, 3)
-        @test ConicIP.maxstep_sdc(ConicIP.vecm(X), ConicIP.vecm(D)) == Inf
+        @test_throws ConicIP.KKT_FAILURES ConicIP.maxstep_sdc(
+            ConicIP.vecm(X), ConicIP.vecm(D))
 
         # Test direct sparse(SymWoodbury) avoids dense materialization
         sw = ConicIP.WoodburyMatrices.SymWoodbury(Diagonal(rand(50)), randn(50, 2), Matrix(1.0I, 2, 2))
@@ -1636,6 +1639,256 @@ end
         @test s.status == :Optimal
     end
 
+    @testset "Non-finite direction at every stage" begin
+        # The mirror of the testset above. Instead of throwing, a broken
+        # KKT solver hands back a direction full of NaN. A NaN reaching
+        # LAPACK raises ArgumentError, which is deliberately *not* a
+        # KKT_FAILURE, so conicIP has to screen the direction itself and
+        # degrade to :Error rather than let the ArgumentError escape.
+        # Solve #1 = initial point, #2 = predictor, #3 = corrector, later
+        # calls = iterative refinement or the next iteration.
+        function nan_after(k)
+            nsolve = Ref(0)
+            function factory(Q, A, G, cone_dims)
+                inner = ConicIP.kktsolver_qr(Q, A, G, cone_dims)
+                function gen(F, F⁻ᵀ)
+                    solve = inner(F, F⁻ᵀ)
+                    function counted(bx, by, bz)
+                        nsolve[] += 1
+                        (x, y, z) = solve(bx, by, bz)
+                        nsolve[] == k && return (fill(NaN, length(x)),
+                                                 fill(NaN, length(y)),
+                                                 fill(NaN, length(z)))
+                        return (x, y, z)
+                    end
+                end
+            end
+        end
+
+        # Heterogeneous cone: every per-cone maxstep/scaling primitive is
+        # on the path, and the S block is the one that calls LAPACK.
+        Km = [("R", 2), ("Q", 3), ("S", 6)]
+        nm = 11
+        Qm = Matrix(1.0I, nm, nm)
+        cm = [1.0, -0.5, 2.0, 0.3, -0.4, 1.0, 0.2, 0.1, 1.0, 0.3, 1.0]
+        Am = sparse(1.0I, nm, nm); bm = zeros(nm)
+
+        for k in (1, 2, 3, 6)
+            s = nothing
+            @test try
+                s = conicIP(Qm, cm, Am, bm, Km;
+                            verbose = false, kktsolver = nan_after(k))
+                true
+            catch err
+                @error "conicIP threw instead of returning :Error" k err
+                false
+            end
+            if s !== nothing
+                @test s.status == :Error
+                @test !isempty(s.message)
+                @test !s.has_certificate
+            end
+        end
+
+        # The four cases above stop at the initial-point, predictor and
+        # corrector screens: with the default refinementThreshold the
+        # refinement loop breaks on its first residual check, so no
+        # refinement solve ever runs. Force the loop to solve by asking
+        # for a residual it can never reach, and the refinement screen is
+        # the one that fires (solves #4..#6 of iteration 1).
+        for k in (4, 5, 6)
+            s = conicIP(Qm, cm, Am, bm, Km; verbose = false,
+                        refinementThreshold = 0.0, kktsolver = nan_after(k))
+            @test s.status == :Error
+            @test occursin("refinement direction", s.message)
+            @test occursin("refinement, iteration 1", s.message)
+        end
+
+        # The iterate screen after axpy4! is the last line of defence, and
+        # a NaN cannot reach it — every direction is screened first. What
+        # can is a *finite* direction that overflows when added to a large
+        # iterate. Inject a near-maximal Float64 into one primal
+        # coordinate of the initial point and the opposite sign into the
+        # corrector direction; their sum is +Inf.
+        function inject_kkt(tbl)
+            nsolve = Ref(0)
+            function factory(Q, A, G, cone_dims)
+                inner = ConicIP.kktsolver_qr(Q, A, G, cone_dims)
+                function gen(F, F⁻ᵀ)
+                    solve = inner(F, F⁻ᵀ)
+                    function counted(bx, by, bz)
+                        nsolve[] += 1
+                        (x, y, z) = solve(bx, by, bz)
+                        f = get(tbl, nsolve[], nothing)
+                        return f === nothing ? (x, y, z) : f(x, y, z)
+                    end
+                end
+            end
+        end
+
+        # min 1'y s.t. y ≥ 0 (Q = 0, so a huge y never enters the dual
+        # residual and the run survives to the line search).
+        huge = 1.7e308
+        nh = 3
+        Qh = spzeros(nh, nh); ch = -ones(nh)
+        Ah = sparse(1.0I, nh, nh); bh = zeros(nh); Kh = [("R", nh)]
+        tbl = Dict(
+            # initial point: one coordinate at (nearly) floatmax
+            1 => (x, y, z) -> (vcat(huge, x[2:end]), y, z),
+            # predictor: a benign zero direction, so ρ and σ stay finite
+            2 => (x, y, z) -> (zero(x), zero(y), zero(z)),
+            # corrector: the same magnitude with the opposite sign
+            3 => (x, y, z) -> (vcat(-huge, zeros(length(x) - 1)),
+                               zero(y), zero(z)),
+        )
+        s = conicIP(Qh, ch, Ah, bh, Kh; verbose = false,
+                    maxRefinementSteps = 0, kktsolver = inject_kkt(tbl))
+        @test s.status == :Error
+        @test occursin("non-finite iterate", s.message)
+        @test occursin("line search, iteration 1", s.message)
+
+        # sanity: the wrapper is transparent when it does not fire
+        s = conicIP(Qm, cm, Am, bm, Km; verbose = false, kktsolver = nan_after(0))
+        @test s.status == :Optimal
+    end
+
+    @testset "SOC scaling guard" begin
+        # nestod_soc divides by the Jordan determinant QF(x) = x₁² - ‖x̄‖².
+        # On a near-boundary iterate roundoff can drive it to zero or
+        # below, and the old code then built a SymWoodbury out of Inf/NaN
+        # entries without throwing; inv_adjoint! met it with
+        # ArgumentError("D must be symmetric"), which is not a KKT_FAILURE
+        # and escaped conicIP — breaking the documented :Error contract.
+        # Refusing QF ≤ 0 up front turns it into a guarded failure, exactly
+        # as the cholesky in nestod_sdc does for a boundary SDP iterate.
+        zbad = [1.0, 1.0, 0.0]                     # QF = 0, on the boundary
+        zgood = [2.0, 0.5, 0.5]
+        @test_throws ConicIP.KKT_FAILURES ConicIP.nestod_soc(zbad, zgood)
+        @test_throws ConicIP.KKT_FAILURES ConicIP.nestod_soc(zgood, zbad)
+        @test ConicIP.nestod_soc(zgood, copy(zgood)) isa
+              ConicIP.WoodburyMatrices.SymWoodbury
+
+        # End-to-end: this family of two-SOC projections hits the boundary
+        # on seeds 47 and 139 of 160 at optTol = 1e-11 under
+        # kktsolver_sparse. Both used to throw out of conicIP; both must
+        # now come back as an ordinary Solution.
+        valid = (:Optimal, :Infeasible, :Unbounded, :AlmostInfeasible,
+                 :AlmostUnbounded, :Abandoned, :Error, :None)
+        escapes = 0
+        statuses = Symbol[]
+        for seed = 1:160
+            rng = Random.Xoshiro(seed)
+            nq = 5
+            Qq = sparse(1.0I, nq, nq); cq = randn(rng, nq)
+            Aq = sparse(1.0I, nq, nq); bq = randn(rng, nq)
+            try
+                sq = conicIP(Qq, cq, Aq, bq, [("Q", 2), ("Q", 3)];
+                             verbose = false, optTol = 1e-11,
+                             kktsolver = ConicIP.kktsolver_sparse)
+                push!(statuses, sq.status)
+            catch err
+                escapes += 1
+                @error "conicIP threw on SOC seed $seed" err
+            end
+        end
+        @test escapes == 0
+        @test length(statuses) == 160
+        @test all(st -> st in valid, statuses)
+        @test count(==(:Optimal), statuses) > 150
+    end
+
+    @testset "SDP certificates" begin
+        # Infeasibility and unboundedness on a pure semidefinite cone,
+        # through the direct API and through MOI. Both rays are produced by
+        # the same validators as the R₊/Q cases, but only the S cone
+        # exercises maxstep_sdc/nestod_sdc on the way there. These are
+        # coverage tests for a path the suite did not reach, not
+        # regression evidence for either fix in this branch — they pass
+        # against the pre-fix solver too.
+        k = 6                                     # vec dim of S³
+        Qs = spzeros(k, k)
+        As = sparse(1.0I, k, k); bs = zeros(k)     # X ⪰ 0
+        Ki = [("S", k)]
+        vecI = ConicIP.vecm(Matrix{Float64}(I, 3, 3))
+
+        # tr X = -1 is unreachable inside the PSD cone.
+        Gs = sparse(reshape(vecI, 1, k)); ds = [-1.0]
+        s = conicIP(Qs, zeros(k), As, bs, Ki, Gs, ds; verbose = false)
+        @test s.status == :Infeasible
+        @test s.has_certificate
+        @test eigmin(Symmetric(ConicIP.mat(s.v))) > -1e-8      # v̄ ∈ K
+        @test dot(ds, s.w) - dot(bs, s.v) ≈ -1                 # normalized ray
+
+        # min -tr X over X ⪰ 0 is unbounded below.
+        s = conicIP(Qs, vecI, As, bs, Ki; verbose = false)
+        @test s.status == :Unbounded
+        @test s.has_certificate
+        @test dot(vecI, s.y) ≈ 1                               # cᵀȳ = +1
+        @test eigmin(Symmetric(ConicIP.mat(s.s))) > -1e-8      # Aȳ ∈ K
+
+        import MathOptInterface as MOI
+
+        # MOI stores the upper triangle column by column with
+        # off-diagonals appearing once and unscaled, in the primal and in
+        # the dual alike, so the matrix is read off directly.
+        function moi_mat(t, n)
+            M = zeros(n, n); c = 1
+            for j = 1:n, i = 1:j
+                M[i, j] = t[c]; M[j, i] = t[c]; c += 1
+            end
+            return M
+        end
+        # diagonal positions of a 3×3 upper-triangle-by-column vector
+        diag3 = [1, 3, 6]
+
+        @testset "MOI infeasible PSD" begin
+            model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+            MOI.set(model, MOI.Silent(), true)
+            x = MOI.add_variables(model, k)
+            psd = MOI.add_constraint(model, MOI.VectorOfVariables(x),
+                                     MOI.PositiveSemidefiniteConeTriangle(3))
+            eq = MOI.add_constraint(model,
+                MOI.ScalarAffineFunction(
+                    MOI.ScalarAffineTerm.(ones(3), x[diag3]), 0.0),
+                MOI.EqualTo(-1.0))
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.optimize!(model)
+
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.INFEASIBLE
+            @test MOI.get(model, MOI.DualStatus()) ==
+                  MOI.INFEASIBILITY_CERTIFICATE
+            V = moi_mat(MOI.get(model, MOI.ConstraintDual(), psd), 3)
+            w = MOI.get(model, MOI.ConstraintDual(), eq)
+            @test eigmin(Symmetric(V)) > -1e-8     # ray lies in the cone
+            @test norm(V, Inf) > 1e-6              # and is not the zero ray
+            # Farkas: the constraint duals annihilate the (zero) objective
+            # row, and pair positively with the right-hand side.
+            @test norm(V + w * Matrix{Float64}(I, 3, 3), Inf) < 1e-6
+            @test w * (-1.0) > 1e-6
+        end
+
+        @testset "MOI dual-infeasible PSD" begin
+            model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+            MOI.set(model, MOI.Silent(), true)
+            x = MOI.add_variables(model, k)
+            MOI.add_constraint(model, MOI.VectorOfVariables(x),
+                               MOI.PositiveSemidefiniteConeTriangle(3))
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction(
+                    MOI.ScalarAffineTerm.(ones(3), x[diag3]), 0.0))
+            MOI.optimize!(model)
+
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.DUAL_INFEASIBLE
+            @test MOI.get(model, MOI.PrimalStatus()) ==
+                  MOI.INFEASIBILITY_CERTIFICATE
+            ray = MOI.get(model, MOI.VariablePrimal(), x)
+            R = moi_mat(ray, 3)
+            @test eigmin(Symmetric(R)) > -1e-8     # ray lies in the cone
+            @test tr(R) > 1e-6                     # and improves the objective
+        end
+    end
+
     @testset "KKT solver contract" begin
         # solve3x3gen(F,F⁻ᵀ)(bx,by,bz) must solve the documented 3×3
         # system for every solver and cone mix — including SOC+SDP mixes
@@ -1933,6 +2186,81 @@ end
             @test MOI.get(model, MOI.ObjectiveValue()) ≈ 2.0 atol=1e-4
             @test MOI.get(model, MOI.VariablePrimal(), x[1]) ≈ 0.0 atol=1e-2
             @test MOI.get(model, MOI.VariablePrimal(), x[2]) ≈ 1.0 atol=1e-2
+        end
+
+        @testset "Dimension-0 PSD constraint via MOI" begin
+            # The wrapper passes PositiveSemidefiniteConeTriangle(0)
+            # straight through as ("S", 0). It constrains nothing, so the
+            # solve must be unaffected rather than crash on an empty
+            # eigen-decomposition.
+            model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+            MOI.set(model, MOI.Silent(), true)
+            x = MOI.add_variables(model, 2)
+            MOI.add_constraint(model, MOI.VectorOfVariables(MOI.VariableIndex[]),
+                               MOI.PositiveSemidefiniteConeTriangle(0))
+            MOI.add_constraint(model, x[1], MOI.GreaterThan(0.0))
+            MOI.add_constraint(model, x[2], MOI.GreaterThan(1.0))
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.(ones(2), x), 0.0))
+            MOI.optimize!(model)
+
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test MOI.get(model, MOI.ObjectiveValue()) ≈ 1.0 atol=1e-4
+        end
+
+        @testset "Max eigenvalue SDP via MOI" begin
+            # min t s.t. t*I - C ⪰ 0, with C = I + 2uu' and u = [1,2,3]/√14,
+            # so λ(C) = (3,1,1): t⋆ = 3 and the dual of the PSD constraint
+            # is the spectral projector uu' onto the leading eigenvector.
+            # This is the sdp_affine_eigmax fixture of the SDP suite; here
+            # it also pins the MOI triangle convention end to end, since C
+            # has distinct off-diagonal entries.
+            u = [1.0, 2.0, 3.0] / sqrt(14.0)
+            C = Matrix{Float64}(I, 3, 3) + 2 * (u * u')
+
+            model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+            MOI.set(model, MOI.Silent(), true)
+            # The dual is recovered to about optTol, so ask for more than
+            # the 1e-6 default before asserting 1e-6 on uu'.
+            MOI.set(model, MOI.RawOptimizerAttribute("optTol"), 1e-9)
+            t = MOI.add_variable(model)
+            MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, t)], 0.0))
+
+            # PositiveSemidefiniteConeTriangle stores the upper triangle
+            # column by column: (1,1),(1,2),(2,2),(1,3),(2,3),(3,3).
+            terms = MOI.VectorAffineTerm{Float64}[]
+            consts = Float64[]
+            row = 1
+            for j = 1:3, i = 1:j
+                if i == j
+                    push!(terms, MOI.VectorAffineTerm(row,
+                        MOI.ScalarAffineTerm(1.0, t)))
+                end
+                push!(consts, -C[i, j])
+                row += 1
+            end
+            psd = MOI.add_constraint(model,
+                MOI.VectorAffineFunction(terms, consts),
+                MOI.PositiveSemidefiniteConeTriangle(3))
+
+            MOI.optimize!(model)
+
+            @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test MOI.get(model, MOI.VariablePrimal(), t) ≈ 3.0 atol=1e-8
+            @test MOI.get(model, MOI.ObjectiveValue()) ≈ 3.0 atol=1e-8
+
+            # The dual comes back in the same plain triangle coordinates
+            # as the constraint function: off-diagonals appear once and
+            # unscaled, so the matrix is read off directly.
+            dv = MOI.get(model, MOI.ConstraintDual(), psd)
+            V = zeros(3, 3); row = 1
+            for j = 1:3, i = 1:j
+                V[i, j] = dv[row]; V[j, i] = dv[row]; row += 1
+            end
+            @test norm(V - u * u') < 1e-6
         end
     end
 

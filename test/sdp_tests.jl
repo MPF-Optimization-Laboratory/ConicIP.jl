@@ -31,6 +31,18 @@ function sdp_block(sol, cone_dims)
     return nothing
 end
 
+# The same for the inequality dual `sol.v`.  An instance whose `A` is not
+# the identity models its matrix variable in the dual rather than in `y`
+# (see `sdp_affine_eigmax`), and reports it as `known_V`.
+function sdp_dual_block(sol, cone_dims)
+    offset = 0
+    for (ctype, cdim) in cone_dims
+        ctype == "S" && return ConicIP.mat(sol.v[offset+1:offset+cdim])
+        offset += cdim
+    end
+    return nothing
+end
+
 # Residuals of the KKT system the solver itself certifies.  The signs and
 # the normalizations follow src/ConicIP.jl, where rDu/rPr/rEq are formed:
 #
@@ -53,10 +65,13 @@ function kkt_residuals(prob, sol)
             v_margin = ConicIP.cone_margin(v, prob.cone_dims))
 end
 
-# Assert every KKT residual of an optimal solution. `δ` defaults to a
-# hundred times the requested optimality tolerance; observed residuals on
-# this suite are all below 1e-7.
-function test_kkt(prob, sol; δ = 100 * optTol)
+# Assert every KKT residual of an optimal solution.  The tolerance is
+# absolute, not a multiple of `optTol`: tying it to the requested
+# tolerance would make the assertion vacuous the moment the suite asks
+# for less accuracy.  At `optTol = 1e-7` the observed relative residuals
+# on this suite are below 1e-8 and the observed gaps below 1e-7, so 1e-6
+# is a real bound with an order of magnitude of headroom.
+function test_kkt(prob, sol; δ = 1e-6)
     r = kkt_residuals(prob, sol)
     @test r.stat     < δ
     @test r.slack    < δ
@@ -65,6 +80,15 @@ function test_kkt(prob, sol; δ = 100 * optTol)
     @test r.pobj     < δ
     @test r.s_margin > -δ
     @test r.v_margin > -δ
+
+    # Dual objective reconstructed from the problem data alone, rather
+    # than read back from the solver's own running value:
+    #   g(w,v) = b'v - d'w - ½y'Qy
+    # (the sign on `d` follows the conicIP Lagrangian, whose stationarity
+    # row is Qy + G'w - A'v - c = 0).  Strong duality closes it onto pobj.
+    dobj = dot(prob.b, sol.v) - dot(prob.d, sol.w) -
+           0.5 * dot(sol.y, prob.Q * sol.y)
+    @test abs(dobj - sol.pobj) / (1 + abs(sol.pobj)) < δ
 end
 
 @testset "SDP Suite" begin
@@ -73,7 +97,32 @@ end
     #  Cone arithmetic
     # ──────────────────────────────────────────────────────────────
 
+    # ── Regression evidence for the S-cone centering fix ──
+    #
+    #  Two assertions below fail against the pre-fix `xsdc!`/`dsdc!`, which
+    #  computed the unnormalized product XY + YX (twice the Jordan product,
+    #  with identity I/2 rather than the vecm(I) that conicIP assembles as
+    #  `e`):
+    #
+    #    * "Cone product and division": `o ≈ vecm((XY + YX)/2)` and the
+    #      division residual `‖YO + OY - 2X‖`;
+    #    * "vecm(I) is the identity of the cone product" and the S case of
+    #      "x ∘ e = x", i.e. `xsdc!(x, e) == x`.
+    #
+    #  Those are the tests that detect the bug. The testsets after them
+    #  ("Jordan product identity", "order-1 S block", the affine-eigmax
+    #  fixture, the certificate tests) pass on the old code too — they are
+    #  invariants worth pinning, not regression evidence. The end-to-end
+    #  effect of the fix is one extra interior-point iteration on the
+    #  with-equality instance and nothing else; that is pinned where the
+    #  instance is solved.
+
     @testset "Cone product and division" begin
+        # The cone product of the semidefinite block is the *Jordan*
+        # product (XY + YX)/2 — the one whose identity is I, matching the
+        # `e = vecm(I)` that conicIP assembles and that the corrector
+        # subtracts σμ times.  Both assertions here fail on the pre-fix
+        # code, which returned XY + YX.
         for n in [2, 3, 4]
             Random.seed!(500 + n)
             k = _vdim(n)
@@ -84,15 +133,15 @@ end
             x = ConicIP.vecm(X); y = ConicIP.vecm(Y)
             o = zeros(k)
 
-            # x ∘ y = XY + YX
+            # x ∘ y = (XY + YX)/2
             ConicIP.xsdc!(x, y, o)
-            @test o ≈ ConicIP.vecm(X * Y + Y * X) atol=1e-10
+            @test o ≈ ConicIP.vecm((X * Y + Y * X) / 2) atol=1e-10
 
-            # x ÷ y solves the Lyapunov equation Y*O + O*Y = X
+            # x ÷ y inverts it: (Y*O + O*Y)/2 = X
             od = zeros(k)
             ConicIP.dsdc!(x, y, od)
             O = ConicIP.mat(od)
-            @test norm(Y * O + O * Y - X, Inf) < 1e-9
+            @test norm(Y * O + O * Y - 2 * X, Inf) < 1e-9
 
             # and the two are inverse: y ∘ (x ÷ y) ≈ x
             ConicIP.xsdc!(y, od, o)
@@ -100,14 +149,117 @@ end
         end
     end
 
-    @testset "Cone identity vecm(I)" begin
+    @testset "vecm(I) is the identity of the cone product" begin
+        # x ∘ e = x for the S block.  Fails on the pre-fix code, which
+        # returned 2X here.
         for n in [2, 4, 6]
             Random.seed!(200 + n)
             M = randn(n, n); X = M' * M + I
             x = ConicIP.vecm(X)
             o = zeros(length(x))
             ConicIP.xsdc!(x, ConicIP.vecm(Matrix{Float64}(I, n, n)), o)
-            @test ConicIP.mat(o) ≈ 2 * X atol=1e-10
+            @test ConicIP.mat(o) ≈ X atol=1e-10
+        end
+    end
+
+    @testset "x ∘ e = x for every cone" begin
+        # conicIP builds one `e` for the whole cone group and the corrector
+        # subtracts σμ*e from the product λ ∘ λ.  That is only the intended
+        # centering target if `e` is the identity of each block's product.
+        # The R and Q cases held before the fix; the S case did not.
+        Random.seed!(4242)
+
+        n_r = 5
+        x_r = rand(n_r) .+ 0.5
+        o_r = zeros(n_r)
+        ConicIP.xrp!(x_r, ones(n_r), o_r)
+        @test o_r ≈ x_r atol=1e-12
+
+        n_q = 4
+        x_q = vcat(3.0, randn(n_q - 1))                 # interior of Q
+        o_q = zeros(n_q)
+        ConicIP.xsoc!(x_q, vcat(1.0, zeros(n_q - 1)), o_q)
+        @test o_q ≈ x_q atol=1e-12
+
+        n_s = 4; k_s = _vdim(n_s)
+        Ms = randn(n_s, n_s); Xs = Ms' * Ms + I
+        x_s = ConicIP.vecm(Xs)
+        o_s = zeros(k_s)
+        ConicIP.xsdc!(x_s, ConicIP.vecm(Matrix{Float64}(I, n_s, n_s)), o_s)
+        @test o_s ≈ x_s atol=1e-12
+    end
+
+    @testset "Jordan product identity" begin
+        # The algebra the corrector row composes: λ ∘ λ = Λ², and the
+        # product of two symmetric direction blocks.  This does *not*
+        # exercise the corrector, and it is written in terms of the
+        # post-fix semantics, so it is an invariant rather than a
+        # regression test — the σ/2 bug is caught by `xsdc!(x, e) == x`
+        # above.
+        Random.seed!(31415)
+        n = 4; k = _vdim(n)
+        Ml = randn(n, n); Λ = Ml' * Ml + I               # strictly PD λ
+        λ = ConicIP.vecm(Λ)
+        e = ConicIP.vecm(Matrix{Float64}(I, n, n))
+        σ = 0.3; μ = 0.7
+
+        o = zeros(k)
+        ConicIP.xsdc!(λ, λ, o)
+        @test o ≈ ConicIP.vecm(Λ * Λ) atol=1e-10
+        @test o - σ * μ * e ≈ ConicIP.vecm(Λ * Λ - σ * μ * Matrix{Float64}(I, n, n)) atol=1e-10
+
+        # The other half of the corrector row is the product of two
+        # symmetric search-direction blocks, F⁻ᵀΔs ∘ FΔv.
+        R1 = randn(n, n); Δ1 = (R1 + R1') / 2
+        R2 = randn(n, n); Δ2 = (R2 + R2') / 2
+        ConicIP.xsdc!(ConicIP.vecm(Δ1), ConicIP.vecm(Δ2), o)
+        @test o ≈ ConicIP.vecm((Δ1 * Δ2 + Δ2 * Δ1) / 2) atol=1e-10
+    end
+
+    @testset "Cone algebra of an order-1 S block matches R₊" begin
+        # For n = 1 the Jordan algebra of symmetric matrices *is* R₊: the
+        # product, the division, the identity, the scaling and the line
+        # search all collapse to the scalar case.  Solving the same QP
+        # under both declarations must therefore trace the same iterates.
+        # (Both runs are pinned to kktsolver_qr so the comparison is not
+        # confounded by the automatic solver choice.)
+        #
+        # This is an invariant, not regression evidence: the pre-fix code
+        # was internally consistent, so `2xy` on both sides of the S/R
+        # comparison cancelled, and σ ≈ 0 on this instance anyway.
+        Qs = ones(1, 1); cs = [2.0]                 # min ½y² - 2y, y ≥ 0
+        As = sparse(1.0I, 1, 1); bs = zeros(1)
+
+        sol_s = conicIP(Qs, cs, As, bs, [("S", 1)];
+                        verbose = false, optTol = optTol,
+                        kktsolver = ConicIP.kktsolver_qr)
+        sol_r = conicIP(Qs, cs, As, bs, [("R", 1)];
+                        verbose = false, optTol = optTol,
+                        kktsolver = ConicIP.kktsolver_qr)
+
+        @test sol_s.status == :Optimal
+        @test sol_r.status == :Optimal
+        @test sol_s.Iter == sol_r.Iter
+        @test norm(sol_s.y - sol_r.y, Inf) < 1e-10
+        @test norm(sol_s.v - sol_r.v, Inf) < 1e-10
+        @test norm(sol_s.s - sol_r.s, Inf) < 1e-10
+        @test abs(sol_s.y[1] - 2.0) < 1e-6           # the actual optimum
+    end
+
+    @testset "Centering fix moves only the with-equality trajectory" begin
+        # End-to-end consequence of centering the S blocks at σμ*I instead
+        # of (σ/2)μ*I: the S contribution to rCp and to the refinement
+        # residual is halved at an identical iterate, so both stopping
+        # rules shift slightly.  Across the whole suite exactly one
+        # instance changes its iteration count, 8 -> 9, and it does so
+        # under all three KKT solvers -- which is what makes the count
+        # safe to pin here.
+        prob = sdp_with_equality(n = 4)
+        for ks in (ConicIP.kktsolver_qr, ConicIP.kktsolver_sparse,
+                   pivot(ConicIP.kktsolver_2x2))
+            sol = sdp_solve(prob; optTol = optTol, kktsolver = ks)
+            @test sol.status == :Optimal
+            @test sol.Iter == 9
         end
     end
 
@@ -247,6 +399,71 @@ end
         @test ConicIP.maxstep_sdc(xL, dNeg) == Inf
     end
 
+    @testset "maxstep_sdc generalized eigen form" begin
+        # maxstep_sdc solves the pencil (D, X) instead of forming
+        # X^{-1/2}*D*X^{-1/2}. The two must agree wherever the explicit
+        # form is defined, and the pencil form must additionally be exact
+        # on the degenerate inputs that broke the explicit one.
+        for n in 2:6, seed in (11, 12, 13)
+            Random.seed!(1000 * n + seed)
+            A = randn(n, n); X = A' * A + I           # strictly PD
+            R = randn(n, n); D = (R + R') / 2
+
+            x = ConicIP.vecm(X); d = ConicIP.vecm(D)
+            α = ConicIP.maxstep_sdc(x, d)
+
+            Xih = X^(-1 / 2)
+            M   = Symmetric((Xih * D * Xih + (Xih * D * Xih)') / 2)
+            λmax = maximum(eigvals(M))
+
+            if λmax > 0
+                @test α ≈ 1 / λmax rtol=1e-8
+                # X - α*D sits exactly on the cone boundary
+                @test eigmin(Symmetric(X - α * D)) ≈ 0 atol=1e-10 * norm(X)
+            else
+                @test α == Inf
+            end
+        end
+
+        # A zero direction never limits the step. kktsolver_sparse returns
+        # -0.0 for a mathematically zero affine dual step; the old sign
+        # mask let those through and produced 1/(-0.0) = -Inf.
+        Xi = ConicIP.vecm(Matrix{Float64}(I, 3, 3))
+        @test ConicIP.maxstep_sdc(Xi,  ConicIP.vecm(zeros(3, 3))) == Inf
+        @test ConicIP.maxstep_sdc(Xi, -ConicIP.vecm(zeros(3, 3))) == Inf
+
+        # X positive definite but scaled into the subnormal range: LAPACK
+        # sygvd returns NaN rather than throwing, which must still be
+        # reported as a KKT failure (never as NaN, never as ArgumentError).
+        @test_throws ConicIP.KKT_FAILURES ConicIP.maxstep_sdc(
+            ConicIP.vecm(diagm(0 => [1.0, 1e-310])),
+            ConicIP.vecm(Matrix{Float64}(I, 2, 2)))
+
+        # And X ⋡ 0 is a factorization failure, not an infinite step.
+        @test_throws ConicIP.KKT_FAILURES ConicIP.maxstep_sdc(
+            ConicIP.vecm(-Matrix{Float64}(I, 3, 3)),
+            ConicIP.vecm(Matrix{Float64}(I, 3, 3)))
+    end
+
+    @testset "Order-0 S block" begin
+        # MOI's PositiveSemidefiniteConeTriangle(0) reaches the solver as
+        # ("S", 0) — the wrapper does not filter it — so every per-cone
+        # primitive has to survive an empty block.  `maximum` and `eigmin`
+        # both throw on an empty spectrum, so both line searches need the
+        # explicit answer: an order-0 block constrains nothing.
+        @test ConicIP.maxstep_sdc(Float64[], Float64[]) == Inf
+        @test ConicIP.maxstep_sdc(Float64[], nothing) == 0
+        @test ConicIP.nestod_sdc(Float64[], Float64[]) isa ConicIP.VecCongurance
+
+        # and end to end, next to a live block
+        n = 2
+        sol = conicIP(Matrix{Float64}(I, n, n), ones(n),
+                      sparse(1.0I, n, n), zeros(n), [("R", n), ("S", 0)];
+                      verbose = false, optTol = optTol)
+        @test sol.status == :Optimal
+        @test norm(sol.y - ones(n), Inf) < tol
+    end
+
     # ──────────────────────────────────────────────────────────────
     #  Standard problem instances
     # ──────────────────────────────────────────────────────────────
@@ -265,6 +482,13 @@ end
             known_y = get(prob, :known_y, nothing)
             if known_y !== nothing
                 @test norm(sol.y - known_y, Inf) < tol
+            end
+            known_V = get(prob, :known_V, nothing)
+            if known_V !== nothing
+                # An instance whose A is not the identity carries its
+                # matrix variable in the dual; hold it to a tight bound,
+                # since the off-diagonals are what pin the vecm scaling.
+                @test norm(sdp_dual_block(sol, prob.cone_dims) - known_V) < 1e-6
             end
             for (name, chk) in get(prob, :checks, ())
                 @testset "$name" begin
@@ -285,18 +509,9 @@ end
 
     @testset "Consistency across KKT solvers" begin
         for prob in sdp_all_problems()
-            # `skip_sparse` marks a known kktsolver_sparse breakdown on
-            # small zero-Hessian SDP blocks: the search direction goes
-            # non-finite and LAPACK throws from inside maxstep_sdc.  This is
-            # off the default path — choose_kktsolver routes any SDP to
-            # kktsolver_qr — and is tracked in a robustness issue, so the
-            # pair is excluded here rather than pinned as expected output.
             solvers = Any[("qr", ConicIP.kktsolver_qr),
                           ("sparse", ConicIP.kktsolver_sparse),
                           ("pivot(2x2)", pivot(ConicIP.kktsolver_2x2))]
-            if get(prob, :skip_sparse, false)
-                deleteat!(solvers, 2)
-            end
 
             # Where the optimal set is not a singleton, solvers may return
             # different points; compare objectives instead, and let the KKT
@@ -328,9 +543,13 @@ end
     # ──────────────────────────────────────────────────────────────
     #  Edge cases
     #
-    #  The projections below have s = v = 0 at the optimum — the worst
-    #  case for strict complementarity, where the attainable accuracy is
-    #  about √optTol — so they are solved to a tighter optTol.
+    #  These projections sit at the extremes of strict complementarity.
+    #  Where the optimal X is on the boundary of the cone the attainable
+    #  accuracy is about √optTol, so those instances are solved to a
+    #  tighter optTol.  Note that s and v do not both vanish in general:
+    #  for an already-PSD target the primal slack is s = X ≠ 0 and the
+    #  dual v = 0, while for a strictly negative-definite target X⋆ = 0
+    #  and it is the dual v = -target ≠ 0 that carries the solution.
     # ──────────────────────────────────────────────────────────────
 
     @testset "1×1 SDP is a nonnegative scalar" begin
