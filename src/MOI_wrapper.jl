@@ -16,16 +16,24 @@ Settable as constructor keywords or through
 - `maxIters::Int` -- maximum iterations (default: `100`)
 - `infeasTol::Float64` -- infeasibility/unboundedness certificate tolerance
   (default: `1e-7`)
-- `kktsolver` -- `"auto"` (default; picks by cone mix and sparsity via
-  [`choose_kktsolver`](@ref)), `"qr"`, `"sparse"`, `"2x2"`, or a solver
-  function
+- `kktsolver` -- `"auto"` (default; picks by cone mix and predicted
+  factorization cost via [`choose_kktsolver`](@ref)), `"ldl"`, `"qr"`,
+  `"sparse"`, `"2x2"`, or a solver function
 - `preprocess::Bool` -- remove redundant equality rows via
   [`preprocess_conicIP`](@ref) before solving (default: `true`)
-- plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `staticReg`,
-  `certFallback`, `certFallbackIters`, `cache_nestodd` — forwarded to
-  [`conicIP`](@ref)
+- `equilibrate::Bool` -- Ruiz-scale the data before solving (default: `true`)
+- `timeLimit::Float64` -- wall-clock budget in seconds (also `MOI.TimeLimitSec`)
+- plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `refineRelTol`,
+  `refineAbsTol`, `staticReg`, `certFallback`, `certFallbackIters`,
+  `cache_nestodd` — forwarded to [`conicIP`](@ref)
 
 `MOI.Silent` is supported and overrides `verbose`.
+
+# Supported Objectives
+Affine and convex quadratic (`ScalarQuadraticFunction`), both handled
+natively: a quadratic objective becomes the solver's `Q` rather than a
+second-order-cone reformulation, so positive semidefinite but singular
+Hessians are fine.
 
 # Supported Constraints
 - **Vector:** `Zeros`, `Nonnegatives`, `Nonpositives`, `SecondOrderCone`,
@@ -38,21 +46,28 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     objective_constant::Float64
     n::Int
     c_int::Vector{Float64}         # internal objective vector handed to the solver
-    # Constraint row tracking for primal/dual recovery
-    eq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
+    Q_int::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # internal Hessian (nothing = 0)
+    # Constraint row tracking for primal/dual recovery. Each constraint
+    # index maps to a slot i; the per-slot vectors below are indexed by i.
+    eq_ci_map::Dict{MOI.ConstraintIndex, Int}
+    eq_rows::Vector{UnitRange{Int}}
     eq_offset::Vector{Float64}     # 0 for Zeros, rhs for EqualTo
     eq_is_scalar::Vector{Bool}
     eq_G::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # equality constraint matrix
     eq_d::Vector{Float64}                                 # equality constraint RHS
-    ineq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
+    eq_Gy::Vector{Float64}         # G*y of the returned point, computed once
+    ineq_ci_map::Dict{MOI.ConstraintIndex, Int}
+    ineq_rows::Vector{UnitRange{Int}}
     ineq_sign::Vector{Float64}     # +1 or -1 (Nonpositive/LessThan flip)
     ineq_offset::Vector{Float64}   # 0 for vector, lower/upper for scalar
     ineq_is_scalar::Vector{Bool}
     ineq_is_psd::Vector{Bool}     # true for PSD constraints (√2 scaling)
     ineq_A::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # inequality constraint matrix
     ineq_b::Vector{Float64}                                # inequality constraint RHS
-    # Timing
+    # Timing: solve_time is the whole optimize! (assembly included);
+    # assembly_time is the part before the solver is called.
     solve_time::Float64
+    assembly_time::Float64
     # Solver options: only the ones explicitly set are stored, so the
     # solver's own defaults (and the preprocessor's dynamic staticReg
     # opt-in) stay in charge of everything else.
@@ -65,7 +80,7 @@ const _SUPPORTED_OPTIONS = (
     "verbose", "optTol", "maxIters", "infeasTol", "infeasAbsTol", "DTB",
     "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
     "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
-    "preprocess", "timeLimit", "equilibrate",
+    "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the constructor
@@ -85,10 +100,12 @@ end
 
 function Optimizer(; kwargs...)
     model = Optimizer(
-        nothing, false, 0.0, 0, Float64[],
-        Pair{Any, UnitRange{Int}}[], Float64[], Bool[], nothing, Float64[],
-        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[], Bool[], nothing, Float64[],
-        NaN,
+        nothing, false, 0.0, 0, Float64[], nothing,
+        Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Bool[],
+        nothing, Float64[], Float64[],
+        Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Float64[],
+        Bool[], Bool[], nothing, Float64[],
+        NaN, NaN,
         Dict{String, Any}(), false,
     )
     for (k, v) in kwargs
@@ -122,7 +139,8 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
         "refineAbsTol" => 1e-12, "staticReg" => 0.0,
         "certFallback" => true, "certFallbackIters" => 50,
         "cache_nestodd" => false, "kktsolver" => "auto",
-        "preprocess" => true, "timeLimit" => Inf, "equilibrate" => true)
+        "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
+        "timeLimit" => Inf, "equilibrate" => true)
     return get(model.options, attr.name, defaults[attr.name])
 end
 
@@ -151,13 +169,18 @@ function MOI.empty!(model::Optimizer)
     model.objective_constant = 0.0
     model.n = 0
     model.solve_time = NaN
+    model.assembly_time = NaN
     empty!(model.c_int)
+    model.Q_int = nothing
     empty!(model.eq_ci_map)
+    empty!(model.eq_rows)
     empty!(model.eq_offset)
     empty!(model.eq_is_scalar)
     model.eq_G = nothing
     empty!(model.eq_d)
+    empty!(model.eq_Gy)
     empty!(model.ineq_ci_map)
+    empty!(model.ineq_rows)
     empty!(model.ineq_sign)
     empty!(model.ineq_offset)
     empty!(model.ineq_is_scalar)
@@ -177,12 +200,14 @@ MOI.get(::Optimizer, ::MOI.SolverVersion) = string(pkgversion(@__MODULE__))
 MOI.supports(::Optimizer, ::MOI.VariableBasisStatus) = false
 MOI.supports(::Optimizer, ::MOI.ConstraintBasisStatus) = false
 
-# Supported objective
+# Supported objective: affine and (convex) quadratic, both native
 MOI.supports(::Optimizer, ::MOI.ObjectiveSense) = true
 function MOI.supports(
     ::Optimizer,
     ::MOI.ObjectiveFunction{F},
-) where {F<:Union{MOI.ScalarAffineFunction{Float64},MOI.VariableIndex}}
+) where {F<:Union{MOI.ScalarAffineFunction{Float64},
+                  MOI.ScalarQuadraticFunction{Float64},
+                  MOI.VariableIndex}}
     return true
 end
 
@@ -221,40 +246,87 @@ end
 #  Extract constraint rows from MOI functions
 # ──────────────────────────────────────────────────────────────
 
-function _extract_vector_constraint(f, n)
-    if f isa MOI.VectorOfVariables
-        dim = length(f.variables)
-        Ai = spzeros(dim, n)
-        bi = zeros(dim)
-        for (i, vi) in enumerate(f.variables)
-            Ai[i, vi.value] = 1.0
-        end
-        return Ai, bi
-    else  # VectorAffineFunction
-        dim = MOI.output_dimension(f)
-        Ai = spzeros(dim, n)
-        bi = collect(Float64, f.constants)
-        for term in f.terms
-            row = term.output_index
-            col = term.scalar_term.variable.value
-            Ai[row, col] += term.scalar_term.coefficient
-        end
-        return Ai, bi
+# Triplet accumulator for one constraint matrix. Every constraint appends
+# its rows here; the matrix is built once by `sparse(I, J, V, m, n)` at the
+# end (duplicates summed), so assembly is linear in the number of
+# nonzeros rather than one small CSC object per constraint.
+struct _Triplets
+    I::Vector{Int}
+    J::Vector{Int}
+    V::Vector{Float64}
+    rhs::Vector{Float64}
+end
+_Triplets() = _Triplets(Int[], Int[], Float64[], Float64[])
+_nrows(t::_Triplets) = length(t.rhs)
+
+# Append the rows of `sign * f(x) + rhs_shift` with `f` a vector function.
+# `rowmap[k]` gives the local row for output index k and `rowscale[k]` a
+# per-row factor (the PSD triangle permutation and √2 scaling); both are
+# `nothing` for the identity. The constants of `f` are appended to the
+# accumulator's rhs *negated* (the solver's convention is A y ≥ b,
+# G y = d with the constant moved to the right-hand side).
+function _append_vector!(t::_Triplets, f, dim::Int, sign::Float64;
+                         rowmap = nothing, rowscale = nothing)
+    r0 = _nrows(t)
+    resize!(t.rhs, r0 + dim)
+    @inbounds for k in 1:dim
+        t.rhs[r0 + k] = 0.0
     end
+    if f isa MOI.VectorOfVariables
+        for (k, vi) in enumerate(f.variables)
+            row = rowmap === nothing ? k : rowmap[k]
+            sc  = rowscale === nothing ? 1.0 : rowscale[k]
+            push!(t.I, r0 + row); push!(t.J, vi.value); push!(t.V, sign * sc)
+        end
+    else  # VectorAffineFunction
+        for term in f.terms
+            k   = term.output_index
+            row = rowmap === nothing ? k : rowmap[k]
+            sc  = rowscale === nothing ? 1.0 : rowscale[k]
+            push!(t.I, r0 + row)
+            push!(t.J, term.scalar_term.variable.value)
+            push!(t.V, sign * sc * term.scalar_term.coefficient)
+        end
+        for (k, ck) in enumerate(f.constants)
+            row = rowmap === nothing ? k : rowmap[k]
+            sc  = rowscale === nothing ? 1.0 : rowscale[k]
+            t.rhs[r0 + row] = -sign * sc * ck
+        end
+    end
+    return (r0 + 1):(r0 + dim)
 end
 
-function _extract_scalar_constraint(f, n)
-    Ai = spzeros(1, n)
-    bi = 0.0
+# Append one row `sign * f(x)` with `f` scalar; the constant of `f` and the
+# set's bound go to the rhs as `sign * (bound − constant)`.
+function _append_scalar!(t::_Triplets, f, sign::Float64, bound::Float64)
+    r = _nrows(t) + 1
+    const_f = 0.0
     if f isa MOI.VariableIndex
-        Ai[1, f.value] = 1.0
-    else  # ScalarAffineFunction
-        bi = f.constant
+        push!(t.I, r); push!(t.J, f.value); push!(t.V, sign)
+    else
+        const_f = f.constant
         for term in f.terms
-            Ai[1, term.variable.value] += term.coefficient
+            push!(t.I, r); push!(t.J, term.variable.value)
+            push!(t.V, sign * term.coefficient)
         end
     end
-    return Ai, bi
+    push!(t.rhs, sign * (bound - const_f))
+    return r:r
+end
+
+_assemble(t::_Triplets, n::Int) =
+    (sparse(t.I, t.J, t.V, _nrows(t), n), copy(t.rhs))
+
+# Append an orthant block of `dim` rows to `cone_dims`, merging it into a
+# preceding orthant block: the cone product is separable over R₊, and one
+# block instead of thousands keeps the per-block loops in the solver short.
+function _push_orthant!(cone_dims, dim::Int)
+    if !isempty(cone_dims) && cone_dims[end][1] == "R"
+        cone_dims[end] = ("R", cone_dims[end][2] + dim)
+    else
+        push!(cone_dims, ("R", dim))
+    end
+    return cone_dims
 end
 
 # ──────────────────────────────────────────────────────────────
@@ -289,23 +361,6 @@ function _psd_moi_vecm_info(d::Int)
 end
 
 """
-Reorder rows of `Ai` and entries of `bi` from MOI triangle order to vecm
-order, and scale off-diagonal rows by √2.
-"""
-function _psd_scale_input!(Ai::SparseMatrixCSC, bi::Vector{Float64}, dim::Int)
-    perm, is_offdiag = _psd_moi_vecm_info(dim)
-    Ai_copy = copy(Ai)
-    bi_copy = copy(bi)
-    s2 = √2
-    for moi_k in 1:dim
-        vecm_k = perm[moi_k]
-        scale = is_offdiag[moi_k] ? s2 : 1.0
-        Ai[vecm_k, :] = scale * Ai_copy[moi_k, :]
-        bi[vecm_k] = scale * bi_copy[moi_k]
-    end
-end
-
-"""
 Convert a vector from vecm order (solver convention) to MOI triangle order,
 dividing off-diagonal entries by √2.
 """
@@ -327,6 +382,7 @@ end
 
 function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     MOI.empty!(dest)
+    t_start = time()
 
     model = MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}())
     index_map = MOI.copy_to(model, src)
@@ -338,14 +394,30 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     sense = MOI.get(model, MOI.ObjectiveSense())
     dest.max_sense = (sense == MOI.MAX_SENSE)
 
+    # MOI objective: ½xᵀQx + aᵀx + const (Q symmetric; a diagonal quadratic
+    # term with coefficient q means ½·q·xᵢ², an off-diagonal one q·xᵢxⱼ).
     c_moi = zeros(n)
     obj_constant = 0.0
+    QI = Int[]; QJ = Int[]; QV = Float64[]
     obj_type = MOI.get(model, MOI.ObjectiveFunctionType())
     if obj_type == MOI.ScalarAffineFunction{Float64}
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
         obj_constant = obj.constant
         for term in obj.terms
             c_moi[term.variable.value] += term.coefficient
+        end
+    elseif obj_type == MOI.ScalarQuadraticFunction{Float64}
+        obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
+        obj_constant = obj.constant
+        for term in obj.affine_terms
+            c_moi[term.variable.value] += term.coefficient
+        end
+        for term in obj.quadratic_terms
+            i = term.variable_1.value; j = term.variable_2.value
+            push!(QI, i); push!(QJ, j); push!(QV, term.coefficient)
+            if i != j
+                push!(QI, j); push!(QJ, i); push!(QV, term.coefficient)
+            end
         end
     elseif obj_type == MOI.VariableIndex
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.VariableIndex}())
@@ -354,20 +426,34 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.objective_constant = obj_constant
 
     # ConicIP minimizes (1/2)y'Qy - c'y
-    # For min c_moi'x: set c_int = -c_moi  → minimizes -(-c_moi)'x = c_moi'x
-    # For max c_moi'x: set c_int = c_moi   → minimizes -(c_moi)'x = -c_moi'x
+    # MIN ½xᵀQx + aᵀx: Q_int = Q,  c_int = -a
+    # MAX ½xᵀQx + aᵀx: Q_int = -Q, c_int = a   (Q negative semidefinite)
     c_int = dest.max_sense ? c_moi : -c_moi
     dest.c_int = c_int
-    Q = spzeros(n, n)
+    if isempty(QI)
+        Q = spzeros(n, n)
+        dest.Q_int = nothing
+    else
+        Q = sparse(QI, QJ, dest.max_sense ? -QV : QV, n, n)
+        dest.Q_int = Q
+    end
 
     # ── Constraints ──
-    G_rows = Any[]
-    d_vals = Float64[]
-    A_rows = Any[]
-    b_vals = Float64[]
+    tG = _Triplets()          # equality rows,   G y = d
+    tA = _Triplets()          # cone rows,       A y ≥_K b
     cone_dims = Tuple{String, Int}[]
-    eq_row = 0
-    ineq_row = 0
+
+    function record_eq!(ci, rows, offset, scalar)
+        push!(dest.eq_rows, rows); push!(dest.eq_offset, offset)
+        push!(dest.eq_is_scalar, scalar)
+        dest.eq_ci_map[ci] = length(dest.eq_rows)
+    end
+    function record_ineq!(ci, rows, sign, offset, scalar, psd)
+        push!(dest.ineq_rows, rows); push!(dest.ineq_sign, sign)
+        push!(dest.ineq_offset, offset); push!(dest.ineq_is_scalar, scalar)
+        push!(dest.ineq_is_psd, psd)
+        dest.ineq_ci_map[ci] = length(dest.ineq_rows)
+    end
 
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
         for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
@@ -375,137 +461,80 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
             s = MOI.get(model, MOI.ConstraintSet(), ci)
 
             if F <: Union{MOI.VectorAffineFunction{Float64}, MOI.VectorOfVariables}
-                Ai, bi = _extract_vector_constraint(f, n)
-                dim = size(Ai, 1)
-
+                dim = MOI.output_dimension(f)
                 if S <: MOI.Zeros
-                    # Ai*x + bi = 0 → G = Ai, d = -bi
-                    push!(G_rows, Ai)
-                    append!(d_vals, -bi)
-                    push!(dest.eq_ci_map, ci => (eq_row+1):(eq_row+dim))
-                    push!(dest.eq_offset, 0.0)
-                    push!(dest.eq_is_scalar, false)
-                    eq_row += dim
+                    # f(x) = 0:  G = A_f, d = -const
+                    rows = _append_vector!(tG, f, dim, 1.0)
+                    record_eq!(ci, rows, 0.0, false)
                 elseif S <: MOI.Nonnegatives
-                    # Ai*x + bi ≥ 0 → A_int = Ai, b_int = -bi
-                    push!(A_rows, Ai)
-                    append!(b_vals, -bi)
-                    push!(cone_dims, ("R", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += dim
+                    rows = _append_vector!(tA, f, dim, 1.0)
+                    _push_orthant!(cone_dims, dim)
+                    record_ineq!(ci, rows, 1.0, 0.0, false, false)
                 elseif S <: MOI.Nonpositives
-                    # Ai*x + bi ≤ 0 → -Ai*x - bi ≥ 0 → A_int = -Ai, b_int = bi
-                    push!(A_rows, -Ai)
-                    append!(b_vals, bi)
-                    push!(cone_dims, ("R", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, -1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += dim
+                    # f(x) ≤ 0  →  -f(x) ≥ 0
+                    rows = _append_vector!(tA, f, dim, -1.0)
+                    _push_orthant!(cone_dims, dim)
+                    record_ineq!(ci, rows, -1.0, 0.0, false, false)
                 elseif S <: MOI.SecondOrderCone
-                    push!(A_rows, Ai)
-                    append!(b_vals, -bi)
+                    rows = _append_vector!(tA, f, dim, 1.0)
                     push!(cone_dims, ("Q", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += dim
+                    record_ineq!(ci, rows, 1.0, 0.0, false, false)
                 elseif S <: MOI.PositiveSemidefiniteConeTriangle
-                    # MOI uses unscaled triangle; solver uses vecm (√2 off-diag)
-                    _psd_scale_input!(Ai, bi, dim)
-                    push!(A_rows, Ai)
-                    append!(b_vals, -bi)
+                    # MOI's column-major unscaled triangle → vecm's row-major
+                    # triangle with √2 on the off-diagonal rows, applied to
+                    # the triplets directly.
+                    perm, is_offdiag = _psd_moi_vecm_info(dim)
+                    scale = [od ? √2 : 1.0 for od in is_offdiag]
+                    rows = _append_vector!(tA, f, dim, 1.0;
+                                           rowmap = perm, rowscale = scale)
                     push!(cone_dims, ("S", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, true)
-                    ineq_row += dim
+                    record_ineq!(ci, rows, 1.0, 0.0, false, true)
                 end
 
             elseif F <: Union{MOI.ScalarAffineFunction{Float64}, MOI.VariableIndex}
-                Ai, bi = _extract_scalar_constraint(f, n)
-
                 if S <: MOI.EqualTo{Float64}
-                    # Ai*x + bi = rhs → Ai*x = rhs - bi
                     rhs = MOI.constant(s)
-                    push!(G_rows, Ai)
-                    push!(d_vals, rhs - bi)
-                    push!(dest.eq_ci_map, ci => (eq_row+1):(eq_row+1))
-                    push!(dest.eq_offset, rhs)
-                    push!(dest.eq_is_scalar, true)
-                    eq_row += 1
+                    rows = _append_scalar!(tG, f, 1.0, rhs)
+                    record_eq!(ci, rows, rhs, true)
                 elseif S <: MOI.GreaterThan{Float64}
-                    # Ai*x + bi ≥ lower → Ai*x ≥ lower - bi
                     lower = MOI.constant(s)
-                    push!(A_rows, Ai)
-                    push!(b_vals, lower - bi)
-                    push!(cone_dims, ("R", 1))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+1))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, lower)
-                    push!(dest.ineq_is_scalar, true)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += 1
+                    rows = _append_scalar!(tA, f, 1.0, lower)
+                    _push_orthant!(cone_dims, 1)
+                    record_ineq!(ci, rows, 1.0, lower, true, false)
                 elseif S <: MOI.LessThan{Float64}
-                    # Ai*x + bi ≤ upper → upper - Ai*x - bi ≥ 0
-                    # (-Ai)*x - (bi - upper) ≥ 0 → A_int = -Ai, b_int = bi - upper
+                    # f(x) ≤ u  →  -f(x) ≥ -u
                     upper = MOI.constant(s)
-                    push!(A_rows, -Ai)
-                    push!(b_vals, bi - upper)
-                    push!(cone_dims, ("R", 1))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+1))
-                    push!(dest.ineq_sign, -1.0)
-                    push!(dest.ineq_offset, upper)
-                    push!(dest.ineq_is_scalar, true)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += 1
+                    rows = _append_scalar!(tA, f, -1.0, upper)
+                    _push_orthant!(cone_dims, 1)
+                    record_ineq!(ci, rows, -1.0, upper, true, false)
                 end
             end
         end
     end
 
-    # ── Assemble matrices ──
-    if isempty(G_rows)
-        G = spzeros(0, n)
-        d = zeros(0)
-    else
-        G = sparse(vcat(G_rows...))
-        d = Float64.(d_vals)
-    end
-    dest.eq_G = G
-    dest.eq_d = d
-
-    if isempty(A_rows)
-        A = spzeros(0, n)
-        b = zeros(0)
-    else
-        A = sparse(vcat(A_rows...))
-        b = Float64.(b_vals)
-    end
-    dest.ineq_A = A
-    dest.ineq_b = b
+    # ── Assemble matrices (one sparse() per matrix) ──
+    G, d = _assemble(tG, n)
+    A, b = _assemble(tA, n)
+    dest.eq_G = G;   dest.eq_d = d
+    dest.ineq_A = A; dest.ineq_b = b
+    dest.assembly_time = time() - t_start
 
     # ── Solve ──
     do_preprocess = get(dest.options, "preprocess", true)
     verbose = dest.silent ? false : get(dest.options, "verbose", false)
     solver = _resolve_kktsolver(get(dest.options, "kktsolver", "auto"))
-    kw = (; (Symbol(k) => v for (k, v) in dest.options
-             if k ∉ ("preprocess", "kktsolver", "verbose"))...)
+    skip = do_preprocess ? ("preprocess", "kktsolver", "verbose") :
+                           ("preprocess", "kktsolver", "verbose", "rank_check",
+                            "fix_singletons")
+    kw = (; (Symbol(k) => v for (k, v) in dest.options if k ∉ skip)...)
     entry = do_preprocess ? preprocess_conicIP : conicIP
-    t0 = time()
     dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
         verbose = verbose, kktsolver = solver, kw...)
-    dest.solve_time = time() - t0
+
+    # Products needed by the result getters, formed once.
+    y = dest.sol.y
+    dest.eq_Gy = (size(G, 1) > 0 && all(isfinite, y)) ? Vector(G * y) : fill(NaN, size(G, 1))
+    dest.solve_time = time() - t_start
 
     return index_map, false
 end
@@ -660,31 +689,30 @@ function MOI.get(
 )
     MOI.check_result_index_bounds(model, attr)
     ray = _is_primal_ray(model)
-    for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
-        if ci_stored == ci
-            # f(x) = G[rows,:]*y - d[rows] + offset  (ray: G[rows,:]*ȳ)
-            residual = ray ? model.eq_G[rows, :] * model.sol.y :
-                model.eq_G[rows, :] * model.sol.y - model.eq_d[rows]
-            if model.eq_is_scalar[i]
-                return ray ? residual[1] : residual[1] + model.eq_offset[i]
-            else
-                return Vector(residual)
-            end
+    i = get(model.eq_ci_map, ci, 0)
+    if i > 0
+        rows = model.eq_rows[i]
+        # f(x) = G[rows,:]*y - d[rows] + offset  (ray: G[rows,:]*ȳ)
+        residual = ray ? model.eq_Gy[rows] : model.eq_Gy[rows] - model.eq_d[rows]
+        if model.eq_is_scalar[i]
+            return ray ? residual[1] : residual[1] + model.eq_offset[i]
+        else
+            return residual
         end
     end
-    for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
-        if ci_stored == ci
-            sgn = model.ineq_sign[i]
-            off = ray ? 0.0 : model.ineq_offset[i]
-            if model.ineq_is_scalar[i]
-                return sgn * model.sol.s[rows[1]] + off
-            else
-                val = Vector(sgn .* model.sol.s[rows])
-                if model.ineq_is_psd[i]
-                    return _psd_vecm_to_moi(val)
-                end
-                return val
+    i = get(model.ineq_ci_map, ci, 0)
+    if i > 0
+        rows = model.ineq_rows[i]
+        sgn = model.ineq_sign[i]
+        off = ray ? 0.0 : model.ineq_offset[i]
+        if model.ineq_is_scalar[i]
+            return sgn * model.sol.s[rows[1]] + off
+        else
+            val = sgn .* model.sol.s[rows]
+            if model.ineq_is_psd[i]
+                return _psd_vecm_to_moi(val)
             end
+            return val
         end
     end
     error("Constraint index $ci not found")
@@ -711,27 +739,27 @@ function MOI.get(
     #   eq_dual = -w    (sign from -A' in KKT)
     #   ineq_dual = ineq_sign * v   (ineq_sign accounts for Nonpos/LessThan flip)
     # The conic dual convention is sense-independent (dual ∈ S*).
-    for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
-        if ci_stored == ci
-            if model.eq_is_scalar[i]
-                return -model.sol.w[rows[1]]
-            else
-                return Vector(-1.0 .* model.sol.w[rows])
-            end
+    i = get(model.eq_ci_map, ci, 0)
+    if i > 0
+        rows = model.eq_rows[i]
+        if model.eq_is_scalar[i]
+            return -model.sol.w[rows[1]]
+        else
+            return -1.0 .* model.sol.w[rows]
         end
     end
-    for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
-        if ci_stored == ci
-            sgn = model.ineq_sign[i]
-            if model.ineq_is_scalar[i]
-                return sgn * model.sol.v[rows[1]]
-            else
-                val = Vector(sgn .* model.sol.v[rows])
-                if model.ineq_is_psd[i]
-                    return _psd_vecm_to_moi(val)
-                end
-                return val
+    i = get(model.ineq_ci_map, ci, 0)
+    if i > 0
+        rows = model.ineq_rows[i]
+        sgn = model.ineq_sign[i]
+        if model.ineq_is_scalar[i]
+            return sgn * model.sol.v[rows[1]]
+        else
+            val = sgn .* model.sol.v[rows]
+            if model.ineq_is_psd[i]
+                return _psd_vecm_to_moi(val)
             end
+            return val
         end
     end
     error("Constraint index $ci not found")

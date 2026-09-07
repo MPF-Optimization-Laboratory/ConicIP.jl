@@ -48,6 +48,7 @@
 # only values are rewritten before each numeric refactorization.
 
 using QDLDL: qdldl, update_values!, refactor!, solve!
+using AMD: amd
 
 """
     soc_uv(Blk::SymWoodbury) -> (d², u, v)
@@ -198,9 +199,9 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa) = pat
   δp = static_reg; δe = static_reg; δc = cone_reg
 
-  # Symbolic analysis once (AMD ordering inside qdldl); numeric
+  # Symbolic analysis once, with the ordering the pattern carries; numeric
   # factorizations happen in refactor! after each value update.
-  Fact = qdldl(K; logical = true, Dsigns = Dsigns,
+  Fact = qdldl(K; perm = pat.perm, logical = true, Dsigns = Dsigns,
                regularize_eps = dynamic_eps, regularize_delta = dynamic_delta)
 
   # Diagonal shifts to remove when evaluating the unregularized residual
@@ -288,7 +289,8 @@ end
 # rewrite them. Also used by choose_kktsolver to estimate the
 # factorization's fill before committing to a solver.
 function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
-                      δp::Float64 = 1e-8, δe::Float64 = 1e-8)
+                      δp::Float64 = 1e-8, δe::Float64 = 1e-8,
+                      perm_hint = nothing)
 
   n = size(Q, 1); m = size(A, 1); p = size(G, 1)
   Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
@@ -384,6 +386,64 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
     Dsigns[oa + 2j] = -1
   end
 
-  return (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa, nlift)
+  # Fill-reducing ordering, computed here once so that the solver choice,
+  # the symbolic analysis, and any cached reuse all share it.
+  perm = perm_hint === nothing ? amd(K) : perm_hint
 
+  return (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa, nlift, perm)
+
+end
+
+# Structure key of a problem, for reusing an ordering across solves.
+_ldl_structure_key(Q, A, G, cone_dims) = begin
+  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  (size(Qs), size(As), size(Gs), copy(cone_dims),
+   copy(Qs.colptr), copy(Qs.rowval), copy(As.colptr), copy(As.rowval),
+   copy(Gs.colptr), copy(Gs.rowval))
+end
+
+"""
+    cached_kktsolver_ldl(; kwargs...)
+
+A [`kktsolver_ldl`](@ref) that remembers the fill-reducing ordering of
+the last problem it saw and reuses it when the next problem has the same
+structure (dimensions, cone list, and sparsity patterns of `Q`, `A`, `G`),
+which is the situation in model-predictive control, sequential convex
+programming, or any loop that re-solves with new data. The AMD ordering
+is the only super-linear part of the symbolic setup; the rest is rebuilt
+in O(nnz) each solve. On banded and block-structured problems AMD is a
+few percent of a solve, so the saving is modest; it grows with the fill
+of the pattern. `kwargs` are forwarded to `kktsolver_ldl`.
+
+```julia
+ks = ConicIP.cached_kktsolver_ldl()
+for t in 1:T
+    sol = conicIP(Q, c[t], A, b[t], cone_dims; kktsolver = ks)
+end
+ks.hits   # number of solves that reused the ordering
+```
+"""
+mutable struct cached_kktsolver_ldl
+  key    :: Any
+  perm   :: Union{Nothing, Vector{Int}}
+  hits   :: Int
+  kwargs :: Any
+end
+cached_kktsolver_ldl(; kwargs...) = cached_kktsolver_ldl(nothing, nothing, 0, kwargs)
+
+function (ks::cached_kktsolver_ldl)(Q, A, G, cone_dims)
+  key = _ldl_structure_key(Q, A, G, cone_dims)
+  hint = nothing
+  if ks.perm !== nothing && key == ks.key
+    hint = ks.perm
+    ks.hits += 1
+  end
+  pat = _ldl_pattern(Q, A, G, cone_dims;
+                     lift_min = get(ks.kwargs, :lift_min, 6),
+                     δp = get(ks.kwargs, :static_reg, 1e-8),
+                     δe = get(ks.kwargs, :static_reg, 1e-8),
+                     perm_hint = hint)
+  ks.key = key
+  ks.perm = pat.perm
+  return kktsolver_ldl(Q, A, G, cone_dims; pattern = pat, ks.kwargs...)
 end

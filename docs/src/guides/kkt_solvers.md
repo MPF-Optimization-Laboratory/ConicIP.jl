@@ -103,6 +103,17 @@ ks = (Q, A, G, cd) -> ConicIP.kktsolver_ldl(Q, A, G, cd; static_reg = 1e-7)
 sol = conicIP(Q, c, A, b, cone_dims; kktsolver = ks)
 ```
 
+For repeated solves of problems with the same structure (new data, same
+sparsity), [`cached_kktsolver_ldl`](@ref ConicIP.cached_kktsolver_ldl)
+keeps the fill-reducing ordering between calls:
+
+```julia
+ks = ConicIP.cached_kktsolver_ldl()
+for t in 1:T
+    sol = conicIP(Q, c[t], A, b[t], cone_dims; kktsolver = ks)
+end
+```
+
 ### `kktsolver_qr`
 
 QR-based solver using the double QR method from CVXOPT: a thin QR of

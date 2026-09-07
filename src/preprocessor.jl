@@ -61,11 +61,25 @@ constructed and verified against the original problem data:
 
 Rank deficiency that is *not* an inconsistency is handled by opting into
 `conicIP`'s static KKT regularization rather than by perturbing `Q`.
+
+`rank_check` controls the sparse-QR rank detection, which is the
+expensive part: `:always` runs it; `:never` skips it and relies on the
+KKT solver's regularization (what [`kktsolver_ldl`](@ref) provides);
+`:auto` (default) runs it only when the KKT solver that will be used
+needs a full-rank `G` — the dense QR solver, chosen for small and
+semidefinite problems, and any explicit solver other than `kktsolver_ldl`.
+
+Before either, singleton equality rows (`gᵢⱼ yⱼ = dᵢ`) fix their variable
+and are removed together with the column; the fixed values, their
+equality duals, and the objective values are restored on the way out
+(`fix_singletons = false` disables this step).
 """
 function preprocess_conicIP(Q, c::AbstractVector,
   A, b::AbstractVector, cone_dims,
   G = spzeros(0,length(c)), d = zeros(0);
   verbose = false,
+  rank_check = :auto,
+  fix_singletons = true,
   options...)
 
   if verbose == true
@@ -73,6 +87,141 @@ function preprocess_conicIP(Q, c::AbstractVector,
     println(" > INTERIOR POINT PREPROCESSOR")
     println()
   end
+
+  fx = fix_singletons ? _singleton_fixings(G, d) : nothing
+  if fx === nothing
+    return _preprocess_core(Q, c, A, b, cone_dims, G, d;
+                            verbose = verbose, rank_check = rank_check, options...)
+  end
+
+  n = length(c); m = size(A, 1); p = size(G, 1)
+  (; rows, cols, vals, conflict) = fx  # rows: singleton rows dropped, cols: fixed columns
+
+  if conflict !== nothing
+    # Two singleton rows i, k on column j with dᵢ/gᵢⱼ ≠ dₖ/gₖⱼ. The Farkas
+    # ray w = ±(eᵢ/gᵢⱼ − eₖ/gₖⱼ), v = 0 has Gᵀw = 0 and dᵀw ≠ 0; pick the
+    # sign with dᵀw < 0 and let the validator normalize and confirm it.
+    (i, k, j) = conflict
+    Gs = sparse(G)
+    w0 = zeros(p); w0[i] = 1 / Gs[i, j]; w0[k] = -1 / Gs[k, j]
+    dot(d, w0) > 0 && (w0 .= .-w0)
+    opts = (; options...)
+    (chk, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims, G, d,
+        w0, zeros(m); abstol = get(opts, :infeasAbsTol, 1e-9),
+                      reltol = get(opts, :infeasTol, 1e-7))
+    if verbose
+      println("   - Conflicting singleton equality rows $i and $k on variable $j",
+              chk.valid ? " (certified infeasible)" : " (no valid certificate)")
+    end
+    nanv(k) = fill(NaN, k)
+    return chk.valid ?
+      Solution(nanv(n), w̄, v̄, nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
+      Solution(nanv(n), nanv(p), nanv(m), nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+  end
+
+  keepc = setdiff(1:n, cols)
+  keepr = setdiff(1:p, rows)
+  yfix  = zeros(n); yfix[cols] = vals
+  if verbose
+    println("   - Fixing $(length(cols)) variable(s) from singleton equality rows")
+  end
+
+  # Reduced data: ½ȳᵀQ̄ȳ − c̄ᵀȳ with c̄ = c − Q[:,F] y_F on the kept columns,
+  # Ā ȳ ≥ b − A[:,F] y_F, Ḡ ȳ = d − G[:,F] y_F on the kept rows.
+  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  cr = (c - Qs * yfix)[keepc]
+  br = b - As * yfix
+  dr = (d - Gs * yfix)[keepr]
+  sol = _preprocess_core(Qs[keepc, keepc], cr, As[:, keepc], br, cone_dims,
+                         Gs[keepr, keepc], dr;
+                         verbose = verbose, rank_check = rank_check, options...)
+
+  # Postsolve. The primal is the fixed value on F. The dual of a dropped
+  # singleton row i (variable j) comes from stationarity of column j:
+  #   (Qy)ⱼ + (Gᵀw)ⱼ − (Aᵀv)ⱼ = cⱼ  ⇒  gᵢⱼ wᵢ = cⱼ − (Qy)ⱼ + (Aᵀv)ⱼ − Σ_{k≠i} gₖⱼ wₖ.
+  # Rays: a primal ray has zero fixed components; a Farkas ray needs wᵢ
+  # chosen so that column j of Gᵀw − Aᵀv vanishes, which is the same
+  # formula with c and Qy dropped.
+  y = fill(NaN, n); w = fill(NaN, p)
+  if all(isfinite, sol.y)
+    y[keepc] = sol.y
+    if sol.status == :DualInfeasible && sol.has_certificate
+      y[cols] .= 0.0
+    else
+      y[cols] = vals
+    end
+  end
+  if all(isfinite, sol.w) && all(isfinite, sol.v)
+    w[keepr] = sol.w
+    ray = sol.status == :Infeasible && sol.has_certificate
+    wk = zeros(p); wk[keepr] = sol.w
+    rhs = ray ? (As' * sol.v) : (c - Qs * y + As' * sol.v)
+    for (i, j) in zip(rows, cols)
+      gij = Gs[i, j]
+      other = dot(Gs[:, j], wk) - gij * wk[i]     # Σ_{k≠i} gₖⱼ wₖ (wk[i] = 0)
+      w[i] = (rhs[j] - other) / gij
+      wk[i] = w[i]
+    end
+  end
+  sol.y = y; sol.w = w
+  if sol.status == :DualInfeasible && sol.has_certificate && all(isfinite, y)
+    sol.s = As * y
+  elseif all(isfinite, y) && all(isfinite, w) && all(isfinite, sol.v) && all(isfinite, sol.s)
+    # Objective values of the full problem: the reduced solve dropped the
+    # constant ½y_FᵀQ_FF y_F − c_Fᵀy_F carried by the fixed variables.
+    Qy = Qs * y
+    sol.pobj = 0.5 * dot(y, Qy) - dot(c, y)
+    sol.dobj = sol.pobj + dot(w, Gs * y - d) + dot(sol.v, As * y - sol.s - b) -
+               dot(sol.v, sol.s)
+  end
+  return sol
+end
+
+# Singleton equality rows: rows of G with exactly one structural nonzero.
+# Returns `nothing` when there are none, else the rows to drop, the
+# columns they fix (each once), the fixed values dᵢ/gᵢⱼ, and `conflict`:
+# `nothing`, or a pair of singleton rows on the same column whose fixed
+# values disagree beyond `tol` (relative), which makes the problem
+# infeasible. A second singleton on a column that agrees is simply
+# dropped as redundant.
+function _singleton_fixings(G, d; tol = 1e-9)
+  Gs = sparse(G)
+  p = size(Gs, 1)
+  p == 0 && return nothing
+  cnt = zeros(Int, p); lastcol = zeros(Int, p)
+  rowsv = rowvals(Gs); nzv = nonzeros(Gs)
+  for j in 1:size(Gs, 2), t in nzrange(Gs, j)
+    if nzv[t] != 0
+      cnt[rowsv[t]] += 1; lastcol[rowsv[t]] = j
+    end
+  end
+  rows = Int[]; cols = Int[]; vals = Float64[]
+  fixrow = zeros(Int, size(Gs, 2))       # row that fixed each column
+  fixval = zeros(size(Gs, 2))
+  conflict = nothing
+  for i in 1:p
+    cnt[i] == 1 || continue
+    j = lastcol[i]
+    v = d[i] / Gs[i, j]
+    if fixrow[j] == 0
+      fixrow[j] = i; fixval[j] = v
+      push!(rows, i); push!(cols, j); push!(vals, v)
+    elseif abs(v - fixval[j]) <= tol * (1 + abs(fixval[j]))
+      push!(rows, i)                       # consistent duplicate: drop it
+    elseif conflict === nothing
+      conflict = (fixrow[j], i, j)
+    end
+  end
+  isempty(rows) && return nothing
+  return (rows = rows, cols = cols, vals = vals, conflict = conflict)
+end
+
+function _preprocess_core(Q, c::AbstractVector,
+  A, b::AbstractVector, cone_dims,
+  G = spzeros(0,length(c)), d = zeros(0);
+  verbose = false,
+  rank_check = :auto,
+  options...)
 
   n = length(c) # Number of variables
   m = size(A,1) # Number of inequality constraints
@@ -87,7 +236,24 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   nanvec(k) = fill(NaN, k)
 
-  (IP, pconsistent) = imcols(G, d)
+  # Rank detection is needed only by KKT solvers without regularization
+  # of the equality block. Resolve the solver the same way conicIP will.
+  rc = Symbol(rank_check)
+  rc in (:auto, :always, :never) ||
+    throw(ArgumentError("rank_check must be :auto, :always or :never (got $rank_check)"))
+  ks = get(opts, :kktsolver, default_kktsolver)
+  do_rank = rc == :always ? true :
+            rc == :never  ? false :
+            (ks === default_kktsolver ? choose_kktsolver(Q, A, G, cone_dims) !== kktsolver_ldl :
+                                        ks !== kktsolver_ldl)
+
+  if !do_rank
+    if verbose; println("   - Rank detection skipped (KKT solver regularizes)"); end
+    IP = collect(1:p); pconsistent = true
+    ID = collect(1:n); dconsistent = true
+  else
+    (IP, pconsistent) = imcols(G, d)
+  end
 
   if !pconsistent
 
@@ -113,7 +279,9 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   end
 
-  (ID, dconsistent) = imcols([Q A' G[IP,:]'], c)
+  if do_rank
+    (ID, dconsistent) = imcols([Q A' G[IP,:]'], c)
+  end
 
   if !dconsistent
 
@@ -146,7 +314,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     println("   - Rank deficient dual constraints: enabling static regularization");
   end
 
-  if (verbose == true) &&  (length(ID) == n) && (length(IP) == p)
+  if (verbose == true) && do_rank && (length(ID) == n) && (length(IP) == p)
     println("   - No changes made")
   end
 
@@ -175,7 +343,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # pin staticReg themselves. A rank-deficient G is deliberately NOT
   # retried this way: staticReg touches only the Q block and cannot cure
   # it (imcols already trimmed dependent rows above).
-  if sol.status == :Error && reg == 0.0 && !haskey(opts, :staticReg) &&
+  if sol.status == :Error && do_rank && reg == 0.0 && !haskey(opts, :staticReg) &&
      time_left() > 0
     if verbose; println("   - KKT failure; retrying once with staticReg = 1e-8"); end
     sol = conicIP(Q, c, A, b, cone_dims, G[IP,:], d[IP];

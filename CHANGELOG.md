@@ -36,9 +36,16 @@ uses [Semantic Versioning](https://semver.org/).
   and `refineAbsTol = 1e-12`: refinement stops when
   `‖r − KΔz‖ ≤ refineAbsTol + refineRelTol·‖r‖`.
 - Termination also requires the relative duality gap
-  `|pobj − dobj|/(1 + |pobj|) < optTol`; the complementarity residual alone
-  is a 2-norm whose enforced accuracy drifted with the number of cones.
+  `⟨v,s⟩/(1 + |pobj|) < optTol`; the complementarity residual alone is a
+  2-norm whose enforced accuracy drifted with the number of cones. The gap
+  is the complementarity itself rather than `pobj − dobj`, whose residual
+  products floor the computed value once the duals are large.
   `Solution.prFeas` now includes the equality residual.
+- Feasibility residuals are normalized by the size of the equation they
+  measure (right-hand side or data norm times iterate norm, whichever is
+  larger) instead of the right-hand side alone. A homogeneous row
+  (`d = 0`) with a matrix of size 10⁸ was an absolute test that rounding
+  alone could never meet.
 
 ### Added
 - `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
@@ -64,6 +71,30 @@ uses [Semantic Versioning](https://semver.org/).
   iteration, covering preprocessing and retries; returns `:TimeLimit`
   (`MOI.TIME_LIMIT`) with the best iterate, and skips the certificate
   fallback solves.
+- `cached_kktsolver_ldl()`: an LDLᵀ solver object that reuses the AMD
+  ordering across solves with the same structure (repeated solves, MPC);
+  a modest saving on well-structured problems, larger where fill is heavy.
+  The ordering is also computed once per solve now instead of twice
+  (solver selection and factorization each ran AMD). New direct
+  dependency: AMD.jl (already required by QDLDL.jl).
+- `preprocess_conicIP` fixes variables from singleton equality rows
+  (`gᵢⱼ yⱼ = dᵢ`), solves the reduced problem, and restores the fixed
+  values and their equality duals; conflicting singletons surface as a
+  certified infeasibility. Its sparse-QR rank detection is now governed by
+  `rank_check = :auto | :always | :never` (also an MOI option): `:auto`
+  runs it only when the KKT solver in use cannot regularize a
+  rank-deficient `G` (dense QR, i.e. small and semidefinite problems, or
+  an explicit non-LDLᵀ solver), so large problems no longer pay for two
+  sparse QR factorizations before the solve.
+- Native quadratic objectives through MOI/JuMP: `ScalarQuadraticFunction`
+  objectives become the solver's `Q` instead of a second-order-cone
+  reformulation, so positive semidefinite but singular Hessians solve
+  (Maros–Mészáros `cvxqp1_s` failed in the bridge before).
+- MOI assembly builds the constraint matrices from triplets in one
+  `sparse` call each (no per-constraint CSC object, no PSD row
+  reassignment), merges adjacent orthant blocks, looks constraint results
+  up in O(1), and computes `G*y` once; `SolveTimeSec` now covers assembly
+  as well as the solve, with the assembly part in `Optimizer.assembly_time`.
 - `Solution.kkt_solves`: the number of KKT back-solves the main loop
   performed (initial point, predictor, corrector, refinements).
 - `benchmark/suite.jl`: reproducible harness with phase timings, solve

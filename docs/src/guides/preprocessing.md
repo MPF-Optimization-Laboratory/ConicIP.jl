@@ -25,15 +25,29 @@ sol = preprocess_conicIP(Q, c, A, b, cone_dims, G, d; verbose=false)
 
 ## What It Does
 
-The preprocessor performs two steps:
+The preprocessor performs three steps:
 
-1. **Equality constraint reduction:** Uses [`imcols`](@ref ConicIP.imcols)
-   to identify and remove linearly dependent rows from `G` and `d`,
-   ensuring `rank(G) = size(G, 1)`.
+1. **Singleton fixing:** an equality row with a single nonzero,
+   `gᵢⱼ yⱼ = dᵢ`, fixes `yⱼ = dᵢ/gᵢⱼ`. The row and the column are removed
+   and the right-hand sides and objective adjusted; the fixed value and
+   the row's dual multiplier are restored on the way out. Two singletons
+   on the same column are kept as ordinary rows, so a conflict is
+   reported as a certified infeasibility.
 
-2. **Dual constraint reduction:** Checks that the combined system
-   `[Q  A'  G']` has full row rank. If not, it removes dependent
-   columns to restore full rank.
+2. **Equality constraint reduction** (`rank_check`): uses
+   [`imcols`](@ref ConicIP.imcols) to identify and remove linearly
+   dependent rows from `G` and `d`, ensuring `rank(G) = size(G, 1)`.
+
+3. **Dual constraint check** (`rank_check`): checks that the combined
+   system `[Q  A'  G']` has full row rank and, if not, opts into the
+   solver's static KKT regularization rather than altering the problem.
+
+Steps 2 and 3 are the expensive ones (two sparse QR factorizations) and
+exist for KKT solvers that need a full-rank `G`. `rank_check = :auto`
+(default) runs them only when such a solver will be used — dense QR for
+small and semidefinite problems, or an explicit solver other than
+[`kktsolver_ldl`](@ref ConicIP.kktsolver_ldl) — since the LDLᵀ solver
+regularizes the equality block itself. `:always` and `:never` override.
 
 After preprocessing, the reduced problem is passed to `conicIP`.
 

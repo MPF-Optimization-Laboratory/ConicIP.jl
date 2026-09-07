@@ -29,7 +29,7 @@ dense_kkt_flops(n, m, p) = (r = max(n - p, 0); m*r^2 + r^3/3)
 # Per-iteration flop estimate for kktsolver_ldl from the symbolic
 # factorization: Σⱼ (column count of L)², the cost of the rank-1 updates.
 function _ldl_flops(pat)
-  Fl = qdldl(pat.K; logical = true)
+  Fl = qdldl(pat.K; perm = pat.perm, logical = true)
   return sum(abs2, Float64.(Fl.workspace.Lnz))
 end
 

@@ -28,7 +28,7 @@ where `Q ⪰ 0` and each `Kᵢ` is a nonnegative orthant, a second-order cone, o
   | Second-order cone | `("Q", n)` | Norm constraints |
   | Semidefinite | `("S", k)` | Matrix positivity |
 
-- **Quadratic objectives.** Handled natively by the direct API, without reformulation to a second-order cone. Through JuMP, quadratic objectives are supported via MathOptInterface bridges.
+- **Quadratic objectives.** Handled natively, through both the direct API and JuMP, without reformulation to a second-order cone; positive semidefinite but singular Hessians are fine.
 - **Custom KKT solvers.** Plug in your own factorization or iterative method at each interior-point iteration; built-in dense, sparse, and reduced 2×2 solvers with automatic selection.
 - **Nesterov-Todd scaling.** Symmetric primal-dual scaling for good numerical behaviour.
 - **Infeasibility detection.** Returns validated certificates for infeasible and unbounded problems.

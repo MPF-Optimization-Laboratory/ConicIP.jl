@@ -3,6 +3,7 @@ uuid = "d92ec50d-21ac-4ea5-850a-0588cd9e47b8"
 version = "0.4.0"
 
 [deps]
+AMD = "14f7f29c-3bd6-536c-9a0b-7339e30b5a3e"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MathOptInterface = "b8f27783-ece8-5eb3-8dc8-9495eed66fee"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
@@ -11,6 +12,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 WoodburyMatrices = "efce3f68-66dc-5838-9240-27a6d6f5f9b6"
 
 [compat]
+AMD = "0.5"
 LinearAlgebra = "1"
 MathOptInterface = "1"
 Printf = "1"

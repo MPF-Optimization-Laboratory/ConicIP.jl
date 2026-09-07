@@ -1551,7 +1551,11 @@ end
         @testset "Reduced-problem ray failing revalidation is :Error" begin
             (IP, consistent) = ConicIP.imcols(G, d)
             @test consistent && length(IP) == 1       # premise: a row is dropped
-            s = preprocess_conicIP(Q, c, A, b, K, G, d; verbose = false)
+            # Singleton fixing would resolve this problem exactly (row 1 fixes
+            # y₁ = 0, the reduced row 2 then fixes y₂); disable it to reach the
+            # rank-detection path this test is about.
+            s = preprocess_conicIP(Q, c, A, b, K, G, d; verbose = false,
+                                   fix_singletons = false)
             @test s.status == :Error
             @test !s.has_certificate
             @test all(isnan, s.y) && all(isnan, s.w)
@@ -1563,7 +1567,27 @@ end
         @testset "Same problem through MOI maps to NUMERICAL_ERROR" begin
             model = MOI.Utilities.CachingOptimizer(
                 MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
+                ConicIP.Optimizer(fix_singletons = false))
+            # With singleton fixing on, the same model simply solves.
+            model_fix = MOI.Utilities.CachingOptimizer(
+                MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()),
                 ConicIP.Optimizer())
+            xf = MOI.add_variables(model_fix, 2)
+            MOI.set(model_fix, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(model_fix, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(-1.0, xf[2])], 0.0))
+            MOI.add_constraint(model_fix,
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(100.0, xf[1])], 0.0),
+                MOI.EqualTo(0.0))
+            MOI.add_constraint(model_fix,
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(100.0, xf[1]),
+                                          MOI.ScalarAffineTerm(1e-6, xf[2])], 0.0),
+                MOI.EqualTo(0.0))
+            MOI.add_constraint(model_fix, xf[1], MOI.GreaterThan(0.0))
+            MOI.add_constraint(model_fix, xf[2], MOI.GreaterThan(0.0))
+            MOI.optimize!(model_fix)
+            @test MOI.get(model_fix, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test abs(MOI.get(model_fix, MOI.ObjectiveValue())) < 1e-6
             x = MOI.add_variables(model, 2)
             MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
             MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
@@ -2039,6 +2063,191 @@ end
         @test MOI.get(opt, MOI.RawOptimizerAttribute("equilibrate")) == true
         MOI.set(opt, MOI.RawOptimizerAttribute("equilibrate"), false)
         @test MOI.get(opt, MOI.RawOptimizerAttribute("equilibrate")) == false
+    end
+
+    @testset "MOI native quadratic objectives and triplet assembly" begin
+        import MathOptInterface as MOI
+        # Singular PSD Hessian: ½(x₁−x₂)² + x₁ + x₂ over x ≥ 0, x₁+x₂ ≥ 1.
+        # The quadratic-to-SOC bridge refuses this (not strongly convex);
+        # natively it is an ordinary QP with optimum 1 at (½, ½).
+        model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(model, MOI.Silent(), true)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraint.(model, x, MOI.GreaterThan(0.0))
+        c1 = MOI.add_constraint(model, 1.0*x[1] + 1.0*x[2], MOI.GreaterThan(1.0))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        f = MOI.ScalarQuadraticFunction(
+            [MOI.ScalarQuadraticTerm(1.0, x[1], x[1]),
+             MOI.ScalarQuadraticTerm(1.0, x[2], x[2]),
+             MOI.ScalarQuadraticTerm(-1.0, x[1], x[2])],
+            [MOI.ScalarAffineTerm(1.0, x[1]), MOI.ScalarAffineTerm(1.0, x[2])], 0.0)
+        MOI.set(model, MOI.ObjectiveFunction{typeof(f)}(), f)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test MOI.get(model, MOI.ObjectiveValue()) ≈ 1.0 atol = 1e-6
+        @test MOI.get.(model, MOI.VariablePrimal(), x) ≈ [0.5, 0.5] atol = 1e-5
+        @test MOI.get(model, MOI.ConstraintDual(), c1) ≈ 1.0 atol = 1e-5
+        raw = MOI.get(model, MOI.RawSolver())
+        @test Matrix(raw.Q_int) == [1.0 -1.0; -1.0 1.0]      # Q, not a bridge
+        @test raw.assembly_time >= 0 && raw.solve_time >= raw.assembly_time
+
+        # Concave maximization: max −x² + 4x + 1 s.t. x ≤ 10 → 5 at x = 2.
+        model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(model, MOI.Silent(), true)
+        x = MOI.add_variables(model, 1)
+        MOI.add_constraint(model, x[1], MOI.LessThan(10.0))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+        f = MOI.ScalarQuadraticFunction([MOI.ScalarQuadraticTerm(-2.0, x[1], x[1])],
+                                        [MOI.ScalarAffineTerm(4.0, x[1])], 1.0)
+        MOI.set(model, MOI.ObjectiveFunction{typeof(f)}(), f)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test MOI.get(model, MOI.ObjectiveValue()) ≈ 5.0 atol = 1e-6
+        @test MOI.get(model, MOI.VariablePrimal(), x[1]) ≈ 2.0 atol = 1e-5
+
+        # Triplet assembly: a VectorAffineFunction with constants and a
+        # repeated (row, column) pair, Nonpositives sign flip, PSD row
+        # permutation and √2 scaling, and orthant merging into one block.
+        model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(model, MOI.Silent(), true)
+        y = MOI.add_variables(model, 3)
+        MOI.add_constraint.(model, y, MOI.GreaterThan(0.0))         # three scalar rows
+        cnp = MOI.add_constraint(model, MOI.VectorAffineFunction(
+            [MOI.VectorAffineTerm(1, MOI.ScalarAffineTerm(1.0, y[1])),
+             MOI.VectorAffineTerm(1, MOI.ScalarAffineTerm(2.0, y[1])),   # duplicate → 3 y₁
+             MOI.VectorAffineTerm(2, MOI.ScalarAffineTerm(1.0, y[2]))],
+            [-1.0, -2.0]), MOI.Nonpositives(2))                     # 3y₁ − 1 ≤ 0, y₂ − 2 ≤ 0
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                1.0*y[1] + 1.0*y[2] - 1.0*y[3])
+        MOI.optimize!(model)
+        raw = MOI.get(model, MOI.RawSolver())
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test MOI.get.(model, MOI.VariablePrimal(), y) ≈ [1/3, 2.0, 0.0] atol = 1e-5
+        @test size(raw.ineq_A) == (5, 3)
+        rows = raw.ineq_rows[raw.ineq_ci_map[cnp]]     # O(1) lookup, order-independent
+        @test Matrix(raw.ineq_A)[rows, :] == [-3.0 0.0 0.0; 0.0 -1.0 0.0]
+        @test raw.ineq_b[rows] == [-1.0, -2.0]
+        @test length(raw.ineq_rows) == 4                # three scalar bounds + one vector
+        @test MOI.get(model, MOI.SolveTimeSec()) >= raw.assembly_time
+
+        # PSD: X ⪰ 0 (2×2), X₁₁ + X₂₂ = 1, max 2X₁₂ → 1 with X₁₂ = ½.
+        model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(model, MOI.Silent(), true)
+        X = MOI.add_variables(model, 3)
+        cpsd = MOI.add_constraint(model, MOI.VectorOfVariables(X),
+                                  MOI.PositiveSemidefiniteConeTriangle(2))
+        ctr = MOI.add_constraint(model, 1.0*X[1] + 1.0*X[3], MOI.EqualTo(1.0))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(), 2.0*X[2])
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test MOI.get(model, MOI.ObjectiveValue()) ≈ 1.0 atol = 1e-5
+        @test MOI.get(model, MOI.ConstraintPrimal(), cpsd) ≈ [0.5, 0.5, 0.5] atol = 1e-5
+        @test MOI.get(model, MOI.ConstraintPrimal(), ctr) ≈ 1.0 atol = 1e-6
+        raw = MOI.get(model, MOI.RawSolver())
+        @test Matrix(raw.ineq_A) ≈ [1.0 0 0; 0 √2 0; 0 0 1.0]   # vecm rows, √2 off-diagonal
+    end
+
+    @testset "Presolve: singleton fixing and rank_check" begin
+        # min ½‖y‖² − cᵀy, y ≥ 0, y₁ = 2, 3y₃ = 6, y₁+y₂+y₃+y₄ = 10.
+        # Two singleton rows fix y₁ and y₃; the reduced problem keeps the
+        # sum row. The postsolve must reproduce the unpresolved solution
+        # and duals, and the KKT conditions on the original data.
+        n = 4
+        Q = sparse(1.0I, n, n); c = [1.0, 2.0, 3.0, 4.0]
+        A = sparse(1.0I, n, n); b = zeros(n)
+        G = sparse([1.0 0 0 0; 0 0 3.0 0; 1.0 1.0 1.0 1.0]); d = [2.0, 6.0, 10.0]
+        fx = ConicIP._singleton_fixings(G, d)
+        @test fx.rows == [1, 2] && fx.cols == [1, 3] && fx.vals == [2.0, 2.0]
+        ref = conicIP(Q, c, A, b, [("R", n)], G, d; verbose = false)
+        for rc in (:auto, :always, :never)
+            s = preprocess_conicIP(Q, c, A, b, [("R", n)], G, d;
+                                   verbose = false, rank_check = rc)
+            @test s.status == :Optimal
+            @test norm(s.y - ref.y) < 1e-6
+            @test norm(G*s.y - d) < 1e-10
+            @test norm(Q*s.y + G'*s.w - A'*s.v - c) < 1e-6      # duals recovered
+            @test norm(s.w - ref.w) < 1e-5
+            @test abs(s.pobj - ref.pobj) < 1e-6 * (1 + abs(ref.pobj))   # constant restored
+            @test abs(s.dobj - s.pobj) < 1e-5 * (1 + abs(ref.pobj))
+        end
+        s0 = preprocess_conicIP(Q, c, A, b, [("R", n)], G, d;
+                                verbose = false, fix_singletons = false)
+        @test s0.status == :Optimal && norm(s0.y - ref.y) < 1e-6
+        @test_throws ArgumentError preprocess_conicIP(Q, c, A, b, [("R", n)], G, d;
+                                                       verbose = false, rank_check = :maybe)
+        # No singleton rows: the fast path is taken and nothing changes.
+        @test ConicIP._singleton_fixings(sparse([1.0 1.0 0 0; 0 0 1.0 1.0]), [1.0, 2.0]) === nothing
+
+        # Conflicting singletons y₁ = 2, 2y₁ = 6: the second stays as an
+        # ordinary row and the solve certifies infeasibility of the original.
+        G2 = sparse([1.0 0 0 0; 2.0 0 0 0]); d2 = [2.0, 6.0]
+        s = preprocess_conicIP(Q, c, A, b, [("R", n)], G2, d2; verbose = false)
+        @test s.status == :Infeasible && s.has_certificate
+        @test abs(dot(d2, s.w) - dot(b, s.v) + 1) < 1e-8
+        chk, _, _ = ConicIP.validate_infeasibility_certificate(
+            Q, c, A, b, [("R", n)], G2, d2, s.w, s.v; abstol = 1e-9, reltol = 1e-7)
+        @test chk.valid
+
+        # Dual infeasible with a fixed variable: min −y₂, y₁ = 1, y ≥ 0. The
+        # ray has a zero fixed component and certifies the original data.
+        s = preprocess_conicIP(spzeros(2, 2), [0.0, 1.0], sparse(1.0I, 2, 2), zeros(2),
+                               [("R", 2)], sparse([1.0 0.0]), [1.0]; verbose = false)
+        @test s.status == :DualInfeasible && s.has_certificate
+        @test s.y[1] == 0.0 && abs(dot([0.0, 1.0], s.y) - 1) < 1e-10
+
+        # MOI fixed variable (VariableIndex-in-EqualTo) with MOI dual signs.
+        import MathOptInterface as MOI
+        model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(model, MOI.Silent(), true)
+        x = MOI.add_variables(model, 3)
+        MOI.add_constraint.(model, x[2:3], MOI.GreaterThan(0.0))
+        cfix = MOI.add_constraint(model, x[1], MOI.EqualTo(2.0))
+        csum = MOI.add_constraint(model, 1.0*x[1] + 1.0*x[2] + 1.0*x[3], MOI.EqualTo(5.0))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                1.0*x[2] + 2.0*x[3])
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test MOI.get.(model, MOI.VariablePrimal(), x) ≈ [2.0, 3.0, 0.0] atol = 1e-5
+        @test MOI.get(model, MOI.ConstraintDual(), cfix) ≈ -1.0 atol = 1e-5
+        @test MOI.get(model, MOI.ConstraintDual(), csum) ≈ 1.0 atol = 1e-5
+        @test MOI.get(model, MOI.ConstraintPrimal(), cfix) ≈ 2.0 atol = 1e-8
+        # rank_check is an MOI option and is not forwarded when preprocess = false
+        opt = ConicIP.Optimizer(rank_check = "never", preprocess = false)
+        @test MOI.get(opt, MOI.RawOptimizerAttribute("rank_check")) == "never"
+        m2 = MOI.instantiate(() -> opt; with_bridge_type = Float64)
+        MOI.set(m2, MOI.Silent(), true)
+        z = MOI.add_variable(m2)
+        MOI.add_constraint(m2, z, MOI.GreaterThan(1.0))
+        MOI.set(m2, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.set(m2, MOI.ObjectiveFunction{MOI.VariableIndex}(), z)
+        MOI.optimize!(m2)
+        @test MOI.get(m2, MOI.TerminationStatus()) == MOI.OPTIMAL
+    end
+
+    @testset "cached_kktsolver_ldl" begin
+        Random.seed!(21)
+        pg = socp_sum_of_norms(60; d = 80)
+        ks = ConicIP.cached_kktsolver_ldl()
+        s1 = conicIP(pg.Q, pg.c, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                     verbose = false, kktsolver = ks)
+        @test ks.hits == 0 && ks.perm !== nothing
+        # Same structure, new data: the ordering is reused.
+        c2 = pg.c .+ 0.1 .* randn(length(pg.c))
+        s2 = conicIP(pg.Q, c2, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                     verbose = false, kktsolver = ks)
+        @test ks.hits == 1
+        @test s1.status == :Optimal && s2.status == :Optimal
+        ref = conicIP(pg.Q, c2, pg.A, pg.b, pg.cone_dims, pg.G, pg.d;
+                      verbose = false, kktsolver = ConicIP.kktsolver_ldl)
+        @test norm(s2.y - ref.y) < 1e-6 * (1 + norm(ref.y))
+        # A structural change invalidates the cache without breaking the solve.
+        pg3 = socp_sum_of_norms(61; d = 80)
+        s3 = conicIP(pg3.Q, pg3.c, pg3.A, pg3.b, pg3.cone_dims, pg3.G, pg3.d;
+                     verbose = false, kktsolver = ks)
+        @test ks.hits == 1 && s3.status == :Optimal
     end
 
     @testset "Step safeguards" begin

@@ -156,9 +156,13 @@ function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d)
   if all(isfinite, y) && all(isfinite, v) && all(isfinite, s) && all(isfinite, w)
     Qy   = Q * y
     cᵀy  = dot(c, y)
-    rDu  = norm(Qy + G' * w - A' * v - c) / (1 + norm(c))
-    rPr  = isempty(b) ? 0.0 : norm(A * y - s - b) / (1 + norm(b))
-    rEq  = isempty(d) ? 0.0 : norm(G * y - d) / (1 + norm(d))
+    Qmax = _maxabs(Q); Amax = _maxabs(A); Gmax = _maxabs(G)
+    ny = norm(y); nw = normsafe(w); nv = normsafe(v)
+    rDu  = norm(Qy + G' * w - A' * v - c) /
+           (1 + max(norm(c), Qmax*ny, Gmax*nw, Amax*nv))
+    rPr  = isempty(b) ? 0.0 :
+           norm(A * y - s - b) / (1 + max(norm(b), Amax*ny, norm(s)))
+    rEq  = isempty(d) ? 0.0 : norm(G * y - d) / (1 + max(norm(d), Gmax*ny))
     pobj = 0.5 * dot(y, Qy) - cᵀy
     dobj = pobj + dot(w, G * y - d) + dot(v, A * y - s - b) - dot(v, s)
     sol.duFeas = rDu

@@ -363,7 +363,21 @@ prototype is 1–2 weeks. Scaling, safeguards, and validation are the rest.
 
 ### Tranche 2: front end and presolve
 
-**Status:** not started. **Estimate:** 2–4 weeks.
+**Status:** done on branch `large-scale-roadmap` (2026-09-07): triplet assembly with one
+`sparse` call per matrix, PSD permutation and √2 applied to the triplets, adjacent
+orthant blocks merged, O(1) constraint-result lookup with `G*y` computed once,
+`SolveTimeSec` covering assembly (`Optimizer.assembly_time` separately); native
+quadratic objectives through MOI (`cvxqp1_s`, refused by the SOC bridge, now solves to
+its reference objective); singleton-equality presolve with dual and objective postsolve
+and certified conflicts (`fix_singletons`); `rank_check = :auto | :always | :never`
+with `:auto` skipping the two sparse QRs whenever the LDLᵀ solver is used;
+`cached_kktsolver_ldl` reusing the AMD ordering across same-structure solves. Two
+termination fixes fell out of the presolve work: the gap is measured as ⟨v,s⟩ rather
+than `pobj − dobj` (whose residual products floor it when duals are large), and
+feasibility residuals are normalized by the data norm times the iterate norm as well
+as the right-hand side, since a homogeneous equality row under a 10⁸ scale was an
+absolute test. Not done: bound tightening, duplicate-row detection, and general
+singleton substitution beyond equality rows. **Estimate was:** 2–4 weeks.
 
 1. MOI assembly directly into the global `A` and `G` by triplet accumulation (one
    `sparse(I, J, V, m, n)` per matrix, not per constraint object); merge compatible

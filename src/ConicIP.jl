@@ -56,6 +56,13 @@ MatrixTypes = Union{Matrix, Array{Real,2},
 # returns 0 for matrices with dimension 0.
 normsafe(x) = isempty(x) ? 0 : norm(x)
 
+# Largest absolute entry of a matrix (0 for an empty one); the data scale
+# used in the residual normalizations.
+function _maxabs(M)
+  S = sparse(M)
+  return nnz(S) == 0 ? 0.0 : maximum(abs, nonzeros(S))
+end
+
 # ──────────────────────────────────────────────────────────────
 #  3x1 block vector
 # ──────────────────────────────────────────────────────────────
@@ -713,7 +720,8 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
   # The core tests termination on residuals mapped back to the original
   # coordinates, so optTol keeps its meaning under any scaling.
   scaling = (Dc = eq.Dc, Dr = eq.Dr, De = eq.De, σ = eq.σ,
-             normc = norm(c), normb = normsafe(b), normd = normsafe(d))
+             normc = norm(c), normb = normsafe(b), normd = normsafe(d),
+             Qmax = _maxabs(Q), Amax = _maxabs(A), Gmax = _maxabs(G))
   sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
                  scaling = scaling, kwargs...)
   return unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d)
@@ -815,6 +823,8 @@ function _conicIP(
   normd = isempty(d) ? -Inf : norm(d)
   normb = normsafe(b)
   normdsafe = normsafe(d)   # 0 for empty d (normd is -Inf there)
+  # Largest entries of the data, for the residual normalizations
+  Qmax = _maxabs(Q); Amax = _maxabs(A); Gmax = _maxabs(G)
 
   # Sanity Checks
   ◂ = nothing
@@ -1230,28 +1240,43 @@ function _conicIP(
     pobj = 0.5*dot(z.y, Qy) - dot(c, z.y)
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
 
+    # rGap is the relative duality gap measured as the complementarity
+    # ⟨v,s⟩ (equal to pobj − dobj at a feasible point). It is not taken
+    # from the dobj formula above, whose residual products wᵀr_w + vᵀr_v
+    # put a floor of ‖w‖‖r_w‖ under the computed gap once the duals are
+    # large; feasibility has its own tests. rCp measures the same
+    # complementarity as a 2-norm of the Jordan product, √(cones) smaller
+    # for equal components, so the gap test is what keeps the enforced
+    # accuracy independent of problem size.
+    # Feasibility residuals are relative to the size of the equation they
+    # measure — the right-hand side or the data times the iterate,
+    # whichever is larger: ‖c‖, ‖Q‖‖y‖, ‖G‖‖w‖, ‖A‖‖v‖ for stationarity;
+    # ‖b‖, ‖A‖‖y‖, ‖s‖ for the cone rows; ‖d‖, ‖G‖‖y‖ for the equalities
+    # (matrix norms are the largest entry). Normalizing by the right-hand
+    # side alone makes a homogeneous row (d = 0) an absolute test, which a
+    # G of size 10⁸ can never meet: rounding alone leaves ‖Gy‖ ≈ ‖G‖‖y‖ε.
     if scaling === nothing
-      rDu = norm(r0.y)/(1+normc)
-      rPr = normsafe(r0.v)/(1+normb)
+      ny = norm(z.y); nw = normsafe(z.w); nv = normsafe(z.v)
+      rDu = norm(r0.y)/(1 + max(normc, Qmax*ny, Gmax*nw, Amax*nv))
+      rPr = normsafe(r0.v)/(1 + max(normb, Amax*ny, normsafe(z.s)))
       rCp = normsafe(r0.s)/(1+abs(cᵀy));
-      rEq = normsafe(r0.w)/(1+normdsafe)   # Gy - d
-      rGap = abs(pobj - dobj)/(1 + abs(pobj))
+      rEq = normsafe(r0.w)/(1 + max(normdsafe, Gmax*ny))   # Gy - d
+      rGap = abs(μbar)/(1 + abs(pobj))
     else
       # Residuals of the equilibrated iterate in the original coordinates:
-      # r_y = r̃_y/(σDc), r_v = r̃_v/Dr, r_w = r̃_w/De, and every
-      # complementarity quantity (λ∘λ, ⟨v,s⟩, the objectives) is 1/σ times
-      # its scaled value.
-      σs = scaling.σ
-      rDu = norm(r0.y ./ scaling.Dc)/σs/(1+scaling.normc)
-      rPr = normsafe(r0.v ./ scaling.Dr)/(1+scaling.normb)
+      # r_y = r̃_y/(σDc), r_v = r̃_v/Dr, r_w = r̃_w/De, y = Dc ỹ, w = De w̃/σ,
+      # v = Dr ṽ/σ, s = s̃/Dr, and every complementarity quantity (λ∘λ,
+      # ⟨v,s⟩, the objectives) is 1/σ times its scaled value.
+      σs = scaling.σ; Dc = scaling.Dc; Dr = scaling.Dr; De = scaling.De
+      ny = norm(Dc .* z.y); nw = normsafe(De .* z.w)/σs; nv = normsafe(Dr .* z.v)/σs
+      rDu = norm(r0.y ./ Dc)/σs /
+            (1 + max(scaling.normc, scaling.Qmax*ny, scaling.Gmax*nw, scaling.Amax*nv))
+      rPr = normsafe(r0.v ./ Dr) /
+            (1 + max(scaling.normb, scaling.Amax*ny, normsafe(z.s ./ Dr)))
       rCp = normsafe(r0.s)/σs/(1+abs(cᵀy)/σs)
-      rEq = normsafe(r0.w ./ scaling.De)/(1+scaling.normd)
-      rGap = abs(pobj - dobj)/(σs + abs(pobj))
+      rEq = normsafe(r0.w ./ De) / (1 + max(scaling.normd, scaling.Gmax*ny))
+      rGap = abs(μbar)/(σs + abs(pobj))
     end
-    # rGap is the relative duality gap. rCp measures the complementarity
-    # vector in 2-norm, which is √(cones) smaller than the aggregate gap
-    # ⟨v,s⟩ for equal components; the explicit gap test keeps the enforced
-    # accuracy independent of problem size.
 
     # The retained "best" iterate is judged on feasibility and
     # complementarity only: on an infeasible or unbounded problem the gap
