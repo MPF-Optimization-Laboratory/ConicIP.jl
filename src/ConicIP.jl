@@ -231,8 +231,10 @@ end
 function nestod_sdc(z,s)
 
   # Nesterov-Todd Scaling Matrix for the Semidefinite Cone
-  # Matrix which satisfies the properties
-  # W*z = inv(W)*sb
+  # Matrix which satisfies the property
+  # F*z = inv(F')*s
+  # (equivalently F'*(F*z) = s).  Note inv(F') and not inv(F): the two
+  # agree only when mat(z) and mat(s) commute.
 
   Ls  = cholesky(mat(s)).L
   Lz  = cholesky(mat(z)).L
@@ -836,7 +838,10 @@ function conicIP(
   function nt_scaling(x, y)
 
     # Compute Nesterov-Todd scaling matrix, F s.t.
-    # λ = F*x = F\y
+    # λ = F*x = inv(F')*y
+    # For the self-adjoint R and Q blocks this is λ = F*x = F\y; for
+    # an S block F is a congruence and only the adjoint form holds
+    # (see nestod_sdc).
 
     B = Block(size(block_sizes,1));
 
