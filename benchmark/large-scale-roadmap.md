@@ -412,6 +412,30 @@ and pivot-sign vector, fixed pattern, `unequilibrate!` maps, MOI dual signs, lif
 columns in the flop count. Still open from the review: peak-memory estimate for the
 dense path (the 4 GiB figure is a routing estimate, not a bound).
 
+**Against the last release (v0.4.0, commit `0430b9e`), measured 2026-09-07 after the
+review fixes (commit `3aff869`), same machine, sequential runs, the harness run in a
+v0.4.0 worktree with two compatibility shims (`kkt_solves`, `RawSolver` absent there):**
+
+| instance | v0.4.0 it / s / RSS | now it / s / RSS | speedup |
+|---|---|---|---|
+| lp-band-2000 | 22 / 3.72 / 1.8 GB | 19 / 0.033 / 1.5 GB | 110× |
+| lp-band-20000 | 23 / 2520 / 6.9 GB | 21 / 0.57 / 1.7 GB | 4400× |
+| lp-band-200000 | child process died | 23 / 5.3 / 2.7 GB | — |
+| qp-band-2000 / 20000 / 200000 | 6–7 / 0.021 / 0.39 / 3.36 | 8–9 / 0.0085 / 0.085 / 1.41 | 2.4× / 4.6× / 2.4× |
+| sum-of-norms SOCP 150 / 1500 | 9 / 0.026, 10 / 1.18 (3.6 GB) | 10 / 0.011, 12 / 1.79 (1.4 GB) | 2.4× / **0.7×** |
+| issue #10 | 29 / 0.69 | 25 / 0.34 | 2.0× |
+| Maros–Mészáros hs21 hs35 hs76 qafiro dual1 primal1 qpcblend sambal | 7–30 it, 2–47 ms | 5–17 it, 0.4–5.7 ms | 1.0–9.4× |
+| Maros–Mészáros cvxqp1_s | bridge failure | 10 / 0.0014 | — |
+| CBLIB chainsing-1000-1 / nb / nql30 / qssp30 | 0.97 / 4.72 / 0.33 / 1.64 | 0.39 / 0.77 / 0.18 / 0.46 | 2.5× / 6.1× / 1.8× / 3.6× |
+| CBLIB sched_50_50_scaled | 23 / 7.08 / 3.4 GB | 32 / 0.17 / 1.5 GB | 42× |
+
+v0.4.0's residuals on the same instances are typically 1e-8 to 1e-10 (relative, its own
+normalization); the current tree reports 1e-13 to 1e-16 in original coordinates. The one
+regression is the 1500-variable sum-of-norms SOCP: v0.4.0 took the dense path (3.6 GB),
+the current tree the lifted LDLᵀ with two more iterations; the LDLᵀ route wins on memory
+and loses 0.6 s. The 200 000-variable LP under v0.4.0 exited within a minute with no error
+text (memory, most likely).
+
 1. MOI assembly directly into the global `A` and `G` by triplet accumulation (one
    `sparse(I, J, V, m, n)` per matrix, not per constraint object); merge compatible
    orthant blocks; PSD input scaling as a diagonal multiply; result lookup through
