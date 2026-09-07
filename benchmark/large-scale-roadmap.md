@@ -1,12 +1,13 @@
 # ConicIP.jl large-scale roadmap
 
-**Date:** 2026-09-06 (revised the same day after an independent review)
-**Baseline commit:** `25431eb` (master)
+**Date:** 2026-09-06 (revised the same day after an independent review, then
+rebased onto v0.4.0)
+**Baseline commit:** `119fb5e` (master, v0.4.0)
 **Status:** planning document. No tranche has started. Update the Status line of a
 tranche when work on it lands, and keep the `file:line` references current.
 
-`docs/src/index.md:83` positions ConicIP as a solver for **moderate-size** LP/QP/SOCP
-problems and sends large-scale users to COSMO, Hypatia, SCS, and ECOS. This document
+`docs/src/index.md:82` positions ConicIP as a solver for **moderate-size**
+LP/QP/SOCP/SDP problems and sends large-scale users to COSMO, Hypatia, SCS, and ECOS. This document
 records what would have to change to drop that qualifier honestly, and in what order.
 
 Claims below marked **verified** were checked against the code at the baseline commit.
@@ -54,7 +55,7 @@ precision.
   `−Aᵀ` above the diagonal and `+A` below it, with `+FᵀF` in the (3,3) block. An LDLᵀ
   needs the third block row and its right-hand side negated (see Tranche 1). **Verified.**
 - **Regularization touches only Q.** `staticReg` perturbs the (1,1) block
-  (`src/ConicIP.jl:886-891`). If `Gᵀw = 0` has a nonzero solution, the null vector
+  (`src/ConicIP.jl:944-945`). If `Gᵀw = 0` has a nonzero solution, the null vector
   `(0, w, 0)` survives any such perturbation, so a rank-deficient G is fatal without the
   presolve. A custom callback could assemble a regularized system today; the built-in
   solvers hardcode a zero equality block. **Verified.**
@@ -70,7 +71,7 @@ precision.
   the low-rank part (`src/kktsolvers.jl:158-161`) and selects entries by the sparsity of
   `D` while storing entries of `inv(D)`. The SOC scaling `FᵀF` is diagonal plus a rank-2
   term with one negative sign (`nestod_soc` builds `J = Diagonal([−β; β…])` plus a
-  rank-1 update, `src/ConicIP.jl:226-229`), so the lifted auxiliary block is indefinite
+  rank-1 update, `src/ConicIP.jl:242-244`), so the lifted auxiliary block is indefinite
   and pivot signs are not the ones LDLᵀ expects. The lifted pattern also changes at the
   initial point (`src/kktsolvers.jl:294-304`). **Verified.**
 
@@ -80,48 +81,49 @@ precision.
   Measured at the baseline with a counting KKT wrapper on random sparse LPs: about
   2.7–2.9 KKT solves per iteration, i.e. predictor, corrector, and on average under one
   refinement correction. The stopping test is
-  `(‖r_y‖+‖r_w‖+‖r_v‖+‖r_s‖)/(n+p+2m) < optTol/1e7` (`src/ConicIP.jl:66`, `:1231`),
+  `(‖r_y‖+‖r_w‖+‖r_v‖+‖r_s‖)/(n+p+2m) < optTol/1e7` (`src/ConicIP.jl:64`, `:1338`),
   which gets *easier* to pass as the problem grows for comparable component residuals.
-  The predictor solve is never refined (`src/ConicIP.jl:1175`), the residual is not
+  The predictor solve is never refined (`src/ConicIP.jl:1280`), the residual is not
   recomputed after the last correction, and the verbose "refine" column always prints 1
-  because the loop variable shadows the outer `rStep` (`src/ConicIP.jl:1218-1219`).
+  because the loop variable shadows the outer `rStep` (`src/ConicIP.jl:1325-1326`).
   Once LDLᵀ regularization is introduced, refinement against the unregularized system is
   what recovers accuracy, so this needs a real policy. **Verified.**
 - **Complementarity is tested by 2-norm, not aggregate gap.** `rCp` uses
-  `‖λ∘λ‖₂/(1+|cᵀy|)` (`src/ConicIP.jl:1031`); the aggregate gap `⟨v,s⟩` is √m larger for
+  `‖λ∘λ‖₂/(1+|cᵀy|)` (`src/ConicIP.jl:1136`); the aggregate gap `⟨v,s⟩` is √m larger for
   equal components, so the enforced gap accuracy drifts with size. There is no explicit
   absolute or relative gap test. Equality feasibility enters the termination test but is
-  not stored in `prFeas` (`src/ConicIP.jl:1040`). **Verified.**
-- **A factorization happens before the termination check** (`src/ConicIP.jl:989-1002`
-  precedes `:1055`), so every solve pays one unnecessary final factorization and can fail
+  not stored in `prFeas` (`src/ConicIP.jl:1145`). **Verified.**
+- **A factorization happens before the termination check** (`src/ConicIP.jl:1086-1107`
+  precedes `:1160`), so every solve pays one unnecessary final factorization and can fail
   numerically on an iterate that already met the tolerance. The initial point costs
-  another factorization (`src/ConicIP.jl:952-955`). **Verified.**
+  another factorization (`src/ConicIP.jl:1014`). **Verified.**
 - **The `:Unbounded` status over-claims.** `certificates.jl:155-165` checks `Qy = 0`,
   `Gy = 0`, `Ay ∈ K`, `cᵀy > 0`, which certifies dual infeasibility, not primal
   unboundedness (that also needs primal feasibility). Counterexample: `Q = 0, c = 1,
   A = 0, b = 1, K = R₊` is infeasible, yet the structural zero-column branch
-  (`src/ConicIP.jl:750-762`) returns `:Unbounded`. The MOI mapping to `DUAL_INFEASIBLE`
+  (`src/ConicIP.jl:801-813`) returns `:Unbounded`. The MOI mapping to `DUAL_INFEASIBLE`
   (`src/MOI_wrapper.jl:520-521`) is correct; the direct-API label and the verbose
   message are not. **Verified.**
 - **Products are recomputed.** The screens redo `Gᵀw`, `Aᵀv`, `Ay`, `Gy`, `Qy` each
-  iteration (`src/ConicIP.jl:1087`, `:1120-1122`) and the objective recomputes `Qy`
-  (`:1034`). Cheap now; not once factors are cheap.
+  iteration (`src/ConicIP.jl:1192`, `:1225-1227`) and the objective recomputes `Qy`
+  (`:1139`). Cheap now; not once factors are cheap.
 
 ### 3. SDP cones
 
 - **The explicit congruence matrix is O(k⁴) memory and O(k⁵) work**, but only on the
   paths that build it. `Matrix(::VecCongurance)` applies the O(k³) congruence to each of
-  k(k+1)/2 basis columns (`src/ConicIP.jl:94-106`); `sparse(F'F)` in the no-lift sparse
+  k(k+1)/2 basis columns (`src/ConicIP.jl:100-112`); `sparse(F'F)` in the no-lift sparse
   path and `sparse(F⁻ᵀ)` in the 2×2 path hit it. The default dense-QR path applies
   `F⁻ᵀ` column-wise to `AQ2` and never forms it (`src/kktsolvers.jl:91-100`). At k=100
   one such matrix is 204 MB, and the construction allocates an identity and the output
   besides. **Verified.**
-- Per iteration per block: two Cholesky factorizations, one SVD, and one explicit inverse
-  in `nestod_sdc` (`src/ConicIP.jl:233-247`), a general Lyapunov solve in `dsdc!`
-  (`:384-390`) where the scaled variable λ is diagonal and a closed form exists, and two
-  `eigvals` plus an inverse square root in `maxstep_sdc` (`:309-330`) called four times.
-  `maxstep_sdc` returns `Inf` when the matrix is not positive definite
-  (`src/ConicIP.jl:313-316`), which is not a recovery policy. **Verified.**
+- Per iteration per block: two Cholesky factorizations and one SVD in `nestod_sdc`
+  (`src/ConicIP.jl:248-268`; v0.4.0 replaced the explicit inverse with a triangular
+  solve), a general Lyapunov solve in `dsdc!` (`:414-424`) where the scaled variable λ is
+  diagonal and a closed form exists, and one generalized symmetric eigenproblem in
+  `maxstep_sdc` (`:331-360`; v0.4.0 replaced the inverse square root and now raises on a
+  non-positive-definite iterate instead of returning `Inf`) called four times.
+  **Verified.**
 - Large-SDP solvers (SDPA, SeDuMi, Mosek, Clarabel with chordal decomposition) never form
   the congruence operator; see Tranche 4 for the reduced-system form in this package's
   notation.
@@ -131,7 +133,7 @@ precision.
 - No wall-clock check anywhere. `MOI.TimeLimitSec` is unimplemented (only
   `SolveTimeSec`, `src/MOI_wrapper.jl:724-725`). The only escape is `maxIters = 100`.
 - On exhaustion, `certFallback` can launch up to two more solves of 50 iterations each
-  (`src/ConicIP.jl:1295-1328`), each of which calls `imcols` on an auxiliary system
+  (`src/ConicIP.jl:1419-1452`), each of which calls `imcols` on an auxiliary system
   (`src/fallback.jl:80`, `:149`) and does not receive the caller's `kktsolver`.
   `preprocess_conicIP` retries the whole solve with `staticReg = 1e-8` on `:Error`
   (`src/preprocessor.jl:171-175`). The multiplier on hard instances is unbounded in
@@ -167,19 +169,22 @@ precision.
 
 ### 7. Secondary constants
 
-- `nt_scaling` allocates a new `Block` per iteration (`src/ConicIP.jl:838-854`); every
+- `nt_scaling` allocates a new `Block` per iteration (`src/ConicIP.jl:889-905`); every
   block application allocates its output and per-block temporaries; adjoints construct
   transformed blocks (`src/blockmatrices.jl:111-133`, `:187-200`); `block_idx` and
   `size(::Block)` allocate per call (`:45-49`, `:66-80`). There is no `mul!` or in-place
   solve for `Block`, and a `Block` cannot multiply a `SparseMatrixCSC`.
-- `Solution` has abstract-typed numeric fields (`src/ConicIP.jl:451-457`). Minor.
+- `Solution` has abstract-typed numeric fields (`src/ConicIP.jl:491-497`). Minor.
 - No multithreading in the package. UMFPACK's factorization is not itself parallel;
   only its dense BLAS kernels are. Not a priority until profiling says otherwise.
 
 ### 8. No evidence base
 
-- The largest problem in CI has n=650 (`test/runtests.jl:1363`). The largest tutorial
-  has 12 variables. The 6010-variable issue-#10 instance is download-only.
+- The largest LP/QP/SOCP in CI has n=650 (`socp_sum_of_norms(150; d = 200)` in
+  `test/runtests.jl`). The largest tutorial has 12 variables. The 6010-variable
+  issue-#10 instance is download-only. v0.4.0 added an SDPLIB subset fetched on demand
+  as a CI gate (`test/sdplib_tests.jl`) and `benchmark/sdplib.jl`; that is the only
+  standard-library coverage.
 - No runs against Maros–Mészáros (QP), CBLIB (SOCP), or SDPLIB, and no harness with
   phase timings, fill statistics, or independently evaluated residuals.
 
@@ -277,10 +282,10 @@ rest.
    fallback, checked once per iteration, returning `:TimeLimit` with the best iterate
    assessed so far (or a documented result when none has been). Wire `MOI.TimeLimitSec`
    and `MOI.TIME_LIMIT`. Note that a single factorization can overrun the deadline.
-10. **Step safeguards.** Keep `DTB` (`src/ConicIP.jl:1241-1243`) and add verified
-    interiority after each step, finite-step checks, a backtracking or refactor-and-retry
-    path on failure, and tiny-step termination. Replace the `Inf` return in
-    `maxstep_sdc` with an error status or a recovery.
+10. **Step safeguards.** Keep `DTB` (`src/ConicIP.jl:1358-1360`) and the v0.4.0
+    finiteness guards, and add verified interiority after each step, a backtracking or
+    refactor-and-retry path on failure (today a boundary iterate is a terminal
+    `:Error`), and tiny-step termination.
 11. **Callback contract.** Document the `solve3x3gen(F, F⁻ᵀ)` interface's sign
     convention, who owns regularization, what residual is guaranteed, how failure is
     reported, and workspace lifetime. Add an in-place variant without breaking the
@@ -375,16 +380,16 @@ block incidence; storage versus recomputation of transformed coefficients; chord
 decomposition and clique merging when aggregate sparsity allows; direction recovery,
 regularization, refinement, and original-data residual checks.
 
-Independent of the reduced system: remove the explicit inverses in `nestod_sdc`,
-exploit the diagonal λ in `dsdc!` instead of a general Lyapunov solve, and compute the
-step length with a Cholesky-based generalized eigenvalue instead of the inverse square
-root. An explicit symmetric-Kronecker operator in the augmented matrix is still O(k⁴)
-when dense; `svec` improves constants only.
+Independent of the reduced system: exploit the diagonal λ in `dsdc!` instead of a
+general Lyapunov solve (v0.4.0 already removed the explicit inverse in `nestod_sdc` and
+moved the step length to a generalized eigenproblem). An explicit symmetric-Kronecker
+operator in the augmented matrix is still O(k⁴) when dense; `svec` improves constants
+only.
 
-Build on the in-flight branches `sdp-solver-fixes`, `sdp-test-suite`, and
-`sdplib-validation` (worktrees `.worktrees/sdp-fixes`, `sdp-tests`, `sdplib`), which
-carry an SDP test suite, a vendored SDPLIB subset, and an SDPLIB benchmark script. Keep
-SDP labelled experimental throughout the LP/QP/SOCP work; do not remove it.
+Build on the v0.4.0 SDP test suite (`test/sdp_tests.jl`, `test/sdp_problems.jl`), the
+on-demand SDPLIB subset (`test/sdplib_tests.jl`), and `benchmark/sdplib.jl`. SDP left
+experimental status in v0.4.0; the scale claim for it stays separate from the
+LP/QP/SOCP one until this tranche delivers.
 
 **Verification targets**
 
@@ -420,7 +425,7 @@ preconditioner cost, and total time, not just outer iterations.
 
 ### Documentation change
 
-Rewrite `docs/src/index.md:76-93` and the README positioning only after the Tranche 0
+Rewrite `docs/src/index.md:76-92` and the README positioning only after the Tranche 0
 harness, run after Tranches 1–2, shows: a fixed instance set with a stated solved set,
 equal accuracy enforced in original coordinates, and both pairwise time ratios against
 Clarabel.jl and a Dolan–Moré profile. "Within 2× of Clarabel on 90 % of a broad suite"
