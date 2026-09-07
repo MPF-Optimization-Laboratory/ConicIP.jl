@@ -41,8 +41,8 @@ ConicIP.Solution
 | `:Optimal` | Converged to an optimal solution |
 | `:Infeasible` | Problem is primal infeasible (validated Farkas ray when `has_certificate`) |
 | `:DualInfeasible` | Problem is dual infeasible: a recession ray decreases the objective without bound (validated when `has_certificate`). The primal is unbounded if it is also feasible, which this status does not establish. |
-| `:AlmostInfeasible` | Iteration limit with a near-validating infeasibility candidate (no certificate) |
-| `:AlmostDualInfeasible` | Iteration limit with a near-validating recession-ray candidate (no certificate) |
+| `:AlmostInfeasible` | Iteration limit with a near-validating infeasibility candidate, or a ray that validated on the equilibrated data but not on the original data (no certificate; `message` says which) |
+| `:AlmostDualInfeasible` | Iteration limit with a near-validating recession-ray candidate, or a ray that validated on the equilibrated data but not on the original data (no certificate; `message` says which) |
 | `:Abandoned` | Solver stalled (step size too small or numerical issues) |
 | `:TimeLimit` | `timeLimit` seconds elapsed; the solution holds the best iterate so far |
 | `:Error` | Solver encountered an error |

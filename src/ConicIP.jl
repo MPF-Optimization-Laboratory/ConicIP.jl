@@ -56,11 +56,22 @@ MatrixTypes = Union{Matrix, Array{Real,2},
 # returns 0 for matrices with dimension 0.
 normsafe(x) = isempty(x) ? 0 : norm(x)
 
-# Largest absolute entry of a matrix (0 for an empty one); the data scale
-# used in the residual normalizations.
-function _maxabs(M)
-  S = sparse(M)
-  return nnz(S) == 0 ? 0.0 : maximum(abs, nonzeros(S))
+# Entrywise absolute value |M| of a data matrix, for the backward-error
+# style residual normalizations ‖|M||x|‖. Storage is preserved: sparse
+# stays sparse, Diagonal stays Diagonal, and a Symmetric wrapper is kept
+# (broadcasting through it would densify the parent).
+_absmat(M::AbstractMatrix) = abs.(M)
+_absmat(M::Symmetric) = Symmetric(_absmat(parent(M)), Symbol(M.uplo))
+
+# ‖ |M| x ‖ for a nonnegative vector x, formed in `out`; with D a positive
+# diagonal (vector) the product is divided entrywise by D and by σ first,
+# which maps an equilibrated product back to the original coordinates
+# (see the termination test in _conicIP).
+function _absprod_norm!(out, M, x, D = nothing, σ = 1.0)
+  (isempty(out) || isempty(x)) && return 0.0
+  mul!(out, M, x)
+  D === nothing || (out ./= D)
+  return norm(out) / σ
 end
 
 # ──────────────────────────────────────────────────────────────
@@ -88,6 +99,13 @@ end
 function sub4!(dest::v4x1, a::v4x1, b::v4x1)
     dest.y .= a.y .- b.y; dest.w .= a.w .- b.w
     dest.v .= a.v .- b.v; dest.s .= a.s .- b.s
+    return dest
+end
+
+# dest .= src, in place (no allocation)
+function copy4!(dest::v4x1, src::v4x1)
+    copyto!(dest.y, src.y); copyto!(dest.w, src.w)
+    copyto!(dest.v, src.v); copyto!(dest.s, src.s)
     return dest
 end
 
@@ -210,6 +228,24 @@ cum_range(x) = [i:(j-1) for (i,j) in
         zip(cumsum([1;x])[1:end-1], cumsum([1;x])[2:end])]
 QF(r) = 2*r[1]*r[1] - dot(r,r)
 Q(x::VectorTypes,y::VectorTypes) = 2*x[1]*y[1] - dot(x,y) # xᵀJy
+
+# Jordan determinant of the unit vector x/‖x‖, QF(x)/‖x‖², computed on the
+# normalized entries so that it neither overflows nor underflows for any
+# finite nonzero x (QF(x) itself is 0 for ‖x‖ < 1e-154 and Inf beyond
+# 1e154). It is positive exactly on the interior of the second-order cone
+# (together with x₁ > 0) and is the quantity both the line search's
+# interiority check and `nestod_soc` test.
+function QFunit(x)
+  nx = norm(x)
+  nx > 0 || return 0.0
+  ss = 0.0
+  @inbounds for xi in x
+    t = xi / nx
+    ss += t * t
+  end
+  t1 = x[1] / nx
+  return 2 * t1 * t1 - ss
+end
 fts(x₁, α₁, y₁, x₂, α₂, y₂)      = dot(x₁,x₂) - α₂*dot(x₁,y₂) -
           α₁*dot(y₁,x₂) + α₁*α₂*dot(y₁,y₂) # (x₁ - α₁*y₁)'(x₂ - α₂y₂)
 
@@ -228,13 +264,22 @@ function nestod_soc(z,s)
   # Refuse it here so that a boundary SOC iterate surfaces as a guarded
   # factorization failure, exactly as a boundary SDP iterate does through
   # the cholesky in nestod_sdc.
-  (QF(z) > 0 && QF(s) > 0) || throw(LinearAlgebra.PosDefException(1))
+  #
+  # The scaling is homogeneous, W(αz, βs) = √(β/α)·W(z, s), so it is
+  # computed on the unit vectors z/‖z‖, s/‖s‖ and rescaled: a strictly
+  # interior pair with jointly extreme magnitudes (z ~ 1e-150, s ~ 1e150)
+  # would otherwise overflow in QF(s)/QF(z) and hand back an Inf scaling.
+  qz = QFunit(z); qs = QFunit(s)
+  (qz > 0 && qs > 0) || throw(LinearAlgebra.PosDefException(1))
+  nz = norm(z); ns = norm(s)
 
-  β = (QF(s)/QF(z))^(1/4)
+  # β = (QF(s)/QF(z))^(1/4) = (qs/qz)^(1/4) · √(‖s‖/‖z‖)
+  β = (qs/qz)^(1/4) * (sqrt(ns)/sqrt(nz))
 
-  # Normalize z,s vectors
-  z = z/sqrt(QF(z))
-  s = s/sqrt(QF(s))
+  # Normalize z,s vectors to QF = 1 (two divisions so that neither
+  # ‖z‖·√qz nor its reciprocal is formed)
+  z = (z ./ nz) ./ sqrt(qz)
+  s = (s ./ ns) ./ sqrt(qs)
 
   γ = sqrt((1 + dot(z,s))/2)
 
@@ -261,8 +306,17 @@ function nestod_sdc(z,s)
   # (equivalently F'*(F*z) = s).  Note inv(F') and not inv(F): the two
   # agree only when mat(z) and mat(s) commute.
 
-  Ls  = cholesky(Symmetric(mat(s))).L
-  Lz  = cholesky(Symmetric(mat(z))).L
+  # Homogeneity: F(αz, βs) = √(β/α)·F(z, s), and F acts as X ↦ RᵀXR, so
+  # R scales as (β/α)^(1/4). Factor the unit-norm matrices and rescale,
+  # so that jointly extreme magnitudes cannot overflow or underflow in
+  # the Cholesky factors and their product. (‖vecm(X)‖ = ‖X‖_F.)
+  isempty(z) && return VecCongurance(zeros(0, 0))   # order-0 block
+  nz = norm(z); ns = norm(s)
+  (nz > 0 && ns > 0) || throw(LinearAlgebra.PosDefException(1))
+  Sm  = mat(s); Sm ./= ns
+  Zm  = mat(z); Zm ./= nz
+  Ls  = cholesky(Symmetric(Sm)).L
+  Lz  = cholesky(Symmetric(Zm)).L
   F   = svd(Lz'*Ls)
   U   = F.U
   Λ   = F.S
@@ -270,6 +324,7 @@ function nestod_sdc(z,s)
   # column scaling: inv(Lz)' = inv(Lz') so inv(Lz)'*U is Lz' \ U, and
   # right-multiplying by a diagonal scales the columns.
   R = (Lz' \ U) .* sqrt.(Λ)'
+  R .*= sqrt(sqrt(ns) / sqrt(nz))
   return VecCongurance(R)
 
 end
@@ -481,6 +536,11 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 | `:Infeasible`/`:DualInfeasible` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
 | `:Abandoned`, `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:TimeLimit`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
 
+One exception: when a ray found on the equilibrated data fails revalidation
+against the original data (`sol.message` says so), the `:Almost*` or
+`:Abandoned` solution holds that ray in the ray fields, not the best
+iterate.
+
 The infeasibility ray is normalized so that `dᵀw̄ - bᵀv̄ = -1` with
 `Gᵀw̄ - Aᵀv̄ ≈ 0`; the unboundedness ray is normalized so that `cᵀȳ = +1`
 with `Qȳ ≈ 0`, `Gȳ ≈ 0` and `Aȳ ∈ K`. See
@@ -670,6 +730,10 @@ Selected keyword arguments:
   (a single factorization can overrun it). On expiry the status is
   `:TimeLimit` and the solution holds the best iterate so far; the
   certificate-fallback solves are skipped.
+- `objective_offset` — a constant added to the objective for the purpose
+  of the relative gap test only (`⟨v,s⟩/(1 + |pobj + objective_offset|)`).
+  `preprocess_conicIP` passes the constant carried by fixed variables, so a
+  reduced problem terminates by the same criterion as the full one.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -720,11 +784,17 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
   # The core tests termination on residuals mapped back to the original
   # coordinates, so optTol keeps its meaning under any scaling.
   scaling = (Dc = eq.Dc, Dr = eq.Dr, De = eq.De, σ = eq.σ,
-             normc = norm(c), normb = normsafe(b), normd = normsafe(d),
-             Qmax = _maxabs(Q), Amax = _maxabs(A), Gmax = _maxabs(G))
+             normc = norm(c), normb = normsafe(b), normd = normsafe(d))
   sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
                  scaling = scaling, kwargs...)
-  return unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d)
+  unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d)
+  # A ray validated on the scaled data need not validate on the original
+  # data (tolerances are not scaling-invariant): re-run the validator in
+  # the caller's coordinates with the caller's tolerances, and downgrade
+  # the claim if it fails there.
+  return _revalidate_certificate!(sol, Q, c, A, b, cone_dims, G, d;
+                                  infeasTol = Float64(get(kwargs, :infeasTol, 1e-7)),
+                                  infeasAbsTol = Float64(get(kwargs, :infeasAbsTol, 1e-9)))
 end
 
 function _conicIP(
@@ -777,6 +847,8 @@ function _conicIP(
   refineRelTol = 1e-13,    # refinement stops when ‖r − KΔz‖ ≤ refineAbsTol + refineRelTol‖r‖
   refineAbsTol = 1e-12,
   timeLimit = Inf,         # wall-clock budget in seconds, checked once per iteration
+  objective_offset = 0.0,  # constant part of the objective (from presolve), used
+                           # only in the relative gap test's denominator
   scaling = nothing        # set by conicIP when the data are equilibrated: the
                            # termination residuals are evaluated in the
                            # original coordinates (see equilibrate.jl)
@@ -812,6 +884,9 @@ function _conicIP(
   _trial_s   = zeros(m)
   _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  # Best step seen so far during refinement (restored when a correction
+  # increases the residual)
+  _Δz_keep = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
 
   # KKT back-solve counter, reported as Solution.kkt_solves
   _nsolve = Ref(0)
@@ -823,8 +898,14 @@ function _conicIP(
   normd = isempty(d) ? -Inf : norm(d)
   normb = normsafe(b)
   normdsafe = normsafe(d)   # 0 for empty d (normd is -Inf there)
-  # Largest entries of the data, for the residual normalizations
-  Qmax = _maxabs(Q); Amax = _maxabs(A); Gmax = _maxabs(G)
+  # Entrywise absolute values of the data, for the residual normalizations
+  # ‖|Q||y|‖, ‖|Gᵀ||w|‖, ‖|Aᵀ||v|‖, ‖|A||y|‖, ‖|G||y|‖ (transposes are
+  # lazy wrappers; the products below never materialize them).
+  absQ = _absmat(Q); absA = _absmat(A); absG = _absmat(G)
+  absAᵀ = absA'; absGᵀ = absG'
+  # Scratch for those products: |y|, |w|, |v| and the outputs
+  _absy = zeros(n); _absw = zeros(p); _absv = zeros(m)
+  _nrm_n = zeros(n); _nrm_m = zeros(m); _nrm_p = zeros(p)
 
   # Sanity Checks
   ◂ = nothing
@@ -894,6 +975,7 @@ function _conicIP(
                    certFallbackIters = certFallbackIters,
                    refineRelTol = refineRelTol, refineAbsTol = refineAbsTol,
                    timeLimit = time_left(),
+                   objective_offset = objective_offset,
                    scaling = scaling === nothing ? nothing :
                              (; scaling..., Dc = scaling.Dc[keep_c],
                                             De = scaling.De[keep_r]))
@@ -968,7 +1050,7 @@ function _conicIP(
       if btype == "R"
         all(>(0.0), xI) || return false
       elseif btype == "Q"
-        (xI[1] > 0 && QF(xI) > 0) || return false
+        (xI[1] > 0 && QFunit(xI) > 0) || return false
       elseif btype == "S"
         isposdef(Symmetric(mat(xI))) || return false
       end
@@ -988,7 +1070,9 @@ function _conicIP(
 
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I);
-      if btype == "R"; B[i] = Diagonal(sqrt.(yI./xI)); end
+      # √y/√x rather than √(y/x): the quotient overflows for jointly
+      # extreme magnitudes (y ~ 1e160, x ~ 1e-160), the square roots do not.
+      if btype == "R"; B[i] = Diagonal(sqrt.(yI) ./ sqrt.(xI)); end
       if btype == "Q"; B[i] = nestod_soc(xI, yI); end
       if btype == "S"; B[i] = nestod_sdc(xI, yI); end
     end
@@ -1237,8 +1321,22 @@ function _conicIP(
     # ────────────────────────────────────────────────────────────
 
     cᵀy  = dot(c,z.y)
-    pobj = 0.5*dot(z.y, Qy) - dot(c, z.y)
+    yᵀQy = dot(z.y, Qy)
+    pobj = 0.5*yᵀQy - cᵀy
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
+
+    # Convexity guard. The method assumes Q ⪰ 0 (equilibration preserves
+    # this); an iterate with yᵀQy < 0 beyond rounding is a witness that it
+    # is not, and the iteration would otherwise converge to a stationary
+    # point that is not a minimizer and report it as :Optimal.
+    if yᵀQy < -1e-10 * (1 + norm(Qy) * norm(z.y))
+      sol.status  = :Error
+      sol.message = "objective Hessian is not positive semidefinite " *
+                    "(yᵀQy < 0 at iteration $Iter); ConicIP requires a convex objective"
+      sol.kkt_solves = _nsolve[]
+      if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
+      return sol
+    end
 
     # rGap is the relative duality gap measured as the complementarity
     # ⟨v,s⟩ (equal to pobj − dobj at a feasible point). It is not taken
@@ -1249,33 +1347,51 @@ function _conicIP(
     # for equal components, so the gap test is what keeps the enforced
     # accuracy independent of problem size.
     # Feasibility residuals are relative to the size of the equation they
-    # measure — the right-hand side or the data times the iterate,
-    # whichever is larger: ‖c‖, ‖Q‖‖y‖, ‖G‖‖w‖, ‖A‖‖v‖ for stationarity;
-    # ‖b‖, ‖A‖‖y‖, ‖s‖ for the cone rows; ‖d‖, ‖G‖‖y‖ for the equalities
-    # (matrix norms are the largest entry). Normalizing by the right-hand
-    # side alone makes a homogeneous row (d = 0) an absolute test, which a
-    # G of size 10⁸ can never meet: rounding alone leaves ‖Gy‖ ≈ ‖G‖‖y‖ε.
+    # measure — the right-hand side or the terms actually summed to form
+    # the residual, whichever is larger (a backward-error normalization):
+    # ‖c‖, ‖|Q||y|‖, ‖|Gᵀ||w|‖, ‖|Aᵀ||v|‖ for stationarity; ‖b‖, ‖|A||y|‖,
+    # ‖s‖ for the cone rows; ‖d‖, ‖|G||y|‖ for the equalities. The
+    # componentwise products matter: the cruder bound ‖A‖‖y‖ (largest
+    # entry times the iterate) is far larger than any row of |A||y| when
+    # y has a huge component in a column that row does not touch, and it
+    # then normalizes a genuine residual away — an infeasible pair
+    # y₁ ≥ 1, −y₁ ≥ 0 was reported optimal beside a legitimate y₂ ≈ 10¹⁶.
+    # Normalizing by the right-hand side alone is wrong the other way: a
+    # homogeneous row (d = 0) becomes an absolute test, which a G of size
+    # 10⁸ can never meet, since rounding alone leaves ‖Gy‖ ≈ ‖|G||y|‖ε.
+    _absy .= abs.(z.y); _absw .= abs.(z.w); _absv .= abs.(z.v)
     if scaling === nothing
-      ny = norm(z.y); nw = normsafe(z.w); nv = normsafe(z.v)
-      rDu = norm(r0.y)/(1 + max(normc, Qmax*ny, Gmax*nw, Amax*nv))
-      rPr = normsafe(r0.v)/(1 + max(normb, Amax*ny, normsafe(z.s)))
+      nQy = _absprod_norm!(_nrm_n, absQ,  _absy)
+      nGw = _absprod_norm!(_nrm_n, absGᵀ, _absw)
+      nAv = _absprod_norm!(_nrm_n, absAᵀ, _absv)
+      nAy = _absprod_norm!(_nrm_m, absA,  _absy)
+      nGy = _absprod_norm!(_nrm_p, absG,  _absy)
+      rDu = norm(r0.y)/(1 + max(normc, nQy, nGw, nAv))
+      rPr = normsafe(r0.v)/(1 + max(normb, nAy, normsafe(z.s)))
       rCp = normsafe(r0.s)/(1+abs(cᵀy));
-      rEq = normsafe(r0.w)/(1 + max(normdsafe, Gmax*ny))   # Gy - d
-      rGap = abs(μbar)/(1 + abs(pobj))
+      rEq = normsafe(r0.w)/(1 + max(normdsafe, nGy))   # Gy - d
+      rGap = abs(μbar)/(1 + abs(pobj + objective_offset))
     else
       # Residuals of the equilibrated iterate in the original coordinates:
       # r_y = r̃_y/(σDc), r_v = r̃_v/Dr, r_w = r̃_w/De, y = Dc ỹ, w = De w̃/σ,
       # v = Dr ṽ/σ, s = s̃/Dr, and every complementarity quantity (λ∘λ,
-      # ⟨v,s⟩, the objectives) is 1/σ times its scaled value.
+      # ⟨v,s⟩, the objectives) is 1/σ times its scaled value. The
+      # normalizing products map the same way as the residual they scale,
+      # since |Q̃| = σDc|Q|Dc, |Ã| = Dr|A|Dc, |G̃| = De|G|Dc entrywise:
+      #   |Q||y| = |Q̃||ỹ|/(σDc),  |Gᵀ||w| = |G̃ᵀ||w̃|/(σDc),
+      #   |Aᵀ||v| = |Ãᵀ||ṽ|/(σDc),  |A||y| = |Ã||ỹ|/Dr,  |G||y| = |G̃||ỹ|/De.
       σs = scaling.σ; Dc = scaling.Dc; Dr = scaling.Dr; De = scaling.De
-      ny = norm(Dc .* z.y); nw = normsafe(De .* z.w)/σs; nv = normsafe(Dr .* z.v)/σs
-      rDu = norm(r0.y ./ Dc)/σs /
-            (1 + max(scaling.normc, scaling.Qmax*ny, scaling.Gmax*nw, scaling.Amax*nv))
+      nQy = _absprod_norm!(_nrm_n, absQ,  _absy, Dc, σs)
+      nGw = _absprod_norm!(_nrm_n, absGᵀ, _absw, Dc, σs)
+      nAv = _absprod_norm!(_nrm_n, absAᵀ, _absv, Dc, σs)
+      nAy = _absprod_norm!(_nrm_m, absA,  _absy, Dr)
+      nGy = _absprod_norm!(_nrm_p, absG,  _absy, De)
+      rDu = norm(r0.y ./ Dc)/σs / (1 + max(scaling.normc, nQy, nGw, nAv))
       rPr = normsafe(r0.v ./ Dr) /
-            (1 + max(scaling.normb, scaling.Amax*ny, normsafe(z.s ./ Dr)))
+            (1 + max(scaling.normb, nAy, normsafe(z.s ./ Dr)))
       rCp = normsafe(r0.s)/σs/(1+abs(cᵀy)/σs)
-      rEq = normsafe(r0.w ./ De) / (1 + max(scaling.normd, scaling.Gmax*ny))
-      rGap = abs(μbar)/(σs + abs(pobj))
+      rEq = normsafe(r0.w ./ De) / (1 + max(scaling.normd, nGy))
+      rGap = abs(μbar)/(σs + abs(pobj + σs*objective_offset))
     end
 
     # The retained "best" iterate is judged on feasibility and
@@ -1285,7 +1401,12 @@ function _conicIP(
     # one with a small gap.
     bestMeasure = max(rDu, rPr, rCp, rEq)
     optMeasure  = max(bestMeasure, rGap)
-    if bestMeasure < optBest
+    optimal     = optMeasure < optTol
+    # An iterate that passes the full test is stored unconditionally: the
+    # gap is not part of bestMeasure, so an earlier iterate with a smaller
+    # bestMeasure but a larger gap could otherwise be the one returned as
+    # :Optimal (it is sol, not z, that the exit below hands back).
+    if optimal || bestMeasure < optBest
       sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v; sol.s[:] = z.s
       sol.Iter = Iter; sol.Mu = μ;
       sol.duFeas = rDu; sol.prFeas = max(rPr, rEq); sol.muFeas = rCp
@@ -1302,8 +1423,6 @@ function _conicIP(
     #  validator in certificates.jl accepts the ray against the
     #  original problem data, and the claim returns immediately.
     # ────────────────────────────────────────────────────────────
-
-    optimal = optMeasure < optTol
 
     # Defined even when no screen runs (verbose row below reads them)
     p_infeas = NaN
@@ -1456,10 +1575,15 @@ function _conicIP(
     # Iterative refinement of a step Δz for the right-hand side r: at most
     # maxRefinementSteps corrections, each one more back-solve with the
     # same factorization, until ‖r − KΔz‖ ≤ refineAbsTol + refineRelTol‖r‖.
-    # The residual is re-evaluated after the last correction so that
-    # `rnorm` (relative, shown in red in the verbose row when large)
-    # describes the step actually taken. Returns false after stamping sol
-    # when a correction solve fails.
+    # The residual is evaluated after every correction, and a correction
+    # that does not reduce it is undone and ends the loop: refinement with
+    # an approximate factorization K̃ contracts only when ‖I − K̃⁻¹K‖ < 1,
+    # and a worsening step is the evidence that it does not. The step that
+    # leaves this function is therefore the best one seen, and `rnorm`
+    # (relative, shown in red in the verbose row when large) describes it.
+    # The tolerance is a target, not a guarantee: a step that still misses
+    # it is used as is. Returns false after stamping sol when a correction
+    # solve fails.
     function refine!(Δz, r, stage)
       nr   = norm(r)
       rtol = refineAbsTol + refineRelTol * nr
@@ -1474,9 +1598,15 @@ function _conicIP(
           nonfinite!("refinement direction", "refinement, $stage")
           return false
         end
+        copy4!(_Δz_keep, Δz)
         axpy4!(1.0, Δzr, Δz)
         k += 1
-        rres = step_residual!(Δz, r)
+        rnew = step_residual!(Δz, r)
+        if !(rnew < rres)               # also catches a NaN residual
+          copy4!(Δz, _Δz_keep)
+          break
+        end
+        rres = rnew
       end
       nref += k                         # iteration total, for the verbose row
       rnorm = rres / (1 + nr)
@@ -1641,10 +1771,12 @@ function _conicIP(
 
     # The auxiliary solves use their own iteration budget: the outer
     # maxIters is small in exactly the regime the fallback exists for.
-    if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0
+    # Each solve is gated on the deadline separately: the first can use
+    # up what is left of the budget, and the second must not then start.
+    if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0 && !over_time()
       ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
                                        maxIters = certFallbackIters,
-                                       timeLimit = time_left())
+                                       timeLimit = max(time_left(), 0.0))
       if ray !== nothing
         (fchk, fw̄, fv̄) = validate_infeasibility_certificate(
                             Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
@@ -1656,10 +1788,10 @@ function _conicIP(
       end
     end
 
-    if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0
+    if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0 && !over_time()
       ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
                                    maxIters = certFallbackIters,
-                                   timeLimit = time_left())
+                                   timeLimit = max(time_left(), 0.0))
       if ray !== nothing
         (fchk, fȳ) = validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, ray;

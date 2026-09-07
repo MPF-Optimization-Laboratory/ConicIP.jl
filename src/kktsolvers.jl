@@ -11,20 +11,56 @@ _structural_nnz(M::AbstractMatrix)       = count(!iszero, M)
 """
     dense_kkt_bytes(n, m, p)
 
-Upper bound on the dense storage [`kktsolver_qr`](@ref) holds at once:
-the n×n orthogonal factor and the n×p dense copy of `Gᵀ` at setup, the
-m×(n−p) `A*Q2` and the (n−p)² reduced Hessian, plus one more of each per
-iteration (`W` and `Lmat`). Float64 throughout.
+Routing estimate of the *persistent* dense arrays [`kktsolver_qr`](@ref)
+holds at once, used by [`choose_kktsolver`](@ref) to keep hopeless sizes
+off the dense path: the n×n orthogonal factor and the n×p dense copy of
+`Gᵀ` at setup, the m×(n−p) `A*Q2` and the (n−p)² reduced Hessian, plus
+one more of each per iteration (`W` and `Lmat`). Float64 throughout.
+
+This is not a peak-memory bound: LAPACK workspaces, the temporaries of
+`F.Q * I` and `Q2' * (Q * Q2)`, the Cholesky (or fallback QR) copy of
+the reduced Hessian, and any fill in the caller's own matrices are all
+excluded. Peak usage can be a small multiple of this figure.
 """
 dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
 
 """
-    dense_kkt_flops(n, m, p)
+    dense_kkt_flops(n, m, p; nnzA = 0, nnzQ = 0, iters = 25)
 
-Per-iteration flop estimate for [`kktsolver_qr`](@ref): forming the
-reduced Hessian `S22 + WᵀW` (`m(n−p)²`) plus its Cholesky (`(n−p)³/3`).
+Per-iteration flop estimate for [`kktsolver_qr`](@ref), comparable with
+the per-factorization estimate `Σⱼ nnz(L₍:,ⱼ₎)²` used for
+[`kktsolver_ldl`](@ref). With `r = n − p` it counts
+
+- per iteration: `W = F⁻ᵀ(AQ2)` (`2mr`), the reduced Hessian
+  `S22 + WᵀW` (`mr²`) and its Cholesky (`r³/3`), plus three solves
+  (predictor, corrector, one refinement) that each apply `Q1`, `Q1ᵀ`,
+  `Q2`, `Q2ᵀ` (`4np + 4nr`), the Cholesky and `R1` triangles (`2r² + 2p²`)
+  and two `Hmul` products (`2(nnzQ + 2nnzA)`);
+- setup, amortized over `iters` iterations: the Householder QR of `Gᵀ`
+  (`2np² − 2p³/3`), materializing the n×n `Q0 = F.Q * I` (`4n²p`),
+  `A*Q2` (`2·nnzA·r`) and `Q2' * (Q * Q2)` (`2·nnzQ·r + 2nr²`).
+
+The setup terms matter when equalities nearly determine the variables:
+at `p = n` the per-iteration terms vanish but the n×n QR and the dense
+`Q0` are still paid, so the old model (`mr² + r³/3` alone) reported zero
+cost and routed `n = m = p` problems to the dense solver.
+
+`nnzA` and `nnzQ` are structural nonzero counts; when omitted those
+terms are dropped, which only makes the estimate optimistic for the
+dense path.
 """
-dense_kkt_flops(n, m, p) = (r = max(n - p, 0); m*r^2 + r^3/3)
+function dense_kkt_flops(n, m, p; nnzA = 0, nnzQ = 0, iters = 25)
+  r = max(n - p, 0)
+  iters = max(iters, 1)
+  # Per iteration: NT-scaled constraint block, reduced Hessian, Cholesky.
+  per_iter = 2m*r + m*r^2 + r^3/3
+  # Per solve (nominally three per iteration): the orthogonal applies are
+  # dense n×p and n×r products, whatever the sparsity of the data.
+  per_solve = 4n*p + 4n*r + 2r^2 + 2p^2 + 2(nnzQ + 2nnzA)
+  # Setup, paid once: QR of Gᵀ, the dense Q0, A*Q2 and Q2'(Q Q2).
+  setup = (2n*p^2 - 2p^3/3) + 4n^2*p + 2nnzA*r + 2nnzQ*r + 2n*r^2
+  return per_iter + 3per_solve + setup/iters
+end
 
 # Per-iteration flop estimate for kktsolver_ldl from the symbolic
 # factorization: Σⱼ (column count of L)², the cost of the rank-1 updates.
@@ -45,7 +81,13 @@ chosen by:
 0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
    `dense_bytes_max` ⇒ [`kktsolver_ldl`](@ref), whatever the rules
    below would say — dense QR at that size is an out-of-memory error,
-   not a slow solve;
+   not a slow solve. If the problem also has a semidefinite cone an
+   `ArgumentError` is thrown instead: the sparse solver materializes
+   each k×k SDP scaling block as a dense k²×k² block, so it would trade
+   one huge allocation for another. Such problems currently need the
+   dense path; raise the budget explicitly with
+   `kktsolver = (Q, A, G, cd) -> choose_kktsolver(Q, A, G, cd; dense_bytes_max = …)(Q, A, G, cd)`
+   or pass `kktsolver = kktsolver_qr` directly;
 1. any SDP cone ⇒ [`kktsolver_qr`](@ref) — the dense double-QR method is
    the numerically robust choice for the dense SDP scaling blocks, and
    the sparse solver's SDP path is dense in `k(k+1)/2`;
@@ -71,17 +113,35 @@ function _choose_kktsolver(Q, A, G, cone_dims;
                            size_min = 200, dense_bytes_max = 4 * 2^30,
                            ldl_flop_weight = 10.0)
   n = size(Q,1); m = size(A,1); p = size(G,1)
-  if dense_kkt_bytes(n, m, p) > dense_bytes_max
+  has_sdp = any(cd -> isequal(cd[1], "S"), cone_dims)
+  bytes = dense_kkt_bytes(n, m, p)
+  if bytes > dense_bytes_max
+    if has_sdp
+      GiB = 2.0^30
+      throw(ArgumentError(
+        "choose_kktsolver: the dense KKT solver needs an estimated " *
+        "$(round(bytes / GiB; sigdigits = 3)) GiB of persistent storage " *
+        "(n = $n, m = $m, p = $p), above the dense_bytes_max budget of " *
+        "$(round(dense_bytes_max / GiB; sigdigits = 3)) GiB, and the problem " *
+        "has semidefinite cones, which the sparse LDLᵀ solver would " *
+        "materialize as dense k²×k² blocks (O(k⁴) memory per block). " *
+        "Semidefinite problems currently need the dense path: raise the " *
+        "budget with `kktsolver = (Q, A, G, cd) -> choose_kktsolver(Q, A, G, cd; " *
+        "dense_bytes_max = <bytes>)(Q, A, G, cd)`, or pass " *
+        "`kktsolver = kktsolver_qr` directly."))
+    end
     return (kktsolver_ldl, nothing)
   end
-  if any(cd[1] == "S" for cd in cone_dims)
+  if has_sdp
     return (kktsolver_qr, nothing)
   end
   if n + m + p < size_min
     return (kktsolver_qr, nothing)
   end
   pat = _ldl_pattern(Q, A, G, cone_dims)
-  if dense_kkt_flops(n, m, p) < ldl_flop_weight * _ldl_flops(pat)
+  flops_qr = dense_kkt_flops(n, m, p; nnzA = _structural_nnz(A),
+                             nnzQ = _structural_nnz(Q))
+  if flops_qr < ldl_flop_weight * _ldl_flops(pat)
     return (kktsolver_qr, nothing)
   end
   return (kktsolver_ldl, pat)

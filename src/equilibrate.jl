@@ -121,6 +121,63 @@ function equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
           Dc = Dc, Dr = Dr, De = De, σ = σ)
 end
 
+# Re-validate a certificate found on the equilibrated data against the
+# ORIGINAL data. Tolerance-based validity is not invariant under diagonal
+# scaling: a ray with residual 1e-8 on the scaled data can have residual
+# 1e-4 against the original (a column scaled by 1e-6 amplifies its share
+# of Gᵀw − Aᵀv by 1e6 relative to the normalization). The status
+# vocabulary mirrors the post-loop re-screen in `_conicIP`: a ray valid
+# at the nominal tolerance keeps its claim (and takes the validator's
+# normalization); one valid only at 100× reltol downgrades to
+# :AlmostInfeasible / :AlmostDualInfeasible; otherwise :Abandoned. In
+# both downgraded cases `has_certificate` is cleared and the ray is left
+# in place for inspection.
+function _revalidate_certificate!(sol::Solution, Q, c, A, b, cone_dims, G, d;
+                                  infeasTol::Float64 = 1e-7,
+                                  infeasAbsTol::Float64 = 1e-9)
+  sol.has_certificate || return sol
+  sol.status in (:Infeasible, :DualInfeasible) || return sol
+
+  relaxed = 100 * infeasTol
+  if sol.status == :Infeasible
+    (chk, w̄, v̄) = validate_infeasibility_certificate(
+                     Q, c, A, b, cone_dims, G, d, sol.w, sol.v;
+                     abstol = infeasAbsTol, reltol = infeasTol)
+    if chk.valid
+      sol.w[:] = w̄; sol.v[:] = v̄
+      return sol
+    end
+    (chk100, _, _) = validate_infeasibility_certificate(
+                       Q, c, A, b, cone_dims, G, d, sol.w, sol.v;
+                       abstol = infeasAbsTol, reltol = relaxed)
+    almost = :AlmostInfeasible
+  else
+    (chk, ȳ) = validate_unboundedness_certificate(
+                 Q, c, A, b, cone_dims, G, d, sol.y;
+                 abstol = infeasAbsTol, reltol = infeasTol)
+    if chk.valid
+      sol.y[:] = ȳ
+      sol.s .= A * ȳ
+      return sol
+    end
+    (chk100, _) = validate_unboundedness_certificate(
+                    Q, c, A, b, cone_dims, G, d, sol.y;
+                    abstol = infeasAbsTol, reltol = relaxed)
+    almost = :AlmostDualInfeasible
+  end
+
+  kind = sol.status == :Infeasible ? "infeasibility" : "unboundedness"
+  sol.has_certificate = false
+  sol.status = chk100.valid ? almost : :Abandoned
+  g3(x) = @sprintf("%.3g", x)
+  sol.message = "$kind certificate valid on the equilibrated data but not " *
+                "on the original data (residual $(g3(chk.farkas_residual)), " *
+                "cone margin $(g3(chk.cone_margin)) at infeasTol = $(g3(infeasTol))" *
+                (chk100.valid ? "; valid at $(g3(relaxed)))" :
+                                " and at $(g3(relaxed)))")
+  return sol
+end
+
 # Map a Solution of the scaled problem back to the original coordinates,
 # renormalize certificates, and recompute the reported residuals from
 # the original data.
@@ -156,13 +213,19 @@ function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d)
   if all(isfinite, y) && all(isfinite, v) && all(isfinite, s) && all(isfinite, w)
     Qy   = Q * y
     cᵀy  = dot(c, y)
-    Qmax = _maxabs(Q); Amax = _maxabs(A); Gmax = _maxabs(G)
-    ny = norm(y); nw = normsafe(w); nv = normsafe(v)
-    rDu  = norm(Qy + G' * w - A' * v - c) /
-           (1 + max(norm(c), Qmax*ny, Gmax*nw, Amax*nv))
+    # Same backward-error normalization as the termination test in
+    # _conicIP: the residual is relative to the right-hand side or to the
+    # componentwise products |Q||y|, |Gᵀ||w|, |Aᵀ||v|, |A||y|, |G||y|.
+    absQ = _absmat(Q); absA = _absmat(A); absG = _absmat(G)
+    ay = abs.(y); aw = abs.(w); av = abs.(v)
+    nQy = norm(absQ * ay)
+    nGw = isempty(w) ? 0.0 : norm(absG' * aw)
+    nAv = isempty(v) ? 0.0 : norm(absA' * av)
+    rDu  = norm(Qy + (G' * w - A' * v) - c) / (1 + max(norm(c), nQy, nGw, nAv))
     rPr  = isempty(b) ? 0.0 :
-           norm(A * y - s - b) / (1 + max(norm(b), Amax*ny, norm(s)))
-    rEq  = isempty(d) ? 0.0 : norm(G * y - d) / (1 + max(norm(d), Gmax*ny))
+           norm(A * y - s - b) / (1 + max(norm(b), norm(absA * ay), norm(s)))
+    rEq  = isempty(d) ? 0.0 :
+           norm(G * y - d) / (1 + max(norm(d), norm(absG * ay)))
     pobj = 0.5 * dot(y, Qy) - cᵀy
     dobj = pobj + dot(w, G * y - d) + dot(v, A * y - s - b) - dot(v, s)
     sol.duFeas = rDu

@@ -24,17 +24,25 @@ uses [Semantic Versioning](https://semver.org/).
   iterations like `kktsolver_sparse`.
 - Line search: the trial iterate is checked for strict interiority with
   the same quantities the NT scaling computes, backing the step off
-  geometrically if needed, so an accepted step can no longer fail the next
-  scaling. Three consecutive steps below 1e-8 end the loop as a stall
-  (`sol.message` says so) and hand over to the post-loop certificate
-  screens instead of spinning to `maxIters`.
-- Iterative refinement re-evaluates the step residual after the last
-  correction, so the reported residual describes the step taken, and the
-  predictor step is refined as well as the corrector.
+  geometrically if needed. The NT scaling is computed on normalized cone
+  vectors (SOC and SDP blocks; `√y/√x` for the orthant), so jointly
+  extreme magnitudes such as `z ~ 1e-150`, `s ~ 1e150` no longer overflow
+  it. A genuinely boundary iterate still ends as `:Error`. Three
+  consecutive steps below 1e-8 end the loop as a stall (`sol.message`
+  says so) and hand over to the post-loop certificate screens instead of
+  spinning to `maxIters`.
+- Iterative refinement (the main loop's, and `kktsolver_ldl`'s against the
+  unregularized matrix) evaluates the residual after every correction,
+  discards a correction that does not reduce it and stops, so the step
+  used is the best one seen and the reported residual describes it; the
+  tolerance is a target, not a guarantee. The predictor step is refined as
+  well as the corrector.
 - **Breaking (direct API):** the `refinementThreshold` keyword (an absolute
   bound on a size-scaled residual) is replaced by `refineRelTol = 1e-13`
   and `refineAbsTol = 1e-12`: refinement stops when
   `‖r − KΔz‖ ≤ refineAbsTol + refineRelTol·‖r‖`.
+- **Breaking (direct API):** a custom `kktsolver` now receives the
+  equilibrated (Ruiz-scaled) `Q`, `A`, `G` when `equilibrate = true`.
 - Termination also requires the relative duality gap
   `⟨v,s⟩/(1 + |pobj|) < optTol`; the complementarity residual alone is a
   2-norm whose enforced accuracy drifted with the number of cones. The gap
@@ -42,10 +50,27 @@ uses [Semantic Versioning](https://semver.org/).
   products floor the computed value once the duals are large.
   `Solution.prFeas` now includes the equality residual.
 - Feasibility residuals are normalized by the size of the equation they
-  measure (right-hand side or data norm times iterate norm, whichever is
-  larger) instead of the right-hand side alone. A homogeneous row
-  (`d = 0`) with a matrix of size 10⁸ was an absolute test that rounding
-  alone could never meet.
+  measure — the right-hand side, the slack, or the componentwise products
+  `‖|A||y|‖`, `‖|Q||y|‖`, `‖|Gᵀ||w|‖`, `‖|Aᵀ||v|‖`, whichever is largest —
+  instead of the right-hand side alone. A homogeneous row (`d = 0`) with a
+  matrix of size 10⁸ was an absolute test that rounding alone could never
+  meet. The products are componentwise (backward-error style) rather than
+  `‖A‖·‖y‖`, so a large iterate component in a column a row does not touch
+  cannot dilute that row's residual.
+- The relative gap test accepts an `objective_offset` keyword (the constant
+  part of the objective); `preprocess_conicIP` passes the constant carried
+  by fixed variables, so a reduced problem terminates by the same criterion
+  as the full one.
+- `MOI.TimeLimitSec` covers the whole `optimize!` call: the solver's budget
+  is what assembly left of it.
+- `choose_kktsolver` throws an `ArgumentError` for a semidefinite problem
+  whose dense storage estimate exceeds `dense_bytes_max`, instead of
+  falling through to `kktsolver_ldl`, whose dense SDP blocks are no
+  smaller. `dense_kkt_flops` now counts the dense solver's setup (QR of
+  `Gᵀ`, amortized) and per-solve work, so an equality-dominated problem
+  (`p ≈ n`) no longer scores zero dense flops and lands on dense QR.
+- The MOI `kktsolver` option accepts any callable, including
+  `cached_kktsolver_ldl()`.
 
 ### Added
 - `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
@@ -53,8 +78,10 @@ uses [Semantic Versioning](https://semver.org/).
   with AMD ordering analysed once, numeric refactorization in place each
   iteration, second-order cones of dimension ≥ 6 lifted to diagonal plus
   two columns, static and dynamic regularization with refinement against
-  the unregularized matrix. Dependent equality rows no longer need the
-  preprocessor. It is the new automatic choice for large non-SDP problems:
+  the unregularized matrix. On this route dependent equality rows no
+  longer need the preprocessor (`kktsolver_qr`, still auto-selected for
+  small and SDP problems, requires independent rows and `p ≤ n`). It is
+  the new automatic choice for large non-SDP problems:
   `choose_kktsolver` now decides between dense QR and LDLᵀ by predicted
   flops from a symbolic analysis instead of nonzeros per column, and
   `kktsolver_sparse` (UMFPACK LU) is no longer selected automatically.
@@ -65,8 +92,7 @@ uses [Semantic Versioning](https://semver.org/).
   is outside `[1e-3, 1e3]` (the iteration is not invariant to it, and on
   well-scaled problems it costs iterations). Termination is tested on
   residuals mapped back to the original coordinates, so `optTol` keeps
-  its meaning; the solution and rays are mapped back as well. A custom
-  `kktsolver` now receives the scaled data.
+  its meaning; the solution and rays are mapped back as well.
 - `timeLimit` keyword (seconds) and `MOI.TimeLimitSec`: checked once per
   iteration, covering preprocessing and retries; returns `:TimeLimit`
   (`MOI.TIME_LIMIT`) with the best iterate, and skips the certificate
@@ -92,11 +118,13 @@ uses [Semantic Versioning](https://semver.org/).
   (Maros–Mészáros `cvxqp1_s` failed in the bridge before).
 - MOI assembly builds the constraint matrices from triplets in one
   `sparse` call each (no per-constraint CSC object, no PSD row
-  reassignment), merges adjacent orthant blocks, looks constraint results
-  up in O(1), and computes `G*y` once; `SolveTimeSec` now covers assembly
+  reassignment), merges adjacent orthant blocks, makes constraint-index
+  lookup O(1), and computes `G*y` once; `SolveTimeSec` now covers assembly
   as well as the solve, with the assembly part in `Optimizer.assembly_time`.
-- `Solution.kkt_solves`: the number of KKT back-solves the main loop
-  performed (initial point, predictor, corrector, refinements).
+- `Solution.kkt_solves`: the number of calls the main loop made to the KKT
+  callback (initial point, predictor, corrector, outer refinements). Solves
+  a backend performs internally, such as `kktsolver_ldl`'s own refinement,
+  are not counted.
 - `benchmark/suite.jl`: reproducible harness with phase timings, solve
   counts, fill proxies, peak RSS in a fresh process, and residuals
   recomputed from the original data.
@@ -109,6 +137,36 @@ uses [Semantic Versioning](https://semver.org/).
 ### Fixed
 - The verbose "refine" column always printed 1; it now reports the number of
   refinement corrections applied in the previous iteration.
+- An `:Optimal` return now carries the iterate that passed the test. The
+  retained "best" iterate is chosen on feasibility and complementarity
+  without the gap, so a converged iterate could be returned as an earlier
+  one that failed the gap test.
+- A certificate found on the equilibrated data is revalidated against the
+  original data before it is claimed (tolerance-based validity is not
+  invariant under diagonal scaling; on a set of badly scaled infeasible
+  LPs about one ray in eight did not survive the mapping). A ray that fails
+  at the nominal tolerance is reported as `:AlmostInfeasible` /
+  `:AlmostDualInfeasible` (valid at 100×) or `:Abandoned`, with
+  `has_certificate = false` and a message; in that case the solution holds
+  the failed ray, not the best iterate.
+- `preprocess_conicIP`: two consistent singleton equality rows on the same
+  variable misaligned the dual postsolve (`Inf`/`NaN` duals); duplicate
+  rows now get a zero dual and the primary row's dual comes from column
+  stationarity.
+- Native quadratic objectives through MOI are checked for convexity
+  (`cholesky` of the sense-adjusted Hessian with a relative shift); a
+  nonconvex QP returns `MOI.INVALID_MODEL` instead of an `OPTIMAL`
+  stationary point. The direct API returns `:Error` when it observes
+  `yᵀQy < 0` at an iterate.
+- MOI `ConstraintPrimal` for cone rows is evaluated from `A*y − b` at the
+  returned point rather than from the slack, so at a non-converged iterate
+  it agrees with `VariablePrimal` and shows the actual violation.
+- `soc_uv` (the SOC lift in `kktsolver_ldl`) uses a thin QR of the
+  two-column span instead of `T^{±1/2}` with a rank-one collapse
+  threshold; an ill-conditioned but valid NT block had relative error up
+  to 1e-9 in the assembled KKT matrix, now 1e-16.
+- The post-loop certificate fallback checks the deadline before each of
+  its two auxiliary solves.
 
 ## [0.4.0] - 2026-09-06
 

@@ -95,7 +95,10 @@ function preprocess_conicIP(Q, c::AbstractVector,
   end
 
   n = length(c); m = size(A, 1); p = size(G, 1)
-  (; rows, cols, vals, conflict) = fx  # rows: singleton rows dropped, cols: fixed columns
+  # rows: every singleton row dropped (rowcols: its column; primary: the
+  # first row on that column, or a consistent duplicate); cols/vals: the
+  # distinct fixed columns and their values.
+  (; rows, rowcols, primary, cols, vals, conflict) = fx
 
   if conflict !== nothing
     # Two singleton rows i, k on column j with dᵢ/gᵢⱼ ≠ dₖ/gₖⱼ. The Farkas
@@ -132,16 +135,27 @@ function preprocess_conicIP(Q, c::AbstractVector,
   cr = (c - Qs * yfix)[keepc]
   br = b - As * yfix
   dr = (d - Gs * yfix)[keepr]
+  # The reduced objective omits the constant ½y_FᵀQ_FF y_F − c_Fᵀy_F of the
+  # fixed variables. It is passed through as `objective_offset` so that the
+  # reduced solve's relative gap test ⟨v,s⟩/(1 + |pobj|) is the full
+  # problem's, not one scaled by a possibly much smaller reduced objective.
+  # A caller-supplied offset (nested presolves) is added to it.
+  opts0  = (; options...)
+  offset = 0.5 * dot(yfix, Qs * yfix) - dot(c, yfix) + get(opts0, :objective_offset, 0.0)
   sol = _preprocess_core(Qs[keepc, keepc], cr, As[:, keepc], br, cone_dims,
                          Gs[keepr, keepc], dr;
-                         verbose = verbose, rank_check = rank_check, options...)
+                         verbose = verbose, rank_check = rank_check,
+                         objective_offset = offset,
+                         Base.structdiff(opts0, NamedTuple{(:objective_offset,)})...)
 
-  # Postsolve. The primal is the fixed value on F. The dual of a dropped
-  # singleton row i (variable j) comes from stationarity of column j:
+  # Postsolve. The primal is the fixed value on F. The dual of the primary
+  # singleton row i on variable j comes from stationarity of column j:
   #   (Qy)ⱼ + (Gᵀw)ⱼ − (Aᵀv)ⱼ = cⱼ  ⇒  gᵢⱼ wᵢ = cⱼ − (Qy)ⱼ + (Aᵀv)ⱼ − Σ_{k≠i} gₖⱼ wₖ.
-  # Rays: a primal ray has zero fixed components; a Farkas ray needs wᵢ
-  # chosen so that column j of Gᵀw − Aᵀv vanishes, which is the same
-  # formula with c and Qy dropped.
+  # A consistent duplicate singleton row on the same column gets wᵢ = 0 (the
+  # dual of a redundant row is free to be anything; zero keeps the primary
+  # row's stationarity formula exact). Rays: a primal ray has zero fixed
+  # components; a Farkas ray needs wᵢ chosen so that column j of Gᵀw − Aᵀv
+  # vanishes, which is the same formula with c and Qy dropped.
   y = fill(NaN, n); w = fill(NaN, p)
   if all(isfinite, sol.y)
     y[keepc] = sol.y
@@ -156,7 +170,9 @@ function preprocess_conicIP(Q, c::AbstractVector,
     ray = sol.status == :Infeasible && sol.has_certificate
     wk = zeros(p); wk[keepr] = sol.w
     rhs = ray ? (As' * sol.v) : (c - Qs * y + As' * sol.v)
-    for (i, j) in zip(rows, cols)
+    w[rows[.!primary]] .= 0.0                     # duplicates first: they enter `other` as 0
+    for (i, j, isprimary) in zip(rows, rowcols, primary)
+      isprimary || continue
       gij = Gs[i, j]
       other = dot(Gs[:, j], wk) - gij * wk[i]     # Σ_{k≠i} gₖⱼ wₖ (wk[i] = 0)
       w[i] = (rhs[j] - other) / gij
@@ -178,12 +194,17 @@ function preprocess_conicIP(Q, c::AbstractVector,
 end
 
 # Singleton equality rows: rows of G with exactly one structural nonzero.
-# Returns `nothing` when there are none, else the rows to drop, the
-# columns they fix (each once), the fixed values dᵢ/gᵢⱼ, and `conflict`:
-# `nothing`, or a pair of singleton rows on the same column whose fixed
-# values disagree beyond `tol` (relative), which makes the problem
-# infeasible. A second singleton on a column that agrees is simply
-# dropped as redundant.
+# Returns `nothing` when there are none, else a named tuple with
+#   rows, rowcols, primary — every dropped row, the column it fixes, and
+#                            whether it is the first (primary) row on that
+#                            column; a later consistent duplicate is
+#                            dropped as redundant (`primary = false`);
+#   cols, vals             — the distinct fixed columns and values dᵢ/gᵢⱼ,
+#                            in primary-row order (`cols == rowcols[primary]`);
+#   conflict               — `nothing`, or `(i, k, j)`: two singleton rows
+#                            on column j whose fixed values disagree beyond
+#                            `tol` (relative), which makes the problem
+#                            infeasible.
 function _singleton_fixings(G, d; tol = 1e-9)
   Gs = sparse(G)
   p = size(Gs, 1)
@@ -195,7 +216,8 @@ function _singleton_fixings(G, d; tol = 1e-9)
       cnt[rowsv[t]] += 1; lastcol[rowsv[t]] = j
     end
   end
-  rows = Int[]; cols = Int[]; vals = Float64[]
+  rows = Int[]; rowcols = Int[]; primary = Bool[]
+  cols = Int[]; vals = Float64[]
   fixrow = zeros(Int, size(Gs, 2))       # row that fixed each column
   fixval = zeros(size(Gs, 2))
   conflict = nothing
@@ -205,15 +227,17 @@ function _singleton_fixings(G, d; tol = 1e-9)
     v = d[i] / Gs[i, j]
     if fixrow[j] == 0
       fixrow[j] = i; fixval[j] = v
-      push!(rows, i); push!(cols, j); push!(vals, v)
+      push!(rows, i); push!(rowcols, j); push!(primary, true)
+      push!(cols, j); push!(vals, v)
     elseif abs(v - fixval[j]) <= tol * (1 + abs(fixval[j]))
-      push!(rows, i)                       # consistent duplicate: drop it
+      push!(rows, i); push!(rowcols, j); push!(primary, false)   # consistent duplicate
     elseif conflict === nothing
       conflict = (fixrow[j], i, j)
     end
   end
   isempty(rows) && return nothing
-  return (rows = rows, cols = cols, vals = vals, conflict = conflict)
+  return (rows = rows, rowcols = rowcols, primary = primary,
+          cols = cols, vals = vals, conflict = conflict)
 end
 
 function _preprocess_core(Q, c::AbstractVector,

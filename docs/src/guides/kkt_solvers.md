@@ -93,8 +93,13 @@ Regularization is static (`static_reg`, default `1e-8`, on the primal
 and equality blocks) plus QDLDL's dynamic pivot repair; each solve is
 refined against the *unregularized* matrix (`refine_steps`, `refine_tol`),
 so the perturbation acts as a preconditioner rather than a change of
-problem. `G` may have dependent rows: they are absorbed by `δ_e` and the
-refinement rather than requiring the preprocessor.
+problem. The refinement is bounded and keeps the best iterate: the
+residual is evaluated after every correction, a correction that does
+not reduce it is discarded and ends the loop, and `refine_tol` is a
+target rather than a guarantee. `G` may have dependent rows: they are
+absorbed by `δ_e` and the refinement rather than requiring the
+preprocessor (this holds for the LDLᵀ route only; `kktsolver_qr` still
+needs independent rows).
 
 ```julia
 sol = conicIP(Q, c, A, b, cone_dims; kktsolver = ConicIP.kktsolver_ldl)
@@ -228,9 +233,13 @@ What `conicIP` guarantees to a custom solver, and what it expects back:
   equilibration (dense stays dense, sparse stays sparse; `Q` is
   symmetric). Level 1 runs once per solve, before the initial point.
 - **Signs.** Level 3 solves exactly the system in the skeleton above:
-  `−Aᵀ` in the first block row and `+A`, `+FᵀF` in the third. A
-  symmetric formulation must negate the third row and `z` internally, as
-  `kktsolver_ldl` does.
+  `−Aᵀ` in the first block row and `+A`, `+FᵀF` in the third. A solver
+  that factors the symmetric quasi-definite form (third block row
+  negated: `−A`, `−FᵀF`) must negate the third *right-hand-side* block
+  before its back-solve and return the third *solution* block `c`
+  unnegated — the unknown is the same `c` in both forms. This is what
+  `kktsolver_ldl` does: `rhs[oz+1:oz+m] .= .-bz`, and `sol[oz+1:oz+m]`
+  is returned as is.
 - **Scaling blocks.** `F` is a `Block` whose elements are `Diagonal`
   (`"R"` cones, and *every* cone at the identity-scaled initial point),
   `SymWoodbury` (`"Q"`), or `VecCongurance` (`"S"`); `F⁻ᵀ` is its
@@ -246,12 +255,19 @@ What `conicIP` guarantees to a custom solver, and what it expects back:
   its step from them and updates it in place during refinement; a view
   into a buffer that the next call overwrites corrupts the step.
 - **Accuracy.** No tolerance is passed down. `conicIP` measures the 4×4
-  residual of every step and refines it against `refineAbsTol +
-  refineRelTol·‖r‖`, so a solver may regularize its factorization
-  (`kktsolver_ldl` does) as long as each solve is reasonably accurate
-  for the *unregularized* system; the refinement recovers the rest.
-  A solver that returns a poor solve every time will show as three
-  refinements per step in the verbose `refine` column and a red row.
+  residual of every step and refines it towards `refineAbsTol +
+  refineRelTol·‖r‖`: at most `maxRefinementSteps` corrections, each one
+  more level-3 call, with the residual re-evaluated after every
+  correction; a correction that does not reduce the residual is undone
+  and ends the refinement, so the step used is the best one seen and
+  never worse than the unrefined solve. The tolerance is a target, not
+  a guarantee — a step that still misses it is used as is, and the
+  solve is not aborted for it. A solver may therefore regularize its
+  factorization (`kktsolver_ldl` does) as long as each solve is
+  reasonably accurate for the *unregularized* system; the refinement
+  recovers the rest only while it contracts. A solver that returns a
+  poor solve every time shows as `maxRefinementSteps` refinements per
+  step in the verbose `refine` column and a red row.
 - **Failure.** Throw one of `ConicIP.KKT_FAILURES`
   (`SingularException`, `PosDefException`, `LAPACKException`,
   `ZeroPivotException`) from level 2 or level 3 to report a

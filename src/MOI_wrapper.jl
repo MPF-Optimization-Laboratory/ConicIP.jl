@@ -18,7 +18,8 @@ Settable as constructor keywords or through
   (default: `1e-7`)
 - `kktsolver` -- `"auto"` (default; picks by cone mix and predicted
   factorization cost via [`choose_kktsolver`](@ref)), `"ldl"`, `"qr"`,
-  `"sparse"`, `"2x2"`, or a solver function
+  `"sparse"`, `"2x2"`, or any callable solver object (a function or an
+  instance such as `cached_kktsolver_ldl()`)
 - `preprocess::Bool` -- remove redundant equality rows via
   [`preprocess_conicIP`](@ref) before solving (default: `true`)
 - `equilibrate::Bool` -- Ruiz-scale the data before solving (default: `true`)
@@ -33,7 +34,9 @@ Settable as constructor keywords or through
 Affine and convex quadratic (`ScalarQuadraticFunction`), both handled
 natively: a quadratic objective becomes the solver's `Q` rather than a
 second-order-cone reformulation, so positive semidefinite but singular
-Hessians are fine.
+Hessians are fine. A Hessian that is not positive semidefinite for the
+given sense (a nonconvex QP) is rejected before the solve with
+`TerminationStatus == INVALID_MODEL` and no result.
 
 # Supported Constraints
 - **Vector:** `Zeros`, `Nonnegatives`, `Nonpositives`, `SecondOrderCone`,
@@ -64,6 +67,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     ineq_is_psd::Vector{Bool}     # true for PSD constraints (√2 scaling)
     ineq_A::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # inequality constraint matrix
     ineq_b::Vector{Float64}                                # inequality constraint RHS
+    ineq_Ay::Vector{Float64}       # A*y of the returned point, computed once
     # Timing: solve_time is the whole optimize! (assembly included);
     # assembly_time is the part before the solver is called.
     solve_time::Float64
@@ -83,10 +87,12 @@ const _SUPPORTED_OPTIONS = (
     "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
 )
 
-# Map a kktsolver name to the solver constructor. Accepts the constructor
-# itself, or "auto" | "ldl" | "qr" | "sparse" | "2x2"/"pivot".
+# Map a kktsolver name to the solver constructor. Accepts the name
+# "auto" | "ldl" | "qr" | "sparse" | "2x2"/"pivot", or any callable solver
+# object — a function such as `kktsolver_ldl` or a callable struct such as
+# `cached_kktsolver_ldl()` — which is returned as is.
 function _resolve_kktsolver(v)
-    v isa Function && return v
+    v isa Union{AbstractString, Symbol} || return v
     s = lowercase(string(v))
     s == "auto"             && return default_kktsolver
     s == "ldl"              && return kktsolver_ldl
@@ -95,8 +101,32 @@ function _resolve_kktsolver(v)
     s in ("2x2", "pivot")   && return pivot(kktsolver_2x2)
     throw(ArgumentError(
         "unknown kktsolver \"$v\" (expected \"auto\", \"ldl\", \"qr\", " *
-        "\"sparse\", \"2x2\", or a solver function)"))
+        "\"sparse\", \"2x2\", or a callable solver object)"))
 end
+
+# Convexity guard for the objective: the solver assumes ½yᵀQy is convex,
+# so `Q` (already sign-adjusted for the sense) must be positive
+# semidefinite. A Cholesky attempt on Q + δI with δ tiny relative to the
+# entries accepts singular PSD Hessians (a diagonal with zeros, or the
+# Maros–Mészáros rank-deficient QPs) and rejects indefinite ones.
+function _is_psd(Q::SparseMatrixCSC{Float64, Int})
+    nnz(Q) == 0 && return true
+    δ = 1e-10 * (1 + maximum(abs, nonzeros(Q)))
+    F = cholesky(Symmetric(Q); shift = δ, check = false)
+    return issuccess(F)
+end
+
+const _NONCONVEX_MESSAGE =
+    "objective Hessian is not positive semidefinite for the given sense " *
+    "(nonconvex QP); ConicIP solves convex problems only"
+
+# A `Solution` standing in for a solve that was never run because the model
+# is outside the solver's class. `:InvalidModel` maps to
+# `MOI.INVALID_MODEL` with `ResultCount == 0`; the vectors are NaN so an
+# accidental read is visibly meaningless.
+_invalid_model_solution(n::Int, mA::Int, mG::Int, message::String) =
+    Solution(fill(NaN, n), fill(NaN, mG), fill(NaN, mA), fill(NaN, mA),
+             :InvalidModel, 0, NaN, NaN, NaN, NaN, NaN, NaN, false, message, 0)
 
 function Optimizer(; kwargs...)
     model = Optimizer(
@@ -104,7 +134,7 @@ function Optimizer(; kwargs...)
         Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Bool[],
         nothing, Float64[], Float64[],
         Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Float64[],
-        Bool[], Bool[], nothing, Float64[],
+        Bool[], Bool[], nothing, Float64[], Float64[],
         NaN, NaN,
         Dict{String, Any}(), false,
     )
@@ -187,6 +217,7 @@ function MOI.empty!(model::Optimizer)
     empty!(model.ineq_is_psd)
     model.ineq_A = nothing
     empty!(model.ineq_b)
+    empty!(model.ineq_Ay)
 end
 
 function MOI.is_empty(model::Optimizer)
@@ -527,13 +558,29 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                            ("preprocess", "kktsolver", "verbose", "rank_check",
                             "fix_singletons")
     kw = (; (Symbol(k) => v for (k, v) in dest.options if k ∉ skip)...)
+    # TimeLimitSec covers the whole optimize! call: the solver's budget is
+    # what assembly left of it (a non-positive budget makes the solver
+    # return :TimeLimit before its first iteration).
+    if haskey(kw, :timeLimit) && isfinite(kw.timeLimit)
+        kw = merge(kw, (; timeLimit = max(kw.timeLimit - dest.assembly_time, 0.0)))
+    end
     entry = do_preprocess ? preprocess_conicIP : conicIP
-    dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
-        verbose = verbose, kktsolver = solver, kw...)
+    if dest.Q_int !== nothing && !_is_psd(Q)
+        # Nonconvex objective: the solver would report a stationary point
+        # as optimal, so it is not called at all.
+        dest.sol = _invalid_model_solution(n, size(A, 1), size(G, 1), _NONCONVEX_MESSAGE)
+    else
+        dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
+            verbose = verbose, kktsolver = solver, kw...)
+    end
 
-    # Products needed by the result getters, formed once.
+    # Products needed by the result getters, formed once. The inequality
+    # product is used instead of the slack `sol.s` so that ConstraintPrimal
+    # is f(y) at the returned point even when A y − b ≠ s.
     y = dest.sol.y
-    dest.eq_Gy = (size(G, 1) > 0 && all(isfinite, y)) ? Vector(G * y) : fill(NaN, size(G, 1))
+    finite_y = all(isfinite, y)
+    dest.eq_Gy   = (size(G, 1) > 0 && finite_y) ? Vector(G * y) : fill(NaN, size(G, 1))
+    dest.ineq_Ay = (size(A, 1) > 0 && finite_y) ? Vector(A * y) : fill(NaN, size(A, 1))
     dest.solve_time = time() - t_start
 
     return index_map, false
@@ -576,6 +623,8 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
         return MOI.TIME_LIMIT
     elseif status == :Error
         return MOI.NUMERICAL_ERROR
+    elseif status == :InvalidModel
+        return MOI.INVALID_MODEL
     else
         return MOI.OTHER_ERROR
     end
@@ -668,20 +717,25 @@ end
 
 # ConstraintPrimal: return f(x) for constraint f(x) ∈ S
 #
-# Inequality constraints use sol.s (cone slack: s = A_int*y - b_int).
-#   Nonneg/SOC/PSD: f(x) = s           (sign=+1, offset=0)
-#   Nonpositive:    f(x) = -s          (sign=-1, offset=0)
-#   GreaterThan(L): f(x) = s + L       (sign=+1, offset=L)
-#   LessThan(U):    f(x) = U - s       (sign=-1, offset=U)
-# General formula: f(x) = sign * s + offset
+# Inequality rows are stored as A_int y ≥_K b_int with, per constraint,
+# r = A_int[rows,:] y − b_int[rows]:
+#   Nonneg/SOC/PSD: f(x) = r           (sign=+1, offset=0)
+#   Nonpositive:    f(x) = -r          (sign=-1, offset=0)
+#   GreaterThan(L): f(x) = r + L       (sign=+1, offset=L)
+#   LessThan(U):    f(x) = U - r       (sign=-1, offset=U)
+# General formula: f(x) = sign * r + offset.
+# `r` is evaluated from the cached product A_int y (`ineq_Ay`), not from
+# the cone slack `sol.s`: the two agree only at convergence (A y − s = b
+# is a residual the solver drives to zero), and reporting the slack would
+# hide the primal violation of a non-converged iterate.
 #
 # Equality constraints are approximately satisfied:
 #   Zeros:       f(x) ≈ 0    (offset=0)
 #   EqualTo(r):  f(x) ≈ r    (offset=r)
 #
 # On a primal ray (:DualInfeasible with certificate) the value is the *homogeneous*
-# part only: the constant terms (eq_d, ineq_offset) are dropped, since a ray is
-# a direction rather than a point.
+# part only: the constant terms (eq_d, ineq_b, ineq_offset) are dropped, since a
+# ray is a direction rather than a point (sol.s holds A_int ȳ there as well).
 function MOI.get(
     model::Optimizer,
     attr::MOI.ConstraintPrimal,
@@ -705,10 +759,13 @@ function MOI.get(
         rows = model.ineq_rows[i]
         sgn = model.ineq_sign[i]
         off = ray ? 0.0 : model.ineq_offset[i]
+        # r = A[rows,:]*y - b[rows]  (ray: A[rows,:]*ȳ)
         if model.ineq_is_scalar[i]
-            return sgn * model.sol.s[rows[1]] + off
+            r = ray ? model.ineq_Ay[rows[1]] : model.ineq_Ay[rows[1]] - model.ineq_b[rows[1]]
+            return sgn * r + off
         else
-            val = sgn .* model.sol.s[rows]
+            r = ray ? model.ineq_Ay[rows] : model.ineq_Ay[rows] - model.ineq_b[rows]
+            val = sgn .* r
             if model.ineq_is_psd[i]
                 return _psd_vecm_to_moi(val)
             end
@@ -720,11 +777,11 @@ end
 
 # ConstraintDual: return MOI dual for constraint f(x) ∈ S
 #
-# The solver's v ∈ K* satisfies: Qy - c_int + A_int'v + G'w = 0
-# For sets mapped with sign flip (Nonpositive, LessThan), the MOI dual
-# is negated relative to v. For MAX_SENSE, all duals are negated.
-# Formula: dual = sign * sense_sign * v  (ineq)
-#          dual = sense_sign * w         (eq)
+# The solver's v ∈ K* satisfies the stationarity condition written out
+# below; for sets mapped with a sign flip (Nonpositive, LessThan) the MOI
+# dual is negated relative to v. The formulas are sense-independent: the
+# objective sense is already folded into Q and c_int, and the conic dual
+# convention (dual ∈ S*) does not change with the sense.
 #
 # This is already correct on a dual ray (:Infeasible with certificate): the
 # Farkas ray lives in sol.w/sol.v with the same sign and PSD scaling

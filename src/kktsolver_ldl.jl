@@ -62,11 +62,23 @@ Decompose the square of a diagonal-plus-rank-one scaling `F = D + c·w·wᵀ`
 returning the vector `d² = diag(D)²` and the two vectors. Writing
 `w̃ = √c·w`, `FᵀF − D² = B M Bᵀ` with `B = [D w̃  w̃]` and
 `M = [0 1; 1 w̃ᵀw̃]`; `det M = −1`, so the rank-two term has exactly one
-positive and one negative eigenvalue, obtained from the 2×2 symmetric
-matrix `T^{1/2} M T^{1/2}`, `T = BᵀB`. For the NT scaling the negative
-part satisfies `vᵀv < β²` (its eigenvalues on the cone's two-dimensional
-subspace multiply to `β²`), which is what keeps the lifted system
-quasi-definite.
+positive and one negative eigenvalue when `B` has full column rank.
+
+The construction goes through a thin Householder QR `B = Qb R` (`Qb`
+k×2 with orthonormal columns, `R` 2×2 upper triangular), so that
+`B M Bᵀ = Qb (R M Rᵀ) Qbᵀ`. The 2×2 symmetric matrix `R M Rᵀ = V Λ Vᵀ`
+is eigendecomposed and `u = √λ₊·Qb V[:, +]`, `v = √(−λ₋)·Qb V[:, −]`.
+Because `Qb V` has orthonormal columns, `uᵀv = 0` to rounding. Nothing
+is inverted: when `Dw` and `w̃` are nearly (or exactly) parallel the
+second row of `R` is ~0 and the formula degrades gracefully to the
+rank-one term, with reconstruction error O(ε‖B‖²‖M‖) regardless of the
+conditioning of `B`. (The earlier route through `T = BᵀB` and `T^{±1/2}`
+squared the condition number and needed a scale-sensitive degeneracy
+branch that could discard part of the rank-two term.)
+
+For the NT scaling the negative part satisfies `vᵀv < β²` (its
+eigenvalues on the cone's two-dimensional subspace multiply to `β²`),
+which is what keeps the lifted system quasi-definite.
 """
 function soc_uv(Blk::SymWoodbury)
   dvec = Blk.A.diag
@@ -77,33 +89,18 @@ function soc_uv(Blk::SymWoodbury)
   u    = zeros(k); v = zeros(k)
   ww   = dot(w, w)
   ww == 0 && return (d², u, v)
-  Dw   = dvec .* w
-  # T = BᵀB for B = [Dw w]
-  t11 = dot(Dw, Dw); t12 = dot(Dw, w); t22 = ww
-  T   = Symmetric([t11 t12; t12 t22])
-  ET  = eigen(T)
-  if ET.values[1] <= 1e-14 * ET.values[2]
-    # Dw ∥ w: the rank-two term collapses to (2α + ww)·wwᵀ with α = Dwᵀw/wᵀw
-    γ = 2 * t12 / ww + ww
-    if γ >= 0
-      u .= sqrt(γ) .* w
-    else
-      v .= sqrt(-γ) .* w
-    end
-    return (d², u, v)
-  end
-  Vt  = ET.vectors
-  Th  = Vt * Diagonal(sqrt.(ET.values)) * Vt'        # T^{1/2}
-  Tih = Vt * Diagonal(1 ./ sqrt.(ET.values)) * Vt'   # T^{-1/2}
-  M   = [0.0 1.0; 1.0 ww]
-  EC  = eigen(Symmetric(Th * M * Th))                 # λ₋ < 0 < λ₊
-  P   = Tih * EC.vectors                              # B*P has orthonormal columns
-  λ₋  = EC.values[1]; λ₊ = EC.values[2]
-  su  = sqrt(max(λ₊, 0.0)); sv = sqrt(max(-λ₋, 0.0))
-  @inbounds for i in 1:k
-    u[i] = su * (Dw[i] * P[1, 2] + w[i] * P[2, 2])
-    v[i] = sv * (Dw[i] * P[1, 1] + w[i] * P[2, 1])
-  end
+  B    = [dvec .* w  w]                              # k×2, columns Dw and w
+  QRB  = qr(B)
+  Qb   = Matrix(QRB.Q)                                # thin k×min(k,2)
+  R    = QRB.R
+  M    = [0.0 1.0; 1.0 ww]
+  E    = eigen(Symmetric(R * M * R'))                 # ascending: λ₋ ≤ λ₊
+  λ₋   = E.values[1]; λ₊ = E.values[end]
+  # det(R M Rᵀ) = −det(R)² ≤ 0, so the exact eigenvalues have opposite
+  # signs (or one is zero); clamp what rounding may push across zero.
+  su   = sqrt(max(λ₊, 0.0)); sv = sqrt(max(-λ₋, 0.0))
+  su > 0 && mul!(u, Qb, E.vectors[:, end], su, 0.0)
+  sv > 0 && mul!(v, Qb, E.vectors[:, 1],   sv, 0.0)
   return (d², u, v)
 end
 
@@ -171,8 +168,12 @@ magnitude is below `dynamic_eps` by `±dynamic_delta`. Each solve is then
 refined against the *unregularized* matrix (`δ = 0`) for up to
 `refine_steps` corrections or until the residual is below
 `refine_tol · (1 + ‖rhs‖)`, so the perturbation acts as a
-preconditioner rather than a change of problem. `conicIP`'s own
-refinement against the 4×4 system runs on top of this.
+preconditioner rather than a change of problem. The residual is
+evaluated after every correction; a correction that does not reduce it
+is discarded and ends the refinement, so the returned solution is the
+best one seen and never worse than the unrefined solve. The tolerance
+is a target, not a guarantee. `conicIP`'s own refinement against the
+4×4 system runs on top of this.
 
 No rank assumption on `G`: dependent equality rows are handled by
 `δ_e` and the refinement. Semidefinite blocks are supported through a
@@ -211,7 +212,18 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   shift[oz+1:oz+m] .= -δc
 
   rhs  = zeros(N); sol = zeros(N); res = zeros(N); tmp = zeros(N)
+  cand = zeros(N)
   vbuf = Float64[]
+
+  # res = rhs − K₀ x for the unregularized K₀ = K_δ − Diagonal(shift);
+  # returns ‖res‖.
+  function residual!(x)
+    _symmul!(res, K, x)
+    @inbounds for i in 1:N
+      res[i] = rhs[i] - (res[i] - shift[i] * x[i])
+    end
+    return norm(res)
+  end
 
   function solve3x3gen(F::Block, F⁻ᵀ)
 
@@ -259,17 +271,25 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       rhs[oa+1:N] .= 0.0
       sol .= rhs
       solve!(Fact, sol)
-      # Refinement against the unregularized matrix K₀ = K_δ − Diagonal(shift)
-      nrhs = norm(rhs)
-      for _ in 1:refine_steps
-        _symmul!(res, K, sol)
-        @inbounds for i in 1:N
-          res[i] = rhs[i] - (res[i] - shift[i] * sol[i])
+      # Refinement against the unregularized matrix K₀. Each candidate
+      # sol + K_δ⁻¹ res is evaluated before it is accepted: refinement
+      # contracts only when ‖I − K_δ⁻¹K₀‖ < 1, and a correction that
+      # increases the residual is the evidence that it does not, so it is
+      # discarded and the loop ends with the best iterate seen. At most
+      # refine_steps + 1 residual evaluations.
+      if refine_steps > 0
+        rtol  = refine_tol * (1 + norm(rhs))
+        rbest = residual!(sol)
+        for _ in 1:refine_steps
+          rbest <= rtol && break
+          tmp .= res
+          solve!(Fact, tmp)
+          cand .= sol .+ tmp
+          rcand = residual!(cand)
+          rcand < rbest || break
+          sol .= cand
+          rbest = rcand
         end
-        norm(res) <= refine_tol * (1 + nrhs) && break
-        tmp .= res
-        solve!(Fact, tmp)
-        sol .+= tmp
       end
       return (sol[1:n], sol[n+1:n+p], sol[oz+1:oz+m])
     end

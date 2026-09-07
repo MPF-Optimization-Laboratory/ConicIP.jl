@@ -397,6 +397,21 @@ The CBLIB gains come from the front end (triplet assembly, no rank detection bef
 an LDLᵀ solve), the Maros–Mészáros iteration drops from the native quadratic objective
 replacing the SOC epigraph. Issue #10 now stands at 1.2× ECOS.
 
+**Independent review of Tranches 0–2 (2026-09-07), fixes landed the same day:** the
+`Xmax·‖iterate‖` residual normalization could certify an infeasible QP as `:Optimal`
+(now componentwise `‖|A||y|‖` etc.); `:Optimal` could return an earlier saved iterate;
+certificates found on scaled data were not revalidated on the original data (one in
+eight failed on badly scaled infeasible LPs); duplicate singleton rows broke the dual
+postsolve; the presolve dropped the fixed variables' objective constant from the gap
+criterion; `soc_uv`'s degeneracy threshold was scale-sensitive; nonconvex quadratic
+objectives through MOI returned `OPTIMAL`; inequality `ConstraintPrimal` read the slack;
+refinement kept worsening corrections; the dense flop model scored `p = n` as free; an
+over-budget SDP fell through to LDLᵀ; `nestod_soc` overflowed on jointly extreme scales;
+assembly time was not deducted from `TimeLimitSec`. Cleared by the review: LDLᵀ signs
+and pivot-sign vector, fixed pattern, `unequilibrate!` maps, MOI dual signs, lifted
+columns in the flop count. Still open from the review: peak-memory estimate for the
+dense path (the 4 GiB figure is a routing estimate, not a bound).
+
 1. MOI assembly directly into the global `A` and `G` by triplet accumulation (one
    `sparse(I, J, V, m, n)` per matrix, not per constraint object); merge compatible
    orthant blocks; PSD input scaling as a diagonal multiply; result lookup through

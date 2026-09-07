@@ -132,16 +132,24 @@ const INSTANCES = Instance[
 #  Measurements
 # ──────────────────────────────────────────────────────────────
 
-# Residuals of a direct-API solution against the original data, all
-# relative, plus the cone-membership margin of the slack (≥ 0 is inside).
+# Residuals of a direct-API solution against the original data, with the
+# solver's own normalization (relative to the right-hand side or to the
+# componentwise products |Q||y|, |Gᵀ||w|, |Aᵀ||v|, |A||y|, |G||y|, whichever
+# is larger), plus the cone-membership margin of the slack (≥ 0 is inside).
 function residuals(prob, sol)
     Q, c, A, b, G, d = prob.Q, prob.c, prob.A, prob.b, prob.G, prob.d
     y, w, v, s = sol.y, sol.w, sol.v, sol.s
     all(isfinite, y) || return (rDu = NaN, rPr = NaN, rEq = NaN, gap = NaN, margin = NaN)
     Qy   = Q*y
-    rDu  = norm(Qy + G'*w - A'*v - c) / (1 + norm(c))
-    rPr  = isempty(b) ? 0.0 : norm(A*y - s - b) / (1 + norm(b))
-    rEq  = isempty(d) ? 0.0 : norm(G*y - d) / (1 + norm(d))
+    absQ = ConicIP._absmat(Q); absA = ConicIP._absmat(A); absG = ConicIP._absmat(G)
+    ay = abs.(y); aw = abs.(w); av = abs.(v)
+    nQy = norm(absQ*ay)
+    nGw = isempty(w) ? 0.0 : norm(absG'*aw)
+    nAv = isempty(v) ? 0.0 : norm(absA'*av)
+    rDu  = norm(Qy + G'*w - A'*v - c) / (1 + max(norm(c), nQy, nGw, nAv))
+    rPr  = isempty(b) ? 0.0 :
+           norm(A*y - s - b) / (1 + max(norm(b), norm(absA*ay), norm(s)))
+    rEq  = isempty(d) ? 0.0 : norm(G*y - d) / (1 + max(norm(d), norm(absG*ay)))
     # Lagrangian ½yᵀQy − cᵀy + wᵀ(Gy − d) − vᵀ(Ay − b): the dual objective at
     # stationarity is −½yᵀQy + bᵀv − dᵀw.
     pobj = 0.5*dot(y, Qy) - dot(c, y)
