@@ -246,9 +246,31 @@ tolerances; Ruiz equilibration with cone-uniform row scaling, an objective resca
 outside `[1e-3, 1e3]`, and termination on original-coordinate residuals; relative gap
 test and `prFeas` including equalities; `timeLimit` / `MOI.TimeLimitSec`; verified
 interiority with geometric back-off and stall detection in the line search; and the
-callback contract in the KKT-solver guide. Not done from the verification list: the
-n = 10⁵–10⁶ synthetic families and the issue-#10 timing have not been run through the
-harness yet.
+callback contract in the KKT-solver guide.
+
+**Measured 2026-09-07** (`benchmark/suite.jl`, full set, Apple M3 Pro, one Julia
+thread, six BLAS threads; each instance in a fresh process, so RSS includes about
+1.3 GB of compilation):
+
+| instance | n | iterations | KKT solves | time | peak RSS |
+|---|---|---|---|---|---|
+| lp-band | 2 000 | 19 | 42 | 0.04 s | 1.4 GB |
+| lp-band | 20 000 | 21 | 57 | 0.63 s | 1.8 GB |
+| lp-band | 200 000 | 23 | 66 | 5.7 s | 3.2 GB |
+| qp-band | 200 000 | 9 | 17 | 1.6 s | 2.4 GB |
+| sum-of-norms SOCP | 6 500 | 12 | 23 | 2.1 s | 1.7 GB |
+| issue #10 | 6 010 | 25 | 91 | 0.34 s | 1.4 GB |
+| chainsing-1000-1 (CBLIB) | 12 976 | 11 | 21 | 0.88 s | 2.0 GB |
+| nb, nql30, qssp30, sched_50_50_scaled (CBLIB) | 2 383–7 565 | 16–32 | 55–97 | 0.36–2.0 s | ≤ 1.9 GB |
+| Maros–Mészáros hs21…qpcblend (7 of 8) | 3–326 | 10–32 | 23–75 | ≤ 0.03 s | |
+
+Every solved instance reports original-coordinate residuals and relative gap below
+`1e-6`. Memory grows linearly across each banded family (about 1.9 GB above baseline
+at n = 200 000 with 1.4 M nonzeros in A). Issue #10 went from 0.78 s / 29 iterations
+to 0.34 s / 25, exactly 2× ECOS's 0.17 s / 23. The one failure, `cvxqp1_s`, is not the
+solver's: its Hessian is positive semidefinite but singular, and MOI's
+quadratic-to-SOC bridge refuses it, which is the native-QP item in Tranche 2. The
+n = 10⁶ point of the verification list has not been run.
 Measured so far: LDLᵀ is 5–25× faster than UMFPACK LU on banded LP/QP and large
 single SOCs at equal iteration counts, and 1.7× *slower* on the sum-of-norms SOCP at
 n = 6500 where fill is heavy (QDLDL is scalar code, UMFPACK's kernels are BLAS). The
