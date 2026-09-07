@@ -2517,4 +2517,6 @@ end
 
     include("sdp_tests.jl")
 
+    include("sdplib_tests.jl")
+
 end
