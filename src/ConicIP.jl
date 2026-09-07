@@ -450,8 +450,8 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 - `w::Vector{Float64}` -- dual variables for equality constraints (Gy = d)
 - `v::Vector{Float64}` -- dual variables for inequality constraints (Ay ≥_K b)
 - `s::Vector{Float64}` -- cone slack variables (Ay - s = b, s ∈ K)
-- `status::Symbol` -- `:Optimal`, `:Infeasible`, `:Unbounded`,
-  `:AlmostInfeasible`, `:AlmostUnbounded`, `:Abandoned`, or `:Error`
+- `status::Symbol` -- `:Optimal`, `:Infeasible`, `:DualInfeasible`,
+  `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:Abandoned`, or `:Error`
 - `Iter::Integer` -- number of interior-point iterations
 - `Mu::Real` -- final complementarity gap parameter
 - `prFeas::Real` -- primal feasibility residual
@@ -468,9 +468,9 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 |:--|:--|:--|:--|:--|:--|:--|
 | `:Optimal` | solution | dual (eq) | dual (ineq), ∈ K | slack, ∈ K | real | `false` |
 | `:Infeasible` *with ray* | all `NaN` | ray `w̄` | ray `v̄` ∈ K | all `NaN` | `NaN` | `true` |
-| `:Unbounded` *with ray* | ray `ȳ` | all `NaN` | all `NaN` | `A*ȳ` | `NaN` | `true` |
-| `:Infeasible`/`:Unbounded` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
-| `:Abandoned`, `:AlmostInfeasible`, `:AlmostUnbounded`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
+| `:DualInfeasible` *with ray* | ray `ȳ` | all `NaN` | all `NaN` | `A*ȳ` | `NaN` | `true` |
+| `:Infeasible`/`:DualInfeasible` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
+| `:Abandoned`, `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
 
 The infeasibility ray is normalized so that `dᵀw̄ - bᵀv̄ = -1` with
 `Gᵀw̄ - Aᵀv̄ ≈ 0`; the unboundedness ray is normalized so that `cᵀȳ = +1`
@@ -478,8 +478,12 @@ with `Qȳ ≈ 0`, `Gȳ ≈ 0` and `Aȳ ∈ K`. See
 [`validate_infeasibility_certificate`](@ref) and
 [`validate_unboundedness_certificate`](@ref).
 
-A 12-argument constructor is provided which defaults `has_certificate` to
-`false`.
+`kkt_solves` counts the KKT back-solves the main loop performed (initial
+point, predictor, corrector, and refinement corrections); solves made by
+the certificate-fallback auxiliary problems are not included.
+
+Constructors with 12, 13, or 14 positional arguments default the trailing
+fields to `has_certificate = false`, `message = ""`, `kkt_solves = 0`.
 """
 mutable struct Solution
 
@@ -498,14 +502,17 @@ mutable struct Solution
   has_certificate :: Bool  # y/w/v carry a verified ray
   message :: String        # diagnostic detail (e.g. the factorization
                            # failure behind an :Error status); "" otherwise
+  kkt_solves :: Int        # KKT back-solves performed by the main loop
 
 end
 
-# 12/13-argument constructors: no certificate / no message by default
+# 12/13/14-argument constructors: no certificate / no message / no count
 Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj) =
-  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false, "")
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false, "", 0)
 Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate) =
-  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, "")
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, "", 0)
+Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, message) =
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, message, 0)
 
 # Overwrite sol with a *verified* infeasibility ray (dᵀw̄ - bᵀv̄ = -1).
 # The primal iterate is discarded: it means nothing on an empty feasible set.
@@ -520,11 +527,11 @@ end
 
 # Overwrite sol with a *verified* recession ray (cᵀȳ = +1). The duals are
 # discarded: they mean nothing when the dual is infeasible.
-function claim_unbounded!(sol::Solution, ȳ, A)
+function claim_dual_infeasible!(sol::Solution, ȳ, A)
   sol.y[:] = ȳ; sol.s[:] = A*ȳ
   fill!(sol.w, NaN); fill!(sol.v, NaN)
   sol.pobj = NaN; sol.dobj = NaN
-  sol.status = :Unbounded
+  sol.status = :DualInfeasible
   sol.has_certificate = true
   return sol
 end
@@ -610,9 +617,9 @@ scaled by `√2`, so that `dot(vecm(X), vecm(Y)) == tr(X*Y)`. See
 Returns a [`Solution`](@ref) whose `status` is one of
 
 - `:Optimal` — `max(rDu, rPr, rCp, rEq) < optTol`.
-- `:Infeasible` / `:Unbounded` — a ray passed a screen *and* was accepted
+- `:Infeasible` / `:DualInfeasible` — a ray passed a screen *and* was accepted
   by the corresponding validator; `has_certificate` is then `true`.
-- `:AlmostInfeasible` / `:AlmostUnbounded` — set only at loop exhaustion,
+- `:AlmostInfeasible` / `:AlmostDualInfeasible` — set only at loop exhaustion,
   when the best iterate carries a ray that validates at `100*infeasTol`
   but not at `infeasTol`. The best iterate is retained.
 - `:Abandoned` — iteration limit reached with no verdict.
@@ -635,7 +642,7 @@ Structurally degenerate inputs are handled exactly before any
 factorization: an all-zero row of `G` is deflated (`dᵢ = 0`) or answered
 with a certified `:Infeasible` (`dᵢ ≠ 0`), and a variable absent from
 `Q`, `A`, and `G` is deflated (`cⱼ = 0`) or answered with a certified
-`:Unbounded` (`cⱼ ≠ 0`).
+`:DualInfeasible` (`cⱼ ≠ 0`).
 
 Selected keyword arguments:
 
@@ -751,6 +758,9 @@ function conicIP(
   _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
 
+  # KKT back-solve counter, reported as Solution.kkt_solves
+  _nsolve = Ref(0)
+
   # Pre-allocated Block for inv(F)' — reused each iteration
   F⁻ᵀ_cache = Block(size(block_sizes, 1))
 
@@ -810,7 +820,7 @@ function conicIP(
       end
       sol0 = Solution(zeros(n), fill(NaN,p), fill(NaN,m), zeros(m),
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
-      return claim_unbounded!(sol0, ȳ, A)
+      return claim_dual_infeasible!(sol0, ȳ, A)
     end
   end
 
@@ -830,15 +840,16 @@ function conicIP(
     # meaningful for the returned status (see the Solution field table);
     # blocks the convention leaves NaN stay all-NaN.
     best_iter = solr.status in (:Optimal, :Abandoned, :AlmostInfeasible,
-                                :AlmostUnbounded, :Error, :None)
+                                :AlmostDualInfeasible, :Error, :None)
     w_ok = best_iter || (solr.status == :Infeasible && solr.has_certificate)
-    y_ok = best_iter || (solr.status == :Unbounded && solr.has_certificate)
+    y_ok = best_iter || (solr.status == :DualInfeasible && solr.has_certificate)
     w = fill(NaN, p); y = fill(NaN, n)
     if w_ok; fill!(w, 0.0); w[keep_r] = solr.w; end
     if y_ok; fill!(y, 0.0); y[keep_c] = solr.y; end
     return Solution(y, w, solr.v, solr.s, solr.status, solr.Iter, solr.Mu,
                     solr.prFeas, solr.duFeas, solr.muFeas, solr.pobj,
-                    solr.dobj, solr.has_certificate, solr.message)
+                    solr.dobj, solr.has_certificate, solr.message,
+                    solr.kkt_solves)
   end
 
   # Number to scale (z's) by
@@ -955,7 +966,8 @@ function conicIP(
 
   # :Error status carrying no iterate (nothing has been computed yet).
   errsol(msg) = Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                         :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false, msg)
+                         :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false, msg,
+                         _nsolve[])
 
   if verbose && kktsolver === default_kktsolver
     chosen = choose_kktsolver(Qᵣ, A, G, cone_dims)
@@ -987,6 +999,7 @@ function conicIP(
 
     function solve4x4(r)
 
+      _nsolve[] += 1
       cone_div!(_div_buf, r.s, λ)
       t1 = F'*_div_buf
       (Δy, Δw, Δv)  = solve3x3(r.y, r.w, r.v + t1)
@@ -1044,8 +1057,9 @@ function conicIP(
   # ────────────────────────────────────────────────────────────
 
   sol     = Solution(copy(z.y), copy(z.w), copy(z.v), copy(z.s), :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
+  sol.kkt_solves = _nsolve[]
   optBest = Inf
-  rStep   = 0
+  nref    = 0      # refinement corrections applied in the previous iteration
   rnorm   = 0
   μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
 
@@ -1066,6 +1080,7 @@ function conicIP(
       err isa KKT_FAILURES || rethrow()
       sol.status = :Error
       sol.message = kkt_error(stage, err)
+      sol.kkt_solves = _nsolve[]
       return nothing
     end
   end
@@ -1075,11 +1090,16 @@ function conicIP(
   function nonfinite!(what, stage)
     sol.status = :Error
     sol.message = "non-finite $what ($stage)"
+    sol.kkt_solves = _nsolve[]
     if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
     return sol
   end
 
   for Iter = 1:maxIters
+
+    # Every solve of the previous iteration is accounted for here; the
+    # termination returns below happen before this iteration's first solve.
+    sol.kkt_solves = _nsolve[]
 
     # Nesterov-Todd scaling matrix. nestod_sdc factors both cone iterates,
     # so a boundary iterate surfaces here as a PosDefException.
@@ -1096,15 +1116,15 @@ function conicIP(
     all(isfinite, λ) ||
       return nonfinite!("NT scaling", "NT scaling, iteration $Iter")
 
-    solve = try
-      solve4x4gen(λ,F,F⁻ᵀ)         # Caches 4x4 solver
-                                   # (used a few times, at least 2)
-    catch err
-      err isa KKT_FAILURES || rethrow()
-      sol.status = :Error
-      sol.message = kkt_error("factorization, iteration $Iter", err)
-      return sol
-    end
+    # The KKT factorization is deferred until after the termination and
+    # certificate checks below: a converged iterate never pays for it, and
+    # a factorization that would fail on it cannot mask the convergence.
+
+    # Products of the iterate with the data, each formed once per
+    # iteration and shared by the residuals, the objective, and the
+    # infeasibility screens.
+    Qy   = Q*z.y
+    Gᵀw_Aᵀv = Gᵀ*z.w - Aᵀ*z.v
 
     #         ┌                   ┐ ┌     ┐
     # rleft = │ Q   G'   -A'      │ │ z.y │
@@ -1113,10 +1133,10 @@ function conicIP(
     #         │           S     V │ │ z.s │
     #         └                   ┘ └     ┘
     cone_prod!(_prod_buf1, λ, λ)
-    rleft = v4x1( Q*z.y + Gᵀ*z.w - Aᵀ*z.v ,
-                  G*z.y                   ,
-                  A*z.y - z.s             ,
-                  _prod_buf1              )
+    rleft = v4x1( Qy + Gᵀw_Aᵀv ,
+                  G*z.y        ,
+                  A*z.y - z.s  ,
+                  _prod_buf1   )
 
     # True Residual of nonlinear KKT System
     r0 = v4x1(rleft.y - c, rleft.w - d, rleft.v - b, rleft.s);
@@ -1136,7 +1156,7 @@ function conicIP(
     rCp = normsafe(r0.s)/(1+abs(cᵀy));
     rEq = normsafe(r0.w)/(1+normdsafe)   # Gy - d
 
-    pobj = 0.5*dot(z.y, Q*z.y) - dot(c, z.y)
+    pobj = 0.5*dot(z.y, Qy) - dot(c, z.y)
     dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
 
     if max(rDu, rPr, rCp, rEq) < optBest
@@ -1189,7 +1209,7 @@ function conicIP(
       #  the ray to dᵀw̄ - bᵀv̄ = -1.
       dᵀw_bᵀv = dot(d,z.w) - dot(b,z.v)
 
-      p_infeas_unscaled = norm(Gᵀ*z.w - Aᵀ*z.v)
+      p_infeas_unscaled = norm(Gᵀw_Aᵀv)
       p_infeas_cvx  = dᵀw_bᵀv < 0 ? p_infeas_unscaled/(normsafe(z.w) + normsafe(z.v)) : NaN
       p_infeas_ecos = dᵀw_bᵀv < 0 ? p_infeas_unscaled/(max(1,normc)*abs(dᵀw_bᵀv)) : NaN
       p_infeas = max(p_infeas_cvx, p_infeas_ecos)
@@ -1222,9 +1242,9 @@ function conicIP(
       #
       #  Again a nomination only: validate_unboundedness_certificate
       #  makes the claim and normalizes the ray to cᵀȳ = +1.
-      d_infeas1 = isempty(A) ? -Inf : norm(A*z.y - z.s)
-      d_infeas2 = isempty(G) ? -Inf : norm(G*z.y)
-      d_infeas3 = all(isfinite.(z.y)) ? norm(Q*z.y) : NaN
+      d_infeas1 = isempty(A) ? -Inf : norm(rleft.v)     # ‖Ay − s‖
+      d_infeas2 = isempty(G) ? -Inf : norm(rleft.w)     # ‖Gy‖
+      d_infeas3 = all(isfinite, z.y) ? norm(Qy) : NaN
 
       d_infeas_cvx  = cᵀy > 0 ? max(d_infeas1/max(1,normb), d_infeas2/max(1,normd), d_infeas3/max(1,normc))/abs(cᵀy) : NaN
       d_infeas_ecos = cᵀy > 0 ? max(d_infeas1, d_infeas2, d_infeas3)/norm(z.y) : NaN
@@ -1234,7 +1254,7 @@ function conicIP(
         (dchk, ȳ) = validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, z.y;
                        abstol = infeasAbsTol, reltol = infeasTol)
-        if dchk.valid; claim = :Unbounded; end
+        if dchk.valid; claim = :DualInfeasible; end
       end
 
     end
@@ -1243,7 +1263,7 @@ function conicIP(
       # A row is highlighted in red when the KKT step is still inaccurate
       # after iterative refinement (see REFINE_WARN_NORM).
       row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %i\n",
-                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, rStep)
+                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, nref)
       if rnorm > REFINE_WARN_NORM
         printstyled(row; bold = true, color = :red)
       else
@@ -1262,15 +1282,29 @@ function conicIP(
       return claim_infeasible!(sol, w̄, v̄)
     end
 
-    if claim == :Unbounded
+    if claim == :DualInfeasible
       if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
-      return claim_unbounded!(sol, ȳ, A)
+      return claim_dual_infeasible!(sol, ȳ, A)
     end
 
     # Cause of Divergence Unknown
     if !(isfinite(μ) && isfinite(rDu) && isfinite(rPr) && isfinite(rCp))
       if verbose; print("\n > EXIT -- Error!\n\n"); end
       sol.status = :Error; return sol
+    end
+
+    # ────────────────────────────────────────────────────────────
+    #  Factorization (only for an iterate that is going to be stepped)
+    # ────────────────────────────────────────────────────────────
+
+    solve = try
+      solve4x4gen(λ,F,F⁻ᵀ)         # Caches 4x4 solver
+                                   # (used a few times, at least 2)
+    catch err
+      err isa KKT_FAILURES || rethrow()
+      sol.status = :Error
+      sol.message = kkt_error("factorization, iteration $Iter", err)
+      return sol
     end
 
     # ────────────────────────────────────────────────────────────
@@ -1322,12 +1356,12 @@ function conicIP(
     isfinite4(Δz) ||
       return nonfinite!("corrector direction", "corrector, iteration $Iter")
 
-    rStep = 1;
-    for rStep = 1:maxRefinementSteps
+    # Scaled KKT residual of the step Δz against the right-hand side r,
+    # left in the preallocated _rIr:
+    #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
+    function step_residual!(Δz, r)
       cone_prod!(_prod_buf1, λ, F*Δz.v)
       cone_prod!(_prod_buf2, λ, F⁻ᵀ*Δz.s)
-      # KKT residual of the step, into preallocated scratch:
-      #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
       mul!(_rkkt.y, Q, Δz.y)
       mul!(_rkkt.y, Gᵀ, Δz.w, 1.0, 1.0)
       mul!(_rkkt.y, Aᵀ, Δz.v, -1.0, 1.0)
@@ -1335,8 +1369,16 @@ function conicIP(
       mul!(_rkkt.v, A, Δz.y); _rkkt.v .-= Δz.s
       _rkkt.s .= _prod_buf1 .+ _prod_buf2
       sub4!(_rIr, r, _rkkt)
-      rnorm = norm(_rIr)/(n + p + 2*m)
-      if rnorm < refinementThreshold; break; end
+      return norm(_rIr)/(n + p + 2*m)
+    end
+
+    # Iterative refinement: at most maxRefinementSteps corrections, each
+    # one more back-solve with the same factorization. The residual is
+    # re-evaluated after the last correction so that `rnorm` (and the red
+    # highlight in the verbose row) describes the step actually taken.
+    nref  = 0
+    rnorm = step_residual!(Δz, r)
+    while nref < maxRefinementSteps && rnorm >= refinementThreshold
       Δzr = guarded("refinement, iteration $Iter") do
         solve(_rIr)
       end
@@ -1344,6 +1386,8 @@ function conicIP(
       isfinite4(Δzr) ||
         return nonfinite!("refinement direction", "refinement, iteration $Iter")
       axpy4!(1.0, Δzr, Δz)
+      nref += 1
+      rnorm = step_residual!(Δz, r)
     end
     isfinite4(Δz) ||
       return nonfinite!("search direction", "search direction, iteration $Iter")
@@ -1371,6 +1415,8 @@ function conicIP(
 
   end
 
+  sol.kkt_solves = _nsolve[]
+
   # ────────────────────────────────────────────────────────────
   #  Loop exhausted : re-screen the best iterate
   #
@@ -1378,7 +1424,7 @@ function conicIP(
   #  miss a ray that the best iterate carries. Re-validate that
   #  iterate here, first at the nominal tolerance (a full claim, rare)
   #  and then relaxed 100×, which downgrades to :AlmostInfeasible /
-  #  :AlmostUnbounded rather than claiming.
+  #  :AlmostDualInfeasible rather than claiming.
   # ────────────────────────────────────────────────────────────
 
   (pchk, w̄, v̄) = validate_infeasibility_certificate(
@@ -1444,7 +1490,7 @@ function conicIP(
                        abstol = infeasAbsTol, reltol = infeasTol)
         if fchk.valid
           if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
-          return claim_unbounded!(sol, fȳ, A)
+          return claim_dual_infeasible!(sol, fȳ, A)
         end
       end
     end
@@ -1456,11 +1502,11 @@ function conicIP(
     return claim_infeasible!(sol, w̄, v̄)
   elseif dchk.valid
     if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
-    return claim_unbounded!(sol, ȳ, A)
+    return claim_dual_infeasible!(sol, ȳ, A)
   elseif pchk100.valid && μ_collapsed
     sol.status = :AlmostInfeasible
   elseif dchk100.valid && μ_collapsed
-    sol.status = :AlmostUnbounded
+    sol.status = :AlmostDualInfeasible
   else
     sol.status = :Abandoned
   end

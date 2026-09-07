@@ -57,7 +57,7 @@ Inconsistent data is reported with a certificate whenever one can be
 constructed and verified against the original problem data:
 
 - `Gy = d` inconsistent  → `:Infeasible` with a Farkas ray `(w,v)`
-- `c ∉ range([Q Aᵀ Gᵀ])` → `:Unbounded` with a recession ray `y`
+- `c ∉ range([Q Aᵀ Gᵀ])` → `:DualInfeasible` with a recession ray `y`
 
 Rank deficiency that is *not* an inconsistency is handled by opting into
 `conicIP`'s static KKT regularization rather than by perturbing `Q`.
@@ -131,9 +131,9 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
     return check.valid ?
       ConicIP.Solution(ȳ, nanvec(p), nanvec(m), A*ȳ,
-        :Unbounded, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
+        :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
       ConicIP.Solution(nanvec(n), nanvec(p), nanvec(m), nanvec(m),
-        :Unbounded, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+        :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
 
   end
 
@@ -218,13 +218,13 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   # Same for an unbounded ray: it satisfies Gȳ ≈ 0 on the reduced rows only,
   # so re-validate against the full G before letting the certificate stand.
-  if sol.status == :Unbounded && sol.has_certificate
+  if sol.status == :DualInfeasible && sol.has_certificate
     (check, ȳ) = validate_unboundedness_certificate(Q, c, A, b, cone_dims,
       G, d, sol.y; abstol = abstol, reltol = reltol)
     if check.valid
       sol.y = ȳ; sol.s = A*ȳ
     else
-      return retract!(sol, :Unbounded)
+      return retract!(sol, :DualInfeasible)
     end
   end
 

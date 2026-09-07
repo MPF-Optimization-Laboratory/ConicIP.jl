@@ -4,6 +4,37 @@ All notable changes to ConicIP.jl are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Breaking (direct API):** the status `:Unbounded` is now `:DualInfeasible`
+  and `:AlmostUnbounded` is `:AlmostDualInfeasible`. The validated ray
+  certifies dual infeasibility; primal unboundedness additionally needs
+  primal feasibility, which the solver does not establish. The MOI mapping
+  (`DUAL_INFEASIBLE`) is unchanged.
+- `choose_kktsolver` refuses the dense solver when its storage estimate
+  (`dense_kkt_bytes`) exceeds `dense_bytes_max` (default 4 GiB), whatever
+  the cone mix or nonzero density says. Previously a very sparse problem
+  with more than 10 nonzeros per column was routed to dense QR at any size.
+- The KKT factorization is performed after the termination and certificate
+  checks, so a converged iterate no longer pays for one, and a factorization
+  failure cannot mask convergence.
+- Iterative refinement re-evaluates the step residual after the last
+  correction, so the reported residual describes the step taken.
+
+### Added
+- `Solution.kkt_solves`: the number of KKT back-solves the main loop
+  performed (initial point, predictor, corrector, refinements).
+- `benchmark/suite.jl`: reproducible harness with phase timings, solve
+  counts, fill proxies, peak RSS in a fresh process, and residuals
+  recomputed from the original data.
+- `benchmark/large-scale-roadmap.md`: diagnosis of the scale limits and the
+  tranche plan to lift them.
+
+### Fixed
+- The verbose "refine" column always printed 1; it now reports the number of
+  refinement corrections applied in the previous iteration.
+
 ## [0.4.0] - 2026-09-06
 
 ### Added

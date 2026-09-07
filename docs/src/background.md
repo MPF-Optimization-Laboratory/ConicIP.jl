@@ -160,11 +160,11 @@ Common causes:
 
 **What to try:** Relax constraints or check problem data for errors.
 
-### Status: `:Unbounded`
+### Status: `:DualInfeasible`
 
-The objective decreases without bound over the feasible set. As with
-`:Infeasible`, the status is claimed only after validation against the
-original data.
+The dual problem is infeasible: there is a recession direction along which
+the objective decreases without bound. As with `:Infeasible`, the status is
+claimed only after validation against the original data.
 
 When `sol.has_certificate` is `true`, `sol.y` holds the verified recession
 ray, normalized so that
@@ -176,8 +176,13 @@ cᵀȳ = +1,    Qȳ ≈ 0,    Gȳ ≈ 0,    Aȳ ∈ K
 with `sol.s = A*ȳ`; `w` and `v` are `NaN`. Moving from any feasible point
 along `ȳ` stays feasible and decreases the objective at unit rate.
 
-When `sol.has_certificate` is `false`, unboundedness was detected but no
-usable ray is returned.
+The ray says nothing about whether a feasible point exists. If the primal
+is feasible, it is unbounded; if it is not, the problem is both primal and
+dual infeasible, and the ray is still a valid certificate of the latter.
+(Before v0.5.0 this status was named `:Unbounded`, which over-claimed.)
+
+When `sol.has_certificate` is `false`, dual infeasibility was detected but
+no usable ray is returned.
 
 Common causes:
 - Missing constraints that should bound the feasible region
@@ -185,12 +190,12 @@ Common causes:
 
 **What to try:** Add bounding constraints or verify the objective.
 
-### Status: `:AlmostInfeasible` / `:AlmostUnbounded`
+### Status: `:AlmostInfeasible` / `:AlmostDualInfeasible`
 
 The iteration limit was reached with a candidate ray that validates only
 when the tolerances are relaxed by a factor of 100. This is the gray zone
 between a stall and a proof: the evidence points at infeasibility (or
-unboundedness), but not strongly enough to assert it.
+dual infeasibility), but not strongly enough to assert it.
 
 No certificate is returned — `has_certificate` is `false` and the solution
 fields hold the best iterate, not a ray. Treat the result as advisory.
@@ -223,7 +228,7 @@ indicates a problem with the input data. `sol.message` carries the reason.
 
 [`preprocess_conicIP`](@ref ConicIP.preprocess_conicIP) also returns `:Error`
 when the solve on its reduced equality system claims `:Infeasible` or
-`:Unbounded` but the ray fails to certify the *original* data. That means
+`:DualInfeasible` but the ray fails to certify the *original* data. That means
 the redundancy detection dropped a row that was only dependent to tolerance,
 so the reduced problem's verdict does not transfer; the status is retracted
 rather than reported without a certificate.
@@ -276,7 +281,7 @@ iterations.
 **`infeasTol`:** Governs certificate detection only, and is deliberately
 decoupled from `optTol` — changing the accuracy you demand of an optimal
 solution should not change how readily the solver declares a problem
-infeasible. Decrease it if the solver reports `:Infeasible` or `:Unbounded`
+infeasible. Decrease it if the solver reports `:Infeasible` or `:DualInfeasible`
 for a problem you know has a solution; increase it if a genuinely infeasible
 problem is reported as `:Abandoned` or `:AlmostInfeasible`.
 

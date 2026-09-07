@@ -498,12 +498,12 @@ end
 
 # A `Solution` carries a ray only when the solver verified one
 # (`has_certificate`). Per the `Solution` field-convention table:
-#   :Unbounded + certificate → sol.y is the primal ray ȳ (cᵀȳ = +1),
+#   :DualInfeasible + certificate → sol.y is the primal ray ȳ (cᵀȳ = +1),
 #                              sol.s = A*ȳ, and sol.w/sol.v are NaN
 #   :Infeasible + certificate → sol.w/sol.v are the Farkas ray
 #                              (dᵀw̄ - bᵀv̄ = -1), and sol.y/sol.s are NaN
 _is_primal_ray(model::Optimizer) =
-    model.sol !== nothing && model.sol.status == :Unbounded && model.sol.has_certificate
+    model.sol !== nothing && model.sol.status == :DualInfeasible && model.sol.has_certificate
 
 _is_dual_ray(model::Optimizer) =
     model.sol !== nothing && model.sol.status == :Infeasible && model.sol.has_certificate
@@ -517,11 +517,11 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
         return MOI.OPTIMAL
     elseif status == :Infeasible
         return MOI.INFEASIBLE
-    elseif status == :Unbounded
+    elseif status == :DualInfeasible
         return MOI.DUAL_INFEASIBLE
     elseif status == :AlmostInfeasible
         return MOI.ALMOST_INFEASIBLE
-    elseif status == :AlmostUnbounded
+    elseif status == :AlmostDualInfeasible
         return MOI.ALMOST_DUAL_INFEASIBLE
     elseif status == :Abandoned
         return MOI.ITERATION_LIMIT
@@ -539,7 +539,7 @@ function MOI.get(model::Optimizer, attr::MOI.PrimalStatus)
     status = model.sol.status
     if status == :Optimal
         return MOI.FEASIBLE_POINT
-    elseif status == :Unbounded
+    elseif status == :DualInfeasible
         return MOI.INFEASIBILITY_CERTIFICATE
     else
         return MOI.NO_SOLUTION
@@ -567,7 +567,7 @@ function MOI.get(model::Optimizer, ::MOI.ResultCount)
     status = model.sol.status
     if status == :Optimal
         return 1
-    elseif status in (:Infeasible, :Unbounded) && model.sol.has_certificate
+    elseif status in (:Infeasible, :DualInfeasible) && model.sol.has_certificate
         return 1
     end
     return 0
@@ -630,7 +630,7 @@ end
 #   Zeros:       f(x) ≈ 0    (offset=0)
 #   EqualTo(r):  f(x) ≈ r    (offset=r)
 #
-# On a primal ray (:Unbounded with certificate) the value is the *homogeneous*
+# On a primal ray (:DualInfeasible with certificate) the value is the *homogeneous*
 # part only: the constant terms (eq_d, ineq_offset) are dropped, since a ray is
 # a direction rather than a point.
 function MOI.get(
@@ -723,6 +723,15 @@ end
 
 MOI.supports(::Optimizer, ::MOI.SolveTimeSec) = true
 MOI.get(model::Optimizer, ::MOI.SolveTimeSec) = model.solve_time
+
+MOI.supports(::Optimizer, ::MOI.BarrierIterations) = true
+MOI.get(model::Optimizer, ::MOI.BarrierIterations) =
+    model.sol === nothing ? 0 : Int(model.sol.Iter)
+
+# The wrapper is its own solver object: `model.sol` is the full `Solution`
+# (iteration and KKT-solve counts, residuals, message) behind the MOI
+# attributes, and benchmark/suite.jl reads it through this attribute.
+MOI.get(model::Optimizer, ::MOI.RawSolver) = model
 
 # Homogeneous dual objective along a Farkas ray. The ray is normalized so that
 # dᵀw̄ - bᵀv̄ = -1, hence bᵀv̄ - dᵀw̄ = +1 — positive, matching the MOI

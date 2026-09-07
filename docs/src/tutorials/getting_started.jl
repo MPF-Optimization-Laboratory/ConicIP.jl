@@ -77,7 +77,7 @@ round.(sol.y, digits=4)
 # | `sol.y` | Primal variables (vector) |
 # | `sol.v` | Dual variables for inequality constraints |
 # | `sol.w` | Dual variables for equality constraints |
-# | `sol.status` | `:Optimal`, `:Infeasible`, `:Unbounded`, `:Abandoned`, or `:Error` |
+# | `sol.status` | `:Optimal`, `:Infeasible`, `:DualInfeasible`, `:Abandoned`, or `:Error` |
 # | `sol.pobj`, `sol.dobj` | Primal and dual objective values |
 # | `sol.prFeas` | Primal feasibility residual |
 # | `sol.duFeas` | Dual feasibility residual |

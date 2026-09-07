@@ -33,6 +33,12 @@ per problem via [`choose_kktsolver`](@ref ConicIP.choose_kktsolver),
 using cone mix, size, and *structural* sparsity — never the storage
 type of the inputs:
 
+0. **Dense storage over budget → `kktsolver_sparse`.** If the dense
+   solver's storage estimate ([`dense_kkt_bytes`](@ref ConicIP.dense_kkt_bytes),
+   roughly `2n² + 2m(n−p) + 2(n−p)²` doubles) exceeds
+   `dense_bytes_max` (default 4 GiB), the sparse solver is used whatever
+   the rules below would say. At that size dense QR is an out-of-memory
+   error, not a slow solve.
 1. **Any SDP cone → `kktsolver_qr`.** The dense double-QR method is the
    numerically robust choice for the dense SDP scaling blocks. This routing
    sets the cost of a semidefinite solve; see
@@ -121,7 +127,7 @@ to [`conicIP`](@ref)), the solver returns a `Solution` with
 throwing; [`preprocess_conicIP`](@ref) removes redundant rows up front,
 and structurally degenerate inputs (an all-zero equality row, a variable
 appearing in no constraint) are detected exactly in `O(nnz)` and either
-deflated or answered with a certified `:Infeasible`/`:Unbounded`.
+deflated or answered with a certified `:Infeasible`/`:DualInfeasible`.
 
 ## Writing a Custom Solver
 

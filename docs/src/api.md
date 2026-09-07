@@ -40,9 +40,9 @@ ConicIP.Solution
 |--------|---------|
 | `:Optimal` | Converged to an optimal solution |
 | `:Infeasible` | Problem is primal infeasible (validated Farkas ray when `has_certificate`) |
-| `:Unbounded` | Problem is dual infeasible / primal unbounded (validated recession ray when `has_certificate`) |
+| `:DualInfeasible` | Problem is dual infeasible: a recession ray decreases the objective without bound (validated when `has_certificate`). The primal is unbounded if it is also feasible, which this status does not establish. |
 | `:AlmostInfeasible` | Iteration limit with a near-validating infeasibility candidate (no certificate) |
-| `:AlmostUnbounded` | Iteration limit with a near-validating unboundedness candidate (no certificate) |
+| `:AlmostDualInfeasible` | Iteration limit with a near-validating recession-ray candidate (no certificate) |
 | `:Abandoned` | Solver stalled (step size too small or numerical issues) |
 | `:Error` | Solver encountered an error |
 
@@ -85,6 +85,7 @@ for detailed usage and custom solver development.
 ```@docs
 ConicIP.default_kktsolver
 ConicIP.choose_kktsolver
+ConicIP.dense_kkt_bytes
 ConicIP.kktsolver_qr
 ConicIP.kktsolver_sparse
 ConicIP.kktsolver_2x2

@@ -9,11 +9,27 @@ _structural_nnz(M::Diagonal)             = count(!iszero, M.diag)
 _structural_nnz(M::AbstractMatrix)       = count(!iszero, M)
 
 """
-    choose_kktsolver(Q, A, G, cone_dims; nnz_per_col_max = 10, size_min = 1000)
+    dense_kkt_bytes(n, m, p)
+
+Upper bound on the dense storage [`kktsolver_qr`](@ref) holds at once:
+the n×n orthogonal factor and the n×p dense copy of `Gᵀ` at setup, the
+m×(n−p) `A*Q2` and the (n−p)² reduced Hessian, plus one more of each per
+iteration (`W` and `Lmat`). Float64 throughout.
+"""
+dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
+
+"""
+    choose_kktsolver(Q, A, G, cone_dims;
+                     nnz_per_col_max = 10, size_min = 1000,
+                     dense_bytes_max = 4 * 2^30)
 
 Pick a KKT solver from the problem's cone mix, size, and sparsity
 (issue #10). Returns one of the solver constructors, chosen by:
 
+0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
+   `dense_bytes_max` ⇒ [`kktsolver_sparse`](@ref), whatever the rules
+   below would say — dense QR at that size is an out-of-memory error,
+   not a slow solve;
 1. any SDP cone ⇒ [`kktsolver_qr`](@ref) — the dense double-QR method is
    the numerically robust choice for the dense SDP scaling blocks;
 2. `n + m + p < size_min` ⇒ `kktsolver_qr` — dense factorization wins at
@@ -26,11 +42,15 @@ Pick a KKT solver from the problem's cone mix, size, and sparsity
 The decision is by *structural* nonzero counts, never by storage type.
 """
 function choose_kktsolver(Q, A, G, cone_dims;
-                          nnz_per_col_max = 10, size_min = 1000)
+                          nnz_per_col_max = 10, size_min = 1000,
+                          dense_bytes_max = 4 * 2^30)
+  n = size(Q,1)
+  if dense_kkt_bytes(n, size(A,1), size(G,1)) > dense_bytes_max
+    return kktsolver_sparse
+  end
   if any(cd[1] == "S" for cd in cone_dims)
     return kktsolver_qr
   end
-  n = size(Q,1)
   if n + size(A,1) + size(G,1) < size_min
     return kktsolver_qr
   end

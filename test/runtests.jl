@@ -541,7 +541,7 @@ end
                           kktsolver = kktsolver,
                           optTol = optTol)
 
-            @test sol.status == :Unbounded
+            @test sol.status == :DualInfeasible
 
             # Recession ray: Qȳ ≈ 0, Gȳ ≈ 0 (G empty), Aȳ ∈ K, cᵀȳ = +1.
             G = zeros(0, n); d = zeros(0)
@@ -967,7 +967,7 @@ end
         @testset "Unbounded — fallback certifies a stalled solve" begin
             s = conicIP(Qu, cu, Au, bu, Ku, Gu, du;
                         verbose = false, maxIters = 5, certFallback = true)
-            @test s.status == :Unbounded
+            @test s.status == :DualInfeasible
             @test s.has_certificate
 
             (chk, _) = ConicIP.validate_unboundedness_certificate(
@@ -991,7 +991,7 @@ end
             Af = sparse(1.0I, n, n); bf = zeros(n); Kf = [("R", n)]
             s = conicIP(Qf, cf, Af, bf, Kf; verbose = false, maxIters = 4,
                         certFallback = true)
-            @test s.status ∉ (:Infeasible, :Unbounded)
+            @test s.status ∉ (:Infeasible, :DualInfeasible)
             @test !s.has_certificate
         end
 
@@ -1051,8 +1051,8 @@ end
             s = conicIP(Qi, ci, Ai, bi, Ki, Gi, di;
                         verbose = false, maxIters = 1, certFallback = true)
             @test s isa ConicIP.Solution
-            @test s.status ∈ (:Optimal, :Infeasible, :Unbounded,
-                              :AlmostInfeasible, :AlmostUnbounded,
+            @test s.status ∈ (:Optimal, :Infeasible, :DualInfeasible,
+                              :AlmostInfeasible, :AlmostDualInfeasible,
                               :Abandoned, :Error)
         end
 
@@ -1120,7 +1120,7 @@ end
             K = [("R", 1)]; G = spzeros(0, 1); d = Float64[]
             s = conicIP(Q, c, A, b, K, G, d;
                         verbose = false, maxIters = 0, certFallback = false)
-            @test s.status == :Unbounded
+            @test s.status == :DualInfeasible
             @test s.has_certificate
             @test s.Iter == 0
             (chk, ȳ) = ConicIP.validate_unboundedness_certificate(
@@ -1147,7 +1147,7 @@ end
     # ──────────────────────────────────────────────────────────────
     #  Infeasibility soundness (adversarial)
     #
-    #  A sound solver never claims :Infeasible or :Unbounded on a
+    #  A sound solver never claims :Infeasible or :DualInfeasible on a
     #  problem that is neither. These cases sit *deliberately* close to
     #  the boundary: nearly-empty feasible sets, nearly-flat objectives,
     #  degenerate constraint blocks, and poisoned data. Each asserts the
@@ -1206,13 +1206,13 @@ end
             end
 
             # At ε = 1e-12 the claim IS made. Two things must still hold:
-            # the claim is never :Unbounded-without-a-ray, and the ray it
+            # the claim is never :DualInfeasible-without-a-ray, and the ray it
             # carries genuinely satisfies the validator's own contract
             # against the original data — i.e. the tolerance is the only
             # thing being traded, not the soundness argument.
             (Q, c, A, b, K) = mk(1e-12)
             sol = conicIP(Q, c, A, b, K, verbose = false)
-            @test sol.status == :Unbounded
+            @test sol.status == :DualInfeasible
             @test sol.has_certificate
             (chk, _) = ConicIP.validate_unboundedness_certificate(
                 Q, c, A, b, K, no_eq(1)..., sol.y;
@@ -1295,7 +1295,7 @@ end
                     catch
                         threw = true
                     end
-                    @test threw || sol.status ∉ (:Optimal, :Infeasible, :Unbounded)
+                    @test threw || sol.status ∉ (:Optimal, :Infeasible, :DualInfeasible)
                     @test threw || !sol.has_certificate
                 end
             end
@@ -1524,7 +1524,7 @@ end
         Az = sparse([1.0 0 0; 0 1.0 0]); bz = zeros(2)
         s = conicIP(Qz, cz, Az, bz, [("R",2)], spzeros(0,3), zeros(0);
                     verbose = false)
-        @test s.status == :Unbounded
+        @test s.status == :DualInfeasible
         @test s.has_certificate
         # p > n under kktsolver_qr: invariant violation, clear error
         Gpn = sparse(ones(7, 5))
@@ -1539,7 +1539,7 @@ end
         # min -y₂ has optimum 0. imcols drops row 2 as numerically dependent,
         # the reduced problem is unbounded, and the recession ray fails
         # revalidation on the full G. That verdict must not survive as a
-        # terminal :Unbounded (it used to, with has_certificate = false).
+        # terminal :DualInfeasible (it used to, with has_certificate = false).
         Q = zeros(2, 2); c = [0.0, 1.0]
         A = sparse(1.0I, 2, 2); b = zeros(2); K = [("R", 2)]
         G = sparse([100.0 0.0; 100.0 1e-6]); d = zeros(2)
@@ -1551,7 +1551,7 @@ end
             @test s.status == :Error
             @test !s.has_certificate
             @test all(isnan, s.y) && all(isnan, s.w)
-            @test occursin("Unbounded", s.message)
+            @test occursin("DualInfeasible", s.message)
             @test occursin("dropped rows [2]", s.message)
             @test occursin("does not certify the original data", s.message)
         end
@@ -1772,8 +1772,8 @@ end
         # on seeds 47 and 139 of 160 at optTol = 1e-11 under
         # kktsolver_sparse. Both used to throw out of conicIP; both must
         # now come back as an ordinary Solution.
-        valid = (:Optimal, :Infeasible, :Unbounded, :AlmostInfeasible,
-                 :AlmostUnbounded, :Abandoned, :Error, :None)
+        valid = (:Optimal, :Infeasible, :DualInfeasible, :AlmostInfeasible,
+                 :AlmostDualInfeasible, :Abandoned, :Error, :None)
         escapes = 0
         statuses = Symbol[]
         for seed = 1:160
@@ -1821,7 +1821,7 @@ end
 
         # min -tr X over X ⪰ 0 is unbounded below.
         s = conicIP(Qs, vecI, As, bs, Ki; verbose = false)
-        @test s.status == :Unbounded
+        @test s.status == :DualInfeasible
         @test s.has_certificate
         @test dot(vecI, s.y) ≈ 1                               # cᵀȳ = +1
         @test eigmin(Symmetric(ConicIP.mat(s.s))) > -1e-8      # Aȳ ∈ K
@@ -1943,6 +1943,74 @@ end
     # ──────────────────────────────────────────────────────────────
     #  MathOptInterface Tests
     # ──────────────────────────────────────────────────────────────
+
+    @testset "Solve accounting and dense guard" begin
+        # A kktsolver wrapper that counts factorizations (solve3x3gen calls)
+        # and back-solves (solve3x3 calls) without changing the arithmetic.
+        nfact = Ref(0); nsolve = Ref(0)
+        counting(inner) = (Q, A, G, cd) -> begin
+            gen = inner(Q, A, G, cd)
+            (F, Fi) -> begin
+                nfact[] += 1
+                s = gen(F, Fi)
+                (a, b, c) -> (nsolve[] += 1; s(a, b, c))
+            end
+        end
+        # Bounded, feasible random LP: a box −10 ≤ y ≤ 10 plus random rows
+        # that y = 0 satisfies.
+        Random.seed!(11)
+        n = 300; m1 = 300
+        A1 = sprandn(m1, n, 0.02)
+        A  = [A1; sparse(1.0I, n, n); -sparse(1.0I, n, n)]
+        b  = [-rand(m1); fill(-10.0, n); fill(-10.0, n)]
+        c  = randn(n)
+        for mr in (0, 3)
+            nfact[] = 0; nsolve[] = 0
+            sol = conicIP(spzeros(n, n), c, A, b, [("R", size(A, 1))];
+                          kktsolver = counting(ConicIP.kktsolver_sparse),
+                          verbose = false, maxRefinementSteps = mr)
+            @test sol.status == :Optimal
+            # One factorization for the initial point and one per stepped
+            # iteration; the iterate that meets the tolerance is not factored.
+            @test nfact[] == sol.Iter
+            @test sol.kkt_solves == nsolve[]
+            stepped = sol.Iter - 1
+            if mr == 0
+                @test sol.kkt_solves == 1 + 2*stepped
+            else
+                @test 1 + 2*stepped <= sol.kkt_solves <= 1 + (2 + mr)*stepped
+            end
+        end
+        # Short constructors default the count to zero.
+        z = zeros(1)
+        @test ConicIP.Solution(z, z, z, z, :None, 0, 0, 0, 0, 0, 0, 0).kkt_solves == 0
+        @test ConicIP.Solution(z, z, z, z, :None, 0, 0, 0, 0, 0, 0, 0, false).kkt_solves == 0
+        @test ConicIP.Solution(z, z, z, z, :None, 0, 0, 0, 0, 0, 0, 0, false, "").kkt_solves == 0
+
+        # Dense-storage guard in choose_kktsolver: a very sparse problem with
+        # just over 10 nnz/col used to be routed to dense QR at any size.
+        @test ConicIP.dense_kkt_bytes(10, 20, 3) == 8*(2*100 + 2*20*7 + 2*49)
+        nb = 50_000
+        A11 = sprand(nb, nb, 11/nb)
+        @test choose_kktsolver(spzeros(nb, nb), A11, spzeros(0, nb), [("R", nb)]) ===
+              ConicIP.kktsolver_sparse
+        @test choose_kktsolver(spzeros(nb, nb), A11, spzeros(0, nb), [("R", nb)];
+                               dense_bytes_max = typemax(Int)) ===
+              ConicIP.kktsolver_qr
+        # The guard precedes the SDP rule.
+        @test choose_kktsolver(spzeros(20, 20), sprandn(21, 20, 0.5), spzeros(0, 20),
+                               [("S", 6)]; dense_bytes_max = 1) ===
+              ConicIP.kktsolver_sparse
+
+        # A recession ray certifies dual infeasibility, not primal
+        # unboundedness: this problem (0·y ≥ 1) is infeasible, and the
+        # status must not claim an unbounded primal.
+        s = conicIP(spzeros(1, 1), [1.0], spzeros(1, 1), [1.0], [("R", 1)];
+                    verbose = false)
+        @test s.status == :DualInfeasible
+        @test s.has_certificate
+        @test s.status != :Unbounded
+    end
 
     @testset "MOI.Test" begin
         import MathOptInterface as MOI
@@ -2293,7 +2361,7 @@ end
             p = size(opt.eq_G, 1)
             s = opt.ineq_A * y
             return ConicIP.Solution(copy(y), fill(NaN, p), fill(NaN, length(s)),
-                Vector(s), :Unbounded, 0, NaN, NaN, NaN, NaN, NaN, NaN, true)
+                Vector(s), :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true)
         end
 
         # Gᵀw̄ - Aᵀv̄ (the Farkas residual), tolerating an empty equality block
@@ -2464,7 +2532,7 @@ end
             @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
             @test MOI.get(opt, MOI.DualStatus()) == MOI.NO_SOLUTION
 
-            opt.sol = ConicIP.Solution(args[1:4]..., :Unbounded, args[6:end]..., false)
+            opt.sol = ConicIP.Solution(args[1:4]..., :DualInfeasible, args[6:end]..., false)
             @test MOI.get(opt, MOI.ResultCount()) == 0
             @test MOI.get(opt, MOI.PrimalStatus()) == MOI.NO_SOLUTION
             @test MOI.get(opt, MOI.DualStatus()) == MOI.NO_SOLUTION
@@ -2487,7 +2555,7 @@ end
             @test MOI.get(opt, MOI.TerminationStatus()) == MOI.ALMOST_INFEASIBLE
             @test MOI.get(opt, MOI.ResultCount()) == 0
 
-            opt.sol = ConicIP.Solution(args..., :AlmostUnbounded,
+            opt.sol = ConicIP.Solution(args..., :AlmostDualInfeasible,
                                        0, NaN, NaN, NaN, NaN, NaN, NaN, false)
             @test MOI.get(opt, MOI.TerminationStatus()) == MOI.ALMOST_DUAL_INFEASIBLE
             @test MOI.get(opt, MOI.ResultCount()) == 0
