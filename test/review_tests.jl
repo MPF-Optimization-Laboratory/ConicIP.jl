@@ -74,3 +74,17 @@ end
     @test all(x -> 0.1 <= x <= 10.0, [eq.Dc; eq.Dr])
     @test eq.A ≈ Diagonal(eq.Dr)*A*Diagonal(eq.Dc)
 end
+
+@testset "Review: exhausted time budgets" begin
+    Q = sparse(1.0I, 2, 2); A = copy(Q); c = ones(2); b = zeros(2)
+    cd = [("R",2)]; G = spzeros(0,2); d = zeros(0)
+    # The post-loop path must honor time even when there was no loop check.
+    sol = conicIP(Q, c, A, b, cd; maxIters = 0, timeLimit = 0.0, verbose = false)
+    @test sol.status == :TimeLimit
+    @test all(isfinite, sol.y)
+    never_called(args...) = error("expired fallback started a KKT solver")
+    @test ConicIP.fallback_infeasibility_ray(Q,c,A,b,cd,G,d;
+        timeLimit = 0.0, kktsolver = never_called) === nothing
+    @test ConicIP.fallback_unbounded_ray(Q,c,A,b,cd,G,d;
+        timeLimit = 0.0, kktsolver = never_called) === nothing
+end

@@ -135,6 +135,9 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- Time budgets now include singleton reduction, equilibration, the MOI
+  Hessian check, and fallback setup. Expiry on the final iteration or during
+  fallback returns `:TimeLimit`; an expired fallback does not start a solve.
 - Ruiz sweeps limit the scaling increments before applying them, keeping
   the working matrices consistent with cumulative scaling factors when
   those factors reach their bounds.

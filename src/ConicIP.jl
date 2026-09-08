@@ -778,15 +778,16 @@ original coordinates; see [`equilibrate_conicIP`](@ref). A custom
 """
 function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                  G = spzeros(0, length(c)), d = zeros(0);
-                 equilibrate = true, kwargs...)
-  equilibrate || return _conicIP(Q, c, A, b, cone_dims, G, d; kwargs...)
+                 equilibrate = true, timeLimit = Inf, kwargs...)
+  t_start = time()
+  equilibrate || return _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, kwargs...)
   eq  = equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
   # The core tests termination on residuals mapped back to the original
   # coordinates, so optTol keeps its meaning under any scaling.
   scaling = (Dc = eq.Dc, Dr = eq.Dr, De = eq.De, σ = eq.σ,
              normc = norm(c), normb = normsafe(b), normd = normsafe(d))
   sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
-                 scaling = scaling, kwargs...)
+                 scaling = scaling, timeLimit = timeLimit - (time() - t_start), kwargs...)
   unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d)
   # A ray validated on the scaled data need not validate on the original
   # data (tolerances are not scaling-invariant): re-run the validator in
@@ -1726,6 +1727,10 @@ function _conicIP(
   end
 
   sol.kkt_solves = _nsolve[]
+  if over_time()
+    sol.status = :TimeLimit
+    return sol
+  end
 
   # ────────────────────────────────────────────────────────────
   #  Loop exhausted : re-screen the best iterate
@@ -1809,6 +1814,11 @@ function _conicIP(
       end
     end
 
+  end
+
+  if over_time()
+    sol.status = :TimeLimit
+    return sol
   end
 
   if pchk.valid

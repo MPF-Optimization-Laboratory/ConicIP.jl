@@ -80,7 +80,11 @@ function preprocess_conicIP(Q, c::AbstractVector,
   verbose = false,
   rank_check = :auto,
   fix_singletons = true,
+  timeLimit = Inf,
   options...)
+
+  t_start = time()
+  time_left() = timeLimit - (time() - t_start)
 
   if verbose == true
     println()
@@ -91,7 +95,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   fx = fix_singletons ? _singleton_fixings(G, d) : nothing
   if fx === nothing
     return _preprocess_core(Q, c, A, b, cone_dims, G, d;
-                            verbose = verbose, rank_check = rank_check, options...)
+                            verbose = verbose, rank_check = rank_check, timeLimit = time_left(), options...)
   end
 
   n = length(c); m = size(A, 1); p = size(G, 1)
@@ -145,7 +149,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   sol = _preprocess_core(Qs[keepc, keepc], cr, As[:, keepc], br, cone_dims,
                          Gs[keepr, keepc], dr;
                          verbose = verbose, rank_check = rank_check,
-                         objective_offset = offset,
+                         objective_offset = offset, timeLimit = time_left(),
                          Base.structdiff(opts0, NamedTuple{(:objective_offset,)})...)
 
   # Postsolve. The primal is the fixed value on F. The dual of the primary

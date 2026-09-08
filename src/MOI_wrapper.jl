@@ -558,18 +558,18 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                            ("preprocess", "kktsolver", "verbose", "rank_check",
                             "fix_singletons")
     kw = (; (Symbol(k) => v for (k, v) in dest.options if k ∉ skip)...)
-    # TimeLimitSec covers the whole optimize! call: the solver's budget is
-    # what assembly left of it (a non-positive budget makes the solver
-    # return :TimeLimit before its first iteration).
-    if haskey(kw, :timeLimit) && isfinite(kw.timeLimit)
-        kw = merge(kw, (; timeLimit = max(kw.timeLimit - dest.assembly_time, 0.0)))
-    end
     entry = do_preprocess ? preprocess_conicIP : conicIP
     if dest.Q_int !== nothing && !_is_psd(Q)
         # Nonconvex objective: the solver would report a stationary point
         # as optimal, so it is not called at all.
         dest.sol = _invalid_model_solution(n, size(A, 1), size(G, 1), _NONCONVEX_MESSAGE)
     else
+        # Charge all front-end work, including the Hessian check, before
+        # starting the solver's budget. Inner wrappers charge their own
+        # presolve/equilibration work in the same way.
+        if haskey(kw, :timeLimit) && isfinite(kw.timeLimit)
+            kw = merge(kw, (; timeLimit = kw.timeLimit - (time() - t_start)))
+        end
         dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
             verbose = verbose, kktsolver = solver, kw...)
     end

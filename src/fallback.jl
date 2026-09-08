@@ -51,6 +51,9 @@ function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
                                     kktsolver = default_kktsolver,
                                     maxIters = 50, timeLimit = Inf)
 
+  t_start = time()
+  time_left() = timeLimit - (time() - t_start)
+  time_left() > 0 || return nothing
   n = length(c)
   m = size(A, 1)
   p = size(G, 1)
@@ -84,11 +87,12 @@ function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
   (consistent && !isempty(IP)) || return nothing
   G_aux = G_aux[IP, :]; d_aux = d_aux[IP]
 
+  time_left() > 0 || return nothing
   sol = try
     conicIP(Q_aux, c_aux, A_aux, b_aux, cone_dims, G_aux, d_aux;
             kktsolver = kktsolver,
             maxIters = maxIters,
-            timeLimit = timeLimit,
+            timeLimit = time_left(),
             verbose = false,
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
@@ -125,6 +129,9 @@ function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
                                 kktsolver = default_kktsolver,
                                 maxIters = 50, timeLimit = Inf)
 
+  t_start = time()
+  time_left() = timeLimit - (time() - t_start)
+  time_left() > 0 || return nothing
   n = length(c)
   m = size(A, 1)
   p = size(G, 1)
@@ -157,11 +164,12 @@ function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
   (consistent && !isempty(IP)) || return nothing
   G_aux = G_aux[IP, :]; d_aux = d_aux[IP]
 
+  time_left() > 0 || return nothing
   sol = try
     conicIP(Q_aux, c_aux, A_aux, b_aux, cone_dims, G_aux, d_aux;
             kktsolver = kktsolver,
             maxIters = maxIters,
-            timeLimit = timeLimit,
+            timeLimit = time_left(),
             verbose = false,
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
