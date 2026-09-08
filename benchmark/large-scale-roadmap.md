@@ -4,7 +4,9 @@
 rebased onto v0.4.0)
 **Baseline commit:** `119fb5e` (master, v0.4.0)
 **Status:** Tranches 0–2 implemented with the outstanding items below; Tranche 3
-(homogeneous embedding) is next. The diagnosis is historical and its locators refer
+started (centrality correctors implemented behind `centralityCorrectors`, homogeneous
+embedding designed in `benchmark/hsd-design.md` and awaiting decisions). The
+diagnosis is historical and its locators refer
 to the baseline; use the tranche status paragraphs for the current implementation.
 
 `docs/src/index.md:82` positions ConicIP as a solver for **moderate-size**
@@ -283,11 +285,22 @@ in 13 equilibrated. Two lessons for the remaining items: the retained best itera
 be judged on feasibility and complementarity only (a gap term hides the late iterate
 the certificate fallback needs), and predictor and corrector need separate refinement
 budgets.
-**Still missing from the original acceptance list:** recorded pivot repairs and
-inertia, bounded refactorization retries on failed refinement, an in-place callback
-variant, and separate absolute-gap/equality-residual fields. Refinement currently
-keeps the best correction and proceeds even if its target is missed. The measured
-coverage does not complete the n = 10⁶ or adversarial-accuracy targets.
+**Still missing from the original acceptance list:** an in-place callback variant,
+and the n = 10⁶ and adversarial-accuracy coverage. Landed since, on branch
+`tranche-3-prep` (2026-09-07): pivot repairs and inertia are recorded per
+factorization (`LDLDiagnostics` through the `kkt_diagnostics` hook, the verbose `kkt`
+column, `Solution.kkt_repaired`; inertia is recorded only, since QDLDL's `Dsigns`
+forces the pivot signs); a bounded shift-and-refactor retry exists behind
+`retry_max` (off by default until the `--opt retry_max=K` harness sweep decides;
+`Solution.kkt_refactors` counts it), triggered when a solve misses the refinement
+tolerance on a factorization that repaired a pivot or whose first correction did
+not contract; the equality residual and the relative gap are separate fields
+(`Solution.rEq`, `Solution.rGap`, MOI `RelativeGap`); and `:Optimal` additionally
+requires every cone and equality row to pass a row-wise relative residual test in
+the original coordinates (the aggregate test alone accepted an infeasible two-row
+LP with weights 1e-4/1e4 unequilibrated; harness iteration counts unchanged).
+Refinement still keeps the best correction and proceeds if its target is missed;
+the retry is the bounded escape when enabled.
 **Estimate was:** 4–8 focused weeks for one experienced contributor, of which the LDLᵀ
 prototype is 1–2 weeks. Scaling, safeguards, and validation are the rest.
 
@@ -475,9 +488,10 @@ threads (183 ms with one): 0.33 s over 12 iterations, of which LDLᵀ's cheaper 
 (23 solves at 2.5 ms vs 43 at 3.1 ms) claw back 0.08 s. Regularization and refinement are not
 the cause: all 24 combinations of `static_reg`, `dynamic_delta`, `refine_steps`, and
 `maxRefinementSteps` take 12 iterations with identical muFeas trajectories, and only
-`refine_steps = 0` costs anything (45–55 KKT solves). Presolve costs 0.21 s on this instance
-(10 %; lead: `_preprocess_core` calls `choose_kktsolver`, whose symbolic analysis
-`default_kktsolver` then repeats), the value rewrite for 1,500 3×3 SOC blocks 0.07 s. The
+`refine_steps = 0` costs anything (45–55 KKT solves). The harness's `t_presolve_est`
+(0.21 s here) is a subtraction of two runs, not a measured phase: instrumented, the
+presolve overhead is 23 ms (`_choose_kktsolver` 8.6 ms, of which AMD 3 ms), too small to
+be worth reusing the ordering; the value rewrite for 1,500 3×3 SOC blocks costs 0.07 s. The
 LDLᵀ route therefore trades 0.2 s for 2.4 GiB less allocation on the instance whose factor is
 nearly dense; recovering it means BLAS-3 in the factorization (supernodal or a dense
 trailing block), not a default change. No default was changed.
@@ -507,8 +521,20 @@ trailing block), not a default change. No default was changed.
 
 ### Tranche 3: robustness and iteration count
 
-**Status:** not started. **Estimate:** homogeneous embedding is a separate multiweek
-effort; correctors are 1–2 weeks including measurement.
+**Status:** started on branch `tranche-3-prep` (2026-09-07). Item 2 is implemented:
+Gondzio multiple centrality correctors behind `centralityCorrectors = K` (default 0),
+with the Jordan-frame spectral projection for R, Q and S cones (`src/correctors.jl`),
+one extra back-solve per corrector on the current factorization, acceptance by step
+length (δα = 0.1, β ∈ [0.1, 10], γ = 0.1). On the contract mixes and the banded LP/QP,
+K = 2 saves 0–3 iterations for 5–14 extra solves; the default is decided by the
+full-harness sweep over K ∈ {0, 1, 2, 3} (total time down, no instance slower by more
+than 5 %), pending. Item 1 is a design note, `benchmark/hsd-design.md` (embedding with
+the quadratic term, Newton system through the existing factorization by eliminating
+the τ column, termination and certificates from τ and κ, interactions, test plan,
+`method = :classic | :hsd` migration), awaiting the maintainer's §7 decisions before
+implementation; its prototype exposed the termination-normalization hole now closed by
+the row-wise residual test (Tranche 1 status). **Estimate:** homogeneous embedding is a
+separate multiweek effort; correctors are 1–2 weeks including measurement.
 
 1. Homogeneous self-dual embedding, compatible with a quadratic objective (Clarabel's
    formulation is the reference), replacing the certificate screens and the
@@ -601,7 +627,12 @@ is a stretch hypothesis, not a milestone: pure Julia is not the obstacle (Clarab
 is pure Julia), but shared QDLDL machinery does not confer shared robustness, assembly
 efficiency, or cone-implementation quality. Benchmark native QPs against native-QP
 solvers; report the ECOS reformulation cost separately. Include presolve and MOI
-assembly in end-to-end times.
+assembly in end-to-end times. The comparison harness exists:
+`benchmark/baselines.jl --solver clarabel|ecos|conicip-moi` feeds every solver the
+same problem tuple through `benchmark/moi_model.jl` (file instances assembled once by
+`ConicIP.Optimizer` with `assemble_only = true`), verifies each answer against the
+original data with the suite's residuals, and `benchmark/compare.jl` joins the CSVs
+(solved and verified counts, shifted geometric means of time and iterations).
 
 ## Regimes the harness must cover
 

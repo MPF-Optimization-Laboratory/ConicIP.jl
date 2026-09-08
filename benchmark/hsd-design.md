@@ -358,6 +358,16 @@ item 8.
    testset, or add a row-wise relative residual test `max_i |r_i| / (1 + |b_i| +
    (|A||y|)_i + |s_i|) < optTol` alongside it (a `:classic`-affecting change, to be
    measured on the harness before HSD lands).
+   **Decided (review round, 2026-09-07):** the row-wise test is in `:classic` for the
+   cone and equality rows (`src/ConicIP.jl`, termination block). The point that
+   terminates the aggregate test passes it on every `--quick` instance and on the
+   Miles κ-scaling family (largest value 4.4e-11), so no iteration count changed; the
+   classic solver itself was caught by it on a two-row LP (`x ≥ 1` at weight 1e-4,
+   `x ≤ 0.5` at weight 1e4, unequilibrated: `:Optimal` at x ≈ 0.5, now `:Infeasible`).
+   The stationarity-row analogue is *not* added: it fails on 9 of 15 Miles-3 κ points
+   by two to three orders of magnitude (up to 1.1e-3 at κ = 1e8, an instance that
+   already needs 40 iterations), because a free variable's row with a tiny cost
+   coefficient turns it into an absolute test. HSD inherits the decision.
 9. **Smoke-test instance.** Recover and pin the roadmap's 35-iteration unbounded
    SOCP (seed and generator), or accept the §5 generator family in its place.
 10. **`Solution.tau` / `Solution.kappa`** as new trailing fields (recommended) vs

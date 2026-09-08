@@ -33,6 +33,11 @@ ConicIP.Solution
 | `muFeas` | `Real` | Complementarity residual |
 | `Iter` | `Integer` | Number of iterations |
 | `Mu` | `Real` | Final barrier parameter |
+| `rEq` | `Real` | Relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))` of the returned point; `NaN` when no iterate was evaluated or a certificate is returned |
+| `rGap` | `Real` | Relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`, the quantity the gap test compares with `optTol`; `NaN` when unset |
+| `kkt_solves` | `Int` | KKT back-solves performed by the main loop |
+| `kkt_repaired` | `Int` | Pivots the KKT solver dynamically regularized, summed over the solve (0 unless the solver reports diagnostics; see the KKT-solver guide) |
+| `kkt_refactors` | `Int` | Refactorizations after a regularization bump (`kktsolver_ldl` with `retry_max > 0`), summed over the solve |
 
 **Status values:**
 
@@ -133,5 +138,10 @@ ConicIP.identical_sparse_structure
 ConicIP.count_lift
 ConicIP.count_dense
 ConicIP._psd_moi_vecm_info
+ConicIP.kkt_diagnostics
+ConicIP.LDLDiagnostics
+ConicIP.spectral_map!
+ConicIP.clip_spectral!
+ConicIP.centrality_correction!
 ConicIP._psd_vecm_to_moi
 ```

@@ -905,7 +905,7 @@ end
 
 # Relative duality gap |vᵀs| / (1 + |pobj + offset|) of the returned point,
 # the quantity the solver's gap test measures (`Solution.rGap`). NaN when
-# there is no result to describe.
+# there is no result to describe or the result is a certificate.
 MOI.supports(::Optimizer, ::MOI.RelativeGap) = true
 function MOI.get(model::Optimizer, ::MOI.RelativeGap)
     sol = model.sol

@@ -7,6 +7,13 @@ uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- `:Optimal` additionally requires every cone and equality row to pass a
+  row-wise relative residual test, `|rᵢ| / (1 + |bᵢ| + (|A||y|)ᵢ + |sᵢ|) < optTol`
+  (`|rᵢ| / (1 + |dᵢ| + (|G||y|)ᵢ)` for equalities), in the original
+  coordinates. The aggregate 2-norm test alone accepted a point violating a
+  small-scale row when the data span many orders of magnitude (an infeasible
+  pair `x ≥ 1` at weight 1e-4, `x ≤ 0.5` at weight 1e4 was reported optimal
+  unequilibrated). Iteration counts on the harness are unchanged.
 - **Breaking (direct API):** the status `:Unbounded` is now `:DualInfeasible`
   and `:AlmostUnbounded` is `:AlmostDualInfeasible`. The validated ray
   certifies dual infeasibility; primal unboundedness additionally needs
@@ -73,6 +80,34 @@ uses [Semantic Versioning](https://semver.org/).
   `cached_kktsolver_ldl()`.
 
 ### Added
+- `Solution` fields `rEq` (relative equality residual), `rGap` (relative
+  duality gap, the quantity the gap test measures; also `MOI.RelativeGap`),
+  `kkt_repaired` (dynamically regularized pivots) and `kkt_refactors`
+  (retry refactorizations), the last two summed over the solve. The verbose
+  table gains `kkt` (`repaired/refactors`) and `cc` columns.
+- `ConicIP.kkt_diagnostics(solve3x3)`: unexported hook through which a KKT
+  solver reports per-factorization diagnostics; `kktsolver_ldl` implements
+  it with an `LDLDiagnostics` record (repairs, inertia, shifts in effect,
+  unregularized residual).
+- `kktsolver_ldl` keywords `retry_max` (default 0, off), `retry_factor`,
+  `shift_floor`, `shift_max`: a bounded shift-and-refactor retry when a
+  solve misses the refinement tolerance on a factorization that repaired a
+  pivot or whose first correction did not contract. Bumped shifts do not
+  outlive the factorization.
+- `centralityCorrectors = K` (direct API and MOI option, default 0):
+  Gondzio multiple centrality correctors with the Jordan-frame spectral
+  projection for R, Q and S cones (`src/correctors.jl`), one extra
+  back-solve per corrector on the current factorization.
+- MOI option `assemble_only`: `optimize!` returns after assembling the
+  solver's matrices (`OPTIMIZE_NOT_CALLED`, `ResultCount == 0`).
+- Benchmark: `benchmark/baselines.jl` runs the instance set through
+  Clarabel, ECOS or ConicIP-via-MOI from one problem tuple
+  (`benchmark/moi_model.jl`), `benchmark/compare.jl` joins result CSVs;
+  `suite.jl --opt key=value,...` passes solver options, `--timeout` kills a
+  child process, and the CSV gains `kktsolver`, `kkt_repaired`,
+  `kkt_refactors` columns. `benchmark/sumnorms_diag.jl` attributes the
+  sum-of-norms SOCP regression; `benchmark/hsd-design.md` is the design
+  note for the homogeneous self-dual embedding.
 - `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
   quasi-definite KKT system (QDLDL.jl backend, pure Julia). Fixed pattern
   with AMD ordering analysed once, numeric refactorization in place each
@@ -135,6 +170,13 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- A certificate return (`:Infeasible`, `:DualInfeasible`) no longer carries
+  the discarded iterate's `rEq`/`rGap`; they are `NaN`, like `pobj`, and
+  `MOI.RelativeGap` is `NaN` for such a result.
+- `benchmark/suite.jl --opt` rejects entries with an empty key or value;
+  `test/testdata.jl` is no longer included twice when `suite.jl` and
+  `issue10.jl` are loaded into one module (no more "Replacing docs"
+  warnings from the review tests).
 - Automatic routing uses LDL for non-SDP problems with more equality rows
   than variables; dense QR cannot factor these systems. Its flop estimate
   is `Inf` in this unsupported regime instead of zero or negative.

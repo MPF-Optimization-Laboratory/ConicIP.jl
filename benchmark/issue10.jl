@@ -12,7 +12,9 @@
 
 using ConicIP, SparseArrays, LinearAlgebra, Downloads
 
-include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
+# Guarded: suite.jl includes this file after loading testdata.jl itself.
+isdefined(@__MODULE__, :mpb_to_conicip) ||
+    include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
 
 const GIST_URL = "https://gist.githubusercontent.com/mlubin/" *
     "79304a15043498a2f7da35d548f3610c/raw/" *

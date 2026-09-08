@@ -111,6 +111,12 @@ end
         @test parse_opts("") == Dict{Symbol, Any}()
         @test parse_opts(" verbose = true ") == Dict(:verbose => true)
         @test_throws ArgumentError parse_opts("maxIters")
+        # negative numbers, floats without an integer form, and values that
+        # themselves contain "=" (split once); empty keys or values are errors
+        @test parse_opts("staticReg=-1e-8,maxIters=-3,x=a=b,timeLimit=Inf") ==
+              Dict(:staticReg => -1e-8, :maxIters => -3, :x => "a=b", :timeLimit => Inf)
+        @test_throws ArgumentError parse_opts("=3")
+        @test_throws ArgumentError parse_opts("a=")
 
         prob = lp_band(40)
         @test kkt_solver_name(prob) in ("kktsolver_qr", "kktsolver_ldl")
@@ -128,6 +134,47 @@ end
         end
         @test isempty(SOLVER_OPTS) && isempty(OPT_STRING[])
         @test solve_direct(prob).status == :Optimal
+    end
+
+    @testset "Non-optimal statuses recover without throwing" begin
+        function rec(prob; kw...)
+            opt = bridged_cached(ConicIP.Optimizer)
+            MOI.set(opt, MOI.Silent(), true)
+            for (k, v) in kw
+                MOI.set(opt, MOI.RawOptimizerAttribute(string(k)), v)
+            end
+            maps = build_moi_model(opt, prob)
+            MOI.optimize!(opt)
+            r = recover_solution(opt, maps, prob)
+            @test !verified(r, residuals(prob, r))
+            return r
+        end
+        # primal infeasible (certificate result: v is the ray, y is NaN)
+        r = rec((Q = spzeros(1, 1), c = [0.0], A = sparse([1.0; -1.0][:, :]), b = [1.0, 1.0],
+                 cone_dims = [("R", 2)], G = spzeros(0, 1), d = zeros(0)))
+        @test r.status == :INFEASIBLE
+        @test all(isnan, r.y) && all(isfinite, r.v) && isempty(r.w)
+        # iteration limit and time limit: statuses are the MOI names, no throw
+        r = rec(lp_band(200); maxIters = 2, certFallback = false)
+        @test r.status == :ITERATION_LIMIT && length(r.y) == 200
+        r = rec(lp_band(200); timeLimit = 0.0)
+        @test r.status == :TIME_LIMIT
+    end
+
+    @testset "Subprocess timeout" begin
+        # A child that never finishes is killed after `timeout` seconds and
+        # reported as TIMEOUT, with whatever it printed before.
+        script = tempname() * ".jl"
+        write(script, "println(\"status=RUNNING\"); flush(stdout); sleep(120)\n")
+        inst = direct("sleepy", "test", () -> nothing)
+        t = @elapsed row = run_subprocess(inst; timeout = 5.0, script = script)
+        @test row["status"] == "TIMEOUT"
+        @test t < 60
+        # A child that exits normally is read back as it printed
+        write(script, "println(\"status=DONE\"); println(\"iters=3\")\n")
+        row = run_subprocess(inst; timeout = 60.0, script = script)
+        @test row["status"] == "DONE" && row["iters"] == "3"
+        rm(script)
     end
 
     @testset "CSV writer and result row shape" begin

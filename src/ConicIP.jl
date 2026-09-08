@@ -75,6 +75,24 @@ function _absprod_norm!(out, M, x, D = nothing, σ = 1.0)
   return norm(out) / σ
 end
 
+# Largest row-wise relative residual of a block of rows,
+#   max_i |r_i| / (1 + |b_i| + prod_i + |s_i|),
+# with `prod` the componentwise product |M||y| already in the original
+# coordinates (as _absprod_norm! leaves it) and `s` the slack (`nothing`
+# for equality rows). `D` maps the equilibrated `r`, `b`, `s` back to the
+# original coordinates (each divided by D_i). Allocation-free.
+function _rowwise_max(r, b, prod, s, D = nothing)
+  isempty(r) && return 0.0
+  mx = 0.0
+  @inbounds for i in eachindex(r)
+    Di  = D === nothing ? 1.0 : D[i]
+    si  = s === nothing ? 0.0 : abs(s[i]) / Di
+    den = 1 + abs(b[i]) / Di + prod[i] + si
+    mx  = max(mx, abs(r[i]) / Di / den)
+  end
+  return mx
+end
+
 # ──────────────────────────────────────────────────────────────
 #  3x1 block vector
 # ──────────────────────────────────────────────────────────────
@@ -556,9 +574,10 @@ Residual and diagnostic tail:
 
 - `rEq::Real` -- relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))`
   of the returned point (`prFeas = max(rPr, rEq)`); `NaN` when no iterate
-  was evaluated
+  was evaluated or when a certificate is returned (the iterate is discarded)
 - `rGap::Real` -- relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`,
-  the quantity the termination test compares with `optTol`; `NaN` when unset
+  the quantity the termination test compares with `optTol`; `NaN` when
+  unset or when a certificate is returned
 - `kkt_repaired::Int` -- pivots the KKT solver dynamically regularized,
   summed over every factorization of the solve (0 unless the solver
   reports diagnostics; see `kkt_diagnostics`)
@@ -613,6 +632,7 @@ function claim_infeasible!(sol::Solution, w̄, v̄)
   fill!(sol.y, NaN); fill!(sol.s, NaN)
   sol.w[:] = w̄; sol.v[:] = v̄
   sol.pobj = NaN; sol.dobj = NaN
+  sol.rEq  = NaN; sol.rGap = NaN     # they described the discarded iterate
   sol.status = :Infeasible
   sol.has_certificate = true
   return sol
@@ -624,6 +644,7 @@ function claim_dual_infeasible!(sol::Solution, ȳ, A)
   sol.y[:] = ȳ; sol.s[:] = A*ȳ
   fill!(sol.w, NaN); fill!(sol.v, NaN)
   sol.pobj = NaN; sol.dobj = NaN
+  sol.rEq  = NaN; sol.rGap = NaN     # they described the discarded iterate
   sol.status = :DualInfeasible
   sol.has_certificate = true
   return sol
@@ -712,7 +733,12 @@ scaled by `√2`, so that `dot(vecm(X), vecm(Y)) == tr(X*Y)`. See
 
 Returns a [`Solution`](@ref) whose `status` is one of
 
-- `:Optimal` — `max(rDu, rPr, rCp, rEq, rGap) < optTol`.
+- `:Optimal` — `max(rDu, rPr, rCp, rEq, rGap) < optTol`, and every cone
+  and equality row also passes the row-wise test
+  `|rᵢ| / (1 + |bᵢ| + (|A||y|)ᵢ + |sᵢ|) < optTol`
+  (`|rᵢ| / (1 + |dᵢ| + (|G||y|)ᵢ)` for equalities) in the original
+  coordinates; the aggregate 2-norm test alone can accept a point that
+  violates a small-scale row when the data span many orders of magnitude.
 - `:Infeasible` / `:DualInfeasible` — a ray passed a screen *and* was accepted
   by the corresponding validator; `has_certificate` is then `true`.
 - `:AlmostInfeasible` / `:AlmostDualInfeasible` — set only at loop exhaustion,
@@ -1482,7 +1508,29 @@ function _conicIP(
     # one with a small gap.
     bestMeasure = max(rDu, rPr, rCp, rEq)
     optMeasure  = max(bestMeasure, rGap)
-    optimal     = optMeasure < optTol
+    # Row-wise feasibility, in the original coordinates, as an additional
+    # requirement for :Optimal. The aggregate tests above normalize by the
+    # 2-norm of the whole block, so when the data span many orders of
+    # magnitude a small-scale row can be violated by its own scale and
+    # still vanish in the aggregate: x ≥ 1 (row weight 1e-4) together with
+    # x ≤ 0.5 (weight 1e4) was reported optimal at x ≈ 0.5, unequilibrated,
+    # with prFeas = 4e-8 and a row-wise residual of 1.5e-4. Every row is
+    # therefore also held to |r_i| / (1 + |b_i| + (|A||y|)_i + |s_i|) < optTol
+    # (cone rows) and |r_i| / (1 + |d_i| + (|G||y|)_i) < optTol
+    # (equalities). Measured on the harness and the scaling tests, the
+    # iterate that passes the aggregate test passes these too, so the
+    # iteration counts do not change; the stationarity rows are not tested
+    # this way (a free variable's row with a tiny cost coefficient becomes
+    # an absolute test, and the κ-scaling instances then never terminate).
+    # _nrm_m and _nrm_p still hold |A||y| and |G||y| in original coordinates.
+    if scaling === nothing
+      rPrRow = _rowwise_max(r0.v, b, _nrm_m, z.s)
+      rEqRow = _rowwise_max(r0.w, d, _nrm_p, nothing)
+    else
+      rPrRow = _rowwise_max(r0.v, b, _nrm_m, z.s, scaling.Dr)
+      rEqRow = _rowwise_max(r0.w, d, _nrm_p, nothing, scaling.De)
+    end
+    optimal     = optMeasure < optTol && max(rPrRow, rEqRow) < optTol
     # An iterate that passes the full test is stored unconditionally: the
     # gap is not part of bestMeasure, so an earlier iterate with a smaller
     # bestMeasure but a larger gap could otherwise be the one returned as

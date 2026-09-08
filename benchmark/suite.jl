@@ -39,7 +39,10 @@ using ConicIP, SparseArrays, LinearAlgebra, Printf, Random, Downloads, Dates
 using MathOptInterface
 const MOI = MathOptInterface
 
-include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
+# testdata.jl is guarded so that a module that already loaded it (the test
+# suite, or issue10.jl below) does not redefine its methods.
+isdefined(@__MODULE__, :socp_sum_of_norms) ||
+    include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
 include(joinpath(@__DIR__, "issue10.jl"))          # load_issue10()
 
 const CACHE = joinpath(@__DIR__, ".cache")
@@ -204,8 +207,10 @@ function parse_opts(str::AbstractString)
     opts = Dict{Symbol, Any}()
     for kv in split(str, ','; keepempty = false)
         occursin('=', kv) || throw(ArgumentError("--opt entry \"$kv\" is not key=value"))
-        k, v = split(kv, '='; limit = 2)
-        opts[Symbol(strip(k))] = _parse_opt_value(strip(v))
+        k, v = strip.(split(kv, '='; limit = 2))
+        (isempty(k) || isempty(v)) &&
+            throw(ArgumentError("--opt entry \"$kv\" has an empty key or value"))
+        opts[Symbol(k)] = _parse_opt_value(v)
     end
     return opts
 end
