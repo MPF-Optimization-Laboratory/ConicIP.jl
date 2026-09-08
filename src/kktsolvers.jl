@@ -65,9 +65,18 @@ end
 
 # Per-iteration flop estimate for kktsolver_ldl from the symbolic
 # factorization: Σⱼ (column count of L)², the cost of the rank-1 updates.
+# The column counts come from the elimination tree alone (O(nnz + N) time
+# and memory); a logical `qdldl` would also allocate the pattern of L,
+# which for a badly filling matrix is gigabytes spent on an estimate.
 function _ldl_flops(pat)
-  Fl = qdldl(pat.K; perm = pat.perm, logical = true)
-  return sum(abs2, Float64.(Fl.workspace.Lnz))
+  K = pat.K
+  Kp = pat.perm === nothing ? K :
+       first(QDLDL.permute_symmetric(K, invperm(pat.perm)))
+  N = size(Kp, 1)
+  Lnz = zeros(Int, N); etree = zeros(Int, N); work = zeros(Int, N)
+  s = QDLDL.QDLDL_etree!(N, Kp.colptr, Kp.rowval, work, Lnz, etree)
+  s < 0 && return Inf                    # structurally deficient diagonal
+  return sum(abs2, Float64.(Lnz))
 end
 
 """
