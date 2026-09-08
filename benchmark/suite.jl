@@ -1,7 +1,7 @@
 # Benchmark harness (large-scale roadmap, tranche 0)
 # ==================================================
 # A small reproducible instance set with the measurements the roadmap says
-# every later tranche must be judged by: phase timings, iteration and
+# every later tranche must be judged by: partial timing estimates, iteration and
 # KKT-solve counts, a fill proxy for the KKT factorization, peak RSS in a
 # fresh process, and residuals recomputed from the original data.
 #
@@ -139,7 +139,7 @@ const INSTANCES = Instance[
 function residuals(prob, sol)
     Q, c, A, b, G, d = prob.Q, prob.c, prob.A, prob.b, prob.G, prob.d
     y, w, v, s = sol.y, sol.w, sol.v, sol.s
-    all(isfinite, y) || return (rDu = NaN, rPr = NaN, rEq = NaN, gap = NaN, margin = NaN)
+    all(isfinite, y) || return (rDu = NaN, rPr = NaN, rEq = NaN, gap = NaN, margin = NaN, dual_margin = NaN)
     Qy   = Q*y
     absQ = ConicIP._absmat(Q); absA = ConicIP._absmat(A); absG = ConicIP._absmat(G)
     ay = abs.(y); aw = abs.(w); av = abs.(v)
@@ -156,12 +156,15 @@ function residuals(prob, sol)
     dobj = -0.5*dot(y, Qy) + dot(b, v) - dot(d, w)
     gap  = abs(pobj - dobj) / (1 + abs(pobj))
     margin = ConicIP.cone_margin(s, prob.cone_dims)
-    return (rDu = rDu, rPr = rPr, rEq = rEq, gap = gap, margin = margin)
+    dual_margin = ConicIP.cone_margin(v, prob.cone_dims)
+    return (rDu = rDu, rPr = rPr, rEq = rEq, gap = gap, margin = margin,
+            dual_margin = dual_margin)
 end
 
 # Structural nonzeros of the 3×3 KKT matrix at identity scaling, and the
-# fill of its UMFPACK LU (nnz(L)+nnz(U)) as a proxy for what any sparse
-# KKT solver will pay. Skipped above `fill_max` rows.
+# fill of its UMFPACK LU (nnz(L)+nnz(U)). This is an identity-scaling
+# diagnostic, NOT the selected solver's factor fill: SOC off-diagonals
+# and lifted auxiliaries are absent. Skipped above `fill_max` rows.
 function kkt_fill(prob; fill_max = 300_000)
     n = length(prob.c); m = size(prob.A, 1); p = size(prob.G, 1)
     Q = sparse(prob.Q); A = sparse(prob.A); G = sparse(prob.G)
@@ -173,6 +176,11 @@ function kkt_fill(prob; fill_max = 300_000)
     lu_nnz = try nnz(lu(Z)) catch; -1 end
     return (kkt_nnz = kkt_nnz, lu_nnz = lu_nnz)
 end
+
+# Accuracy is checked independently of the solver's termination fields.
+verified(sol, res; tol = 1e-6) = sol.status == :Optimal &&
+    max(res.rDu, res.rPr, res.rEq, res.gap) <= tol &&
+    res.margin >= -tol && res.dual_margin >= -tol
 
 function solve_direct(prob; preprocess = true)
     entry = preprocess ? preprocess_conicIP : conicIP
@@ -186,7 +194,8 @@ function run_direct(inst::Instance)
     data_nnz = nnz(sparse(prob.Q)) + nnz(sparse(prob.A)) + nnz(sparse(prob.G))
     fill = kkt_fill(prob)
     # Two solves with preprocessing (report the better), one without to
-    # separate the presolve's own cost.
+    # estimate the presolve cost by subtraction. This is NOT an instrumented
+    # phase time: the two solves can take different routes/iterations.
     t1 = @timed solve_direct(prob)
     t2 = @timed solve_direct(prob)
     (stats, sol) = t1.time <= t2.time ? (t1, t1.value) : (t2, t2.value)
@@ -197,11 +206,12 @@ function run_direct(inst::Instance)
         "kkt_nnz" => fill.kkt_nnz, "lu_nnz" => fill.lu_nnz,
         "status" => string(sol.status), "iters" => sol.Iter,
         "kkt_solves" => sol.kkt_solves,
-        "t_total" => stats.time, "t_presolve" => max(stats.time - t_raw, 0.0),
+        "t_total" => stats.time, "t_presolve_est" => max(stats.time - t_raw, 0.0),
         "t_assembly" => 0.0,
         "alloc_gib" => stats.bytes / 2^30,
         "rDu" => res.rDu, "rPr" => res.rPr, "rEq" => res.rEq,
-        "gap" => res.gap, "margin" => res.margin,
+        "gap" => res.gap, "margin" => res.margin, "dual_margin" => res.dual_margin,
+        "verified" => verified(sol, res),
     )
 end
 
@@ -223,23 +233,28 @@ function run_moi(inst::Instance)
     n = raw.n
     m = raw.ineq_A === nothing ? 0 : size(raw.ineq_A, 1)
     p = raw.eq_G === nothing ? 0 : size(raw.eq_G, 1)
-    data_nnz = (raw.ineq_A === nothing ? 0 : nnz(raw.ineq_A)) +
+    data_nnz = (raw.Q_int === nothing ? 0 : nnz(raw.Q_int)) +
+               (raw.ineq_A === nothing ? 0 : nnz(raw.ineq_A)) +
                (raw.eq_G === nothing ? 0 : nnz(raw.eq_G))
-    pobj = try MOI.get(r.opt, MOI.ObjectiveValue()) catch; NaN end
-    dobj = try MOI.get(r.opt, MOI.DualObjectiveValue()) catch; NaN end
+    # Reconstruct from the original assembled data, not sol.prFeas/duFeas
+    # or the solver's dual objective. Presolve and equilibration have both
+    # been undone on sol; use the internal minimization sense consistently.
+    prob = (Q = raw.Q_int === nothing ? spzeros(n,n) : raw.Q_int,
+            c = raw.c_int, A = raw.ineq_A, b = raw.ineq_b,
+            G = raw.eq_G, d = raw.eq_d, cone_dims = raw.cone_dims)
+    res = residuals(prob, sol)
     return Dict(
         "n" => n, "m" => m, "p" => p, "data_nnz" => data_nnz,
         "kkt_nnz" => -1, "lu_nnz" => -1,
         "status" => string(MOI.get(r.opt, MOI.TerminationStatus())),
         "iters" => sol === nothing ? 0 : sol.Iter,
         "kkt_solves" => sol === nothing ? 0 : sol.kkt_solves,
-        "t_total" => r.t_asm + r.t_opt, "t_presolve" => NaN,
-        "t_assembly" => r.t_asm,
+        "t_total" => r.t_asm + r.t_opt, "t_presolve_est" => NaN,
+        "t_assembly" => r.t_asm + raw.assembly_time,
         "alloc_gib" => NaN,
-        "rDu" => sol === nothing ? NaN : sol.duFeas,
-        "rPr" => sol === nothing ? NaN : sol.prFeas,
-        "rEq" => NaN,
-        "gap" => abs(pobj - dobj) / (1 + abs(pobj)), "margin" => NaN,
+        "rDu" => res.rDu, "rPr" => res.rPr, "rEq" => res.rEq,
+        "gap" => res.gap, "margin" => res.margin, "dual_margin" => res.dual_margin,
+        "verified" => verified(sol, res),
     )
 end
 
@@ -266,9 +281,9 @@ end
 # ──────────────────────────────────────────────────────────────
 
 const COLUMNS = ["name", "family", "n", "m", "p", "data_nnz", "kkt_nnz", "lu_nnz",
-                 "status", "iters", "kkt_solves", "t_total", "t_presolve",
+                 "status", "iters", "kkt_solves", "t_total", "t_presolve_est",
                  "t_assembly", "alloc_gib", "maxrss_mb",
-                 "rDu", "rPr", "rEq", "gap", "margin"]
+                 "rDu", "rPr", "rEq", "gap", "margin", "dual_margin", "verified"]
 
 function run_subprocess(inst::Instance)
     cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) $(@__FILE__) --one $(inst.name)`

@@ -31,8 +31,8 @@ The preprocessor performs three steps:
    `gᵢⱼ yⱼ = dᵢ`, fixes `yⱼ = dᵢ/gᵢⱼ`. The row and the column are removed
    and the right-hand sides and objective adjusted; the fixed value and
    the row's dual multiplier are restored on the way out. Two singletons
-   on the same column are kept as ordinary rows, so a conflict is
-   reported as a certified infeasibility.
+   on the same column are dropped when their fixed values agree to
+   tolerance; conflicting values are screened for a Farkas certificate.
 
 2. **Equality constraint reduction** (`rank_check`): uses
    [`imcols`](@ref ConicIP.imcols) to identify and remove linearly
@@ -46,10 +46,13 @@ Steps 2 and 3 are the expensive ones (two sparse QR factorizations) and
 exist for KKT solvers that need a full-rank `G`. `rank_check = :auto`
 (default) runs them only when such a solver will be used — dense QR for
 small and semidefinite problems, or an explicit solver other than
-[`kktsolver_ldl`](@ref ConicIP.kktsolver_ldl) — since the LDLᵀ solver
+[`kktsolver_ldl`](@ref ConicIP.kktsolver_ldl) or its cached callable — since the LDLᵀ solver
 regularizes the equality block itself. `:always` and `:never` override.
 
-After preprocessing, the reduced problem is passed to `conicIP`.
+After preprocessing, the reduced problem is passed to `conicIP`. Postsolve
+recomputes feasibility against the original data and revalidates certificates.
+A reduced optimum that fails the original `optTol` is returned as `:Error`,
+with the restored point available for inspection.
 
 ## The `imcols` Function
 

@@ -135,6 +135,11 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- The benchmark independently recomputes MOI residuals and the objective gap
+  from original assembled data, includes Hessian nonzeros and internal MOI
+  assembly time, and checks both primal and dual cone membership. Its
+  `verified` column distinguishes numerical verification from solver status;
+  `t_presolve_est` labels subtraction-based timing as an estimate.
 - Dual objective reporting uses `−½yᵀQy − dᵀw + bᵀv`, including at
   nonstationary iterates; the old expression had incorrect residual terms.
 - The MOI convexity check scales the Hessian before applying a numerical

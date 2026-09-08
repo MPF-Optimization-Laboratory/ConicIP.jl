@@ -6,6 +6,7 @@ using Random
 
 include("testdata.jl")
 include("review_tests.jl")
+include("review_benchmark.jl")
 
 const tol    = 1e-3
 const optTol = 1e-7

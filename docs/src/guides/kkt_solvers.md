@@ -37,8 +37,9 @@ type of the inputs:
    solver's storage estimate ([`dense_kkt_bytes`](@ref ConicIP.dense_kkt_bytes),
    roughly `2n² + 2m(n−p) + 2(n−p)²` doubles) exceeds
    `dense_bytes_max` (default 4 GiB), the LDLᵀ solver is used whatever
-   the rules below would say. At that size dense QR is an out-of-memory
-   error, not a slow solve.
+   the rules below would say. This is a routing estimate, not a peak-memory
+   bound. For an SDP problem, exceeding the budget instead raises an
+   `ArgumentError`: sparse SDP scaling blocks would also be dense.
 1. **Any SDP cone → `kktsolver_qr`.** The dense double-QR method is the
    numerically robust choice for the dense SDP scaling blocks. This routing
    sets the cost of a semidefinite solve; see
@@ -49,7 +50,7 @@ type of the inputs:
    would cost more than it saves.
 3. **Otherwise, predicted flops decide.** A symbolic analysis of the
    quasi-definite KKT pattern gives the LDLᵀ cost `Σⱼ nnz(L₍:,ⱼ₎)²`; the
-   dense cost is `m(n−p)² + (n−p)³/3`
+   dense cost includes `m(n−p)² + (n−p)³/3`, setup, and back-solves
    ([`dense_kkt_flops`](@ref ConicIP.dense_kkt_flops)). Dense QR is chosen
    when its estimate is below ten times the LDLᵀ estimate (the factor
    reflects BLAS versus scalar code), otherwise `kktsolver_ldl`. Many

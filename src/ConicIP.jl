@@ -536,7 +536,7 @@ Return type of [`conicIP`](@ref) and [`preprocess_conicIP`](@ref).
 | `:Infeasible`/`:DualInfeasible` *without ray* | all `NaN` | all `NaN` | all `NaN` | all `NaN` | `NaN` | `false` |
 | `:Abandoned`, `:AlmostInfeasible`, `:AlmostDualInfeasible`, `:TimeLimit`, `:Error` | best iterate | best iterate | best iterate | best iterate | best iterate | `false` |
 
-One exception: when a ray found on the equilibrated data fails revalidation
+One exception: when a ray found on equilibrated or presolved data fails revalidation
 against the original data (`sol.message` says so), the `:Almost*` or
 `:Abandoned` solution holds that ray in the ray fields, not the best
 iterate.
@@ -687,7 +687,7 @@ scaled by `√2`, so that `dot(vecm(X), vecm(Y)) == tr(X*Y)`. See
 
 Returns a [`Solution`](@ref) whose `status` is one of
 
-- `:Optimal` — `max(rDu, rPr, rCp, rEq) < optTol`.
+- `:Optimal` — `max(rDu, rPr, rCp, rEq, rGap) < optTol`.
 - `:Infeasible` / `:DualInfeasible` — a ray passed a screen *and* was accepted
   by the corresponding validator; `has_certificate` is then `true`.
 - `:AlmostInfeasible` / `:AlmostDualInfeasible` — set only at loop exhaustion,

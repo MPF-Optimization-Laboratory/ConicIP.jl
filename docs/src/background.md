@@ -76,14 +76,25 @@ Each iteration consists of two phases:
 
 ## Convergence Criteria
 
-The solver monitors three residuals:
+The solver checks primal feasibility, stationarity, complementarity, and a
+relative gap, all in the original coordinates. Define
+`a = ‖|A||y|‖`, `g = ‖|G||y|‖`, `q = ‖|Q||y|‖`,
+`u = ‖|Gᵀ||w|‖`, and `vnorm = ‖|Aᵀ||v|‖`, with entrywise absolute values.
 
-- **Primal feasibility** (`prFeas`): `‖Ay - s - b‖ / (1 + ‖b‖)`
-- **Dual feasibility** (`duFeas`): `‖Qy + Gᵀw - Aᵀv - c‖ / (1 + ‖c‖)`
-- **Complementarity** (`muFeas`): `sᵀv / (1 + |cᵀy|)`
+- **Primal feasibility** (`prFeas`): the maximum of
+  `‖Ay - s - b‖ / (1 + max(‖b‖, a, ‖s‖))` and
+  `‖Gy - d‖ / (1 + max(‖d‖, g))`.
+- **Dual feasibility** (`duFeas`):
+  `‖Qy + Gᵀw - Aᵀv - c‖ / (1 + max(‖c‖, q, u, vnorm))`.
+- **Complementarity** (`muFeas`): `‖λ ∘ λ‖ / (1 + |cᵀy|)`, where
+  `λ` is the Nesterov–Todd scaled cone variable and `∘` is the Jordan product.
+- **Relative gap**: `|sᵀv| / (1 + |pobj + objective_offset|)`.
 
-The solver terminates with status `:Optimal` when all three residuals
-fall below the tolerance `optTol` (default: `1e-6`).
+All four must be below `optTol` (default `1e-6`). These normwise feasibility
+ratios measure backward error; they do not bound each row's absolute violation.
+The complementarity gap equals the objective difference only at stationarity
+and primal feasibility. The reported dual objective is
+`−½yᵀQy − dᵀw + bᵀv`; away from stationarity it is an estimate, not a certified bound.
 
 ### The Certificate Pipeline
 

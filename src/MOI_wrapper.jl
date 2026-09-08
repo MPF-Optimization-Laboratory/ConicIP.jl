@@ -48,6 +48,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     max_sense::Bool
     objective_constant::Float64
     n::Int
+    cone_dims::Vector{Tuple{String, Int}} # original assembled cone partition
     c_int::Vector{Float64}         # internal objective vector handed to the solver
     Q_int::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # internal Hessian (nothing = 0)
     # Constraint row tracking for primal/dual recovery. Each constraint
@@ -143,7 +144,7 @@ _invalid_model_solution(n::Int, mA::Int, mG::Int, message::String) =
 
 function Optimizer(; kwargs...)
     model = Optimizer(
-        nothing, false, 0.0, 0, Float64[], nothing,
+        nothing, false, 0.0, 0, Tuple{String, Int}[], Float64[], nothing,
         Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Bool[],
         nothing, Float64[], Float64[],
         Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Float64[],
@@ -213,6 +214,7 @@ function MOI.empty!(model::Optimizer)
     model.n = 0
     model.solve_time = NaN
     model.assembly_time = NaN
+    empty!(model.cone_dims)
     empty!(model.c_int)
     model.Q_int = nothing
     empty!(model.eq_ci_map)
@@ -560,6 +562,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     # ── Assemble matrices (one sparse() per matrix) ──
     G, d = _assemble(tG, n)
     A, b = _assemble(tA, n)
+    dest.cone_dims = cone_dims
     dest.eq_G = G;   dest.eq_d = d
     dest.ineq_A = A; dest.ineq_b = b
     dest.assembly_time = time() - t_start

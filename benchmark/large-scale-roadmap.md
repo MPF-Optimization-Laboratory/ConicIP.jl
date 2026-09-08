@@ -3,8 +3,9 @@
 **Date:** 2026-09-06 (revised the same day after an independent review, then
 rebased onto v0.4.0)
 **Baseline commit:** `119fb5e` (master, v0.4.0)
-**Status:** planning document. No tranche has started. Update the Status line of a
-tranche when work on it lands, and keep the `file:line` references current.
+**Status:** Tranches 0–2 implemented with the outstanding items below; Tranche 3
+(homogeneous embedding) is next. The diagnosis is historical and its locators refer
+to the baseline; use the tranche status paragraphs for the current implementation.
 
 `docs/src/index.md:82` positions ConicIP as a solver for **moderate-size**
 LP/QP/SOCP/SDP problems and sends large-scale users to COSMO, Hypatia, SCS, and ECOS. This document
@@ -238,7 +239,7 @@ products. **Estimate was:** 1 week.
 
 ### Tranche 1: numerical core
 
-**Status:** done on branch `large-scale-roadmap` (2026-09-07), all eleven items:
+**Status:** implemented on branch `large-scale-roadmap` (2026-09-07), with gaps below:
 `kktsolver_ldl` with the lifted SOC form and QDLDL backend; flop-based default
 selection replacing the nnz/col rule, dense gate at 200, `kktsolver_2x2` with a
 factorization cache; predictor and corrector refinement with relative/absolute
@@ -282,6 +283,11 @@ in 13 equilibrated. Two lessons for the remaining items: the retained best itera
 be judged on feasibility and complementarity only (a gap term hides the late iterate
 the certificate fallback needs), and predictor and corrector need separate refinement
 budgets.
+**Still missing from the original acceptance list:** recorded pivot repairs and
+inertia, bounded refactorization retries on failed refinement, an in-place callback
+variant, and separate absolute-gap/equality-residual fields. Refinement currently
+keeps the best correction and proceeds even if its target is missed. The measured
+coverage does not complete the n = 10⁶ or adversarial-accuracy targets.
 **Estimate was:** 4–8 focused weeks for one experienced contributor, of which the LDLᵀ
 prototype is 1–2 weeks. Scaling, safeguards, and validation are the rest.
 
@@ -420,6 +426,13 @@ and fallback setup, with an expiry check on loop exhaustion as well.
 Dual objective reporting now uses the stationary quadratic dual formula; the MOI
 convexity guard uses diagonal congruence scaling to prevent an unrelated large block
 from masking negative curvature. Feasibility-sense models ignore cached objectives.
+The benchmark now independently recomputes MOI residuals and objective gaps, counts
+Hessian nonzeros and internal assembly time, and reports primal/dual cone membership
+and a `verified` flag. `t_presolve_est` is a timing subtraction, not an instrumented
+phase; the LU fill fields describe identity scaling, not the selected LDLᵀ factors.
+The harness still lacks separate setup/factor/back-solve/fallback timers. Earlier
+MOI residual/gap tables above used solver-reported diagnostics and must not be read
+as independently verified evidence at the quoted precision.
 Still open from the review: peak-memory estimate for the
 dense path (the 4 GiB figure is a routing estimate, not a bound).
 
@@ -442,8 +455,9 @@ v0.4.0 worktree with two compatibility shims (`kkt_solves`, `RawSolver` absent t
 
 v0.4.0's residuals on the same instances are typically 1e-8 to 1e-10 (relative, its own
 normalization); the current tree reports 1e-13 to 1e-16 in original coordinates. The one
-regression is the 1500-variable sum-of-norms SOCP: v0.4.0 took the dense path (3.6 GB),
-the current tree the lifted LDLᵀ with two more iterations; the LDLᵀ route wins on memory
+regression is the 1500-variable sum-of-norms SOCP (1,500 cones, 6,500 variables): v0.4.0 took the dense path (3.6 GB),
+the current tree LDLᵀ with two more iterations (all SOCs have dimension 3, below
+the lifting threshold); the LDLᵀ route wins on memory
 and loses 0.6 s. The 200 000-variable LP under v0.4.0 exited within a minute with no error
 text (memory, most likely).
 

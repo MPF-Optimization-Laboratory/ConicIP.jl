@@ -22,13 +22,13 @@ ConicIP.Solution
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `y` | `Matrix` | Primal variables |
-| `w` | `Matrix` | Dual variables for equality constraints (`Gy = d`) |
-| `v` | `Matrix` | Dual variables for inequality constraints (`Ay ≥ b`) |
+| `y` | `Vector{Float64}` | Primal variables |
+| `w` | `Vector{Float64}` | Dual variables for equality constraints (`Gy = d`) |
+| `v` | `Vector{Float64}` | Dual variables for inequality constraints (`Ay ≥ b`) |
 | `status` | `Symbol` | Termination status (see below) |
 | `pobj` | `Real` | Primal objective value |
-| `dobj` | `Real` | Dual objective value |
-| `prFeas` | `Real` | Primal feasibility residual |
+| `dobj` | `Real` | Stationary quadratic dual objective estimate |
+| `prFeas` | `Real` | Maximum cone/equality feasibility residual |
 | `duFeas` | `Real` | Dual feasibility residual |
 | `muFeas` | `Real` | Complementarity residual |
 | `Iter` | `Integer` | Number of iterations |
