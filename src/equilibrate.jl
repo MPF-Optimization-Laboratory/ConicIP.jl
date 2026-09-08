@@ -232,7 +232,7 @@ function _refresh_point!(sol::Solution, Q, c, A, b, G, d)
     rEq  = isempty(d) ? 0.0 :
            norm(G * y - d) / (1 + max(norm(d), norm(absG * ay)))
     pobj = 0.5 * dot(y, Qy) - cᵀy
-    dobj = pobj + dot(w, G * y - d) + dot(v, A * y - s - b) - dot(v, s)
+    dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, v)
     sol.duFeas = rDu
     sol.prFeas = max(rPr, rEq)
     sol.pobj   = pobj

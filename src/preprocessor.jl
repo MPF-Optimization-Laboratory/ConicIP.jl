@@ -191,8 +191,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     # constant ½y_FᵀQ_FF y_F − c_Fᵀy_F carried by the fixed variables.
     Qy = Qs * y
     sol.pobj = 0.5 * dot(y, Qy) - dot(c, y)
-    sol.dobj = sol.pobj + dot(w, Gs * y - d) + dot(sol.v, As * y - sol.s - b) -
-               dot(sol.v, sol.s)
+    sol.dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, sol.v)
   end
   return _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
       optTol = get(opts0, :optTol, 1e-6),

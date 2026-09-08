@@ -135,6 +135,11 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- Dual objective reporting uses `−½yᵀQy − dᵀw + bᵀv`, including at
+  nonstationary iterates; the old expression had incorrect residual terms.
+- The MOI convexity check scales the Hessian before applying a numerical
+  shift, so a large positive block cannot hide negative curvature in a
+  smaller block. Feasibility-sense models ignore cached objectives.
 - Time budgets now include singleton reduction, equilibration, the MOI
   Hessian check, and fallback setup. Expiry on the final iteration or during
   fallback returns `:TimeLimit`; an expired fallback does not start a solve.

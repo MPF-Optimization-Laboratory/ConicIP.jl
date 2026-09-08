@@ -417,6 +417,9 @@ certificate failures no longer fall through to row/column deletion. Bounded Ruiz
 sweeps now apply the same increments to the working matrices and scaling record.
 Time accounting includes singleton reduction, equilibration, MOI Hessian validation,
 and fallback setup, with an expiry check on loop exhaustion as well.
+Dual objective reporting now uses the stationary quadratic dual formula; the MOI
+convexity guard uses diagonal congruence scaling to prevent an unrelated large block
+from masking negative curvature. Feasibility-sense models ignore cached objectives.
 Still open from the review: peak-memory estimate for the
 dense path (the 4 GiB figure is a routing estimate, not a bound).
 

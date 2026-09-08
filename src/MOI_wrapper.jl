@@ -111,8 +111,21 @@ end
 # Maros–Mészáros rank-deficient QPs) and rejects indefinite ones.
 function _is_psd(Q::SparseMatrixCSC{Float64, Int})
     nnz(Q) == 0 && return true
-    δ = 1e-10 * (1 + maximum(abs, nonzeros(Q)))
-    F = cholesky(Symmetric(Q); shift = δ, check = false)
+    all(isfinite, nonzeros(Q)) || return false
+    dq = diag(Q)
+    any(<(0), dq) && return false
+    # For a PSD matrix, a zero diagonal implies a zero row and column.
+    # Congruence-scale the positive diagonal to one before shifting;
+    # a large, unrelated block must not hide negative curvature elsewhere.
+    for j in axes(Q, 2), t in nzrange(Q, j)
+        i = rowvals(Q)[t]
+        if (dq[i] == 0 || dq[j] == 0) && nonzeros(Q)[t] != 0
+            return false
+        end
+    end
+    scale = [x > 0 ? 1 / sqrt(x) : 1.0 for x in dq]
+    Qs = Diagonal(scale) * Q * Diagonal(scale)
+    F = cholesky(Symmetric(Qs); shift = 2e-10, check = false)
     return issuccess(F)
 end
 
@@ -430,7 +443,8 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     c_moi = zeros(n)
     obj_constant = 0.0
     QI = Int[]; QJ = Int[]; QV = Float64[]
-    obj_type = MOI.get(model, MOI.ObjectiveFunctionType())
+    # A feasibility model ignores any objective retained in the cache.
+    obj_type = sense == MOI.FEASIBILITY_SENSE ? Nothing : MOI.get(model, MOI.ObjectiveFunctionType())
     if obj_type == MOI.ScalarAffineFunction{Float64}
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
         obj_constant = obj.constant

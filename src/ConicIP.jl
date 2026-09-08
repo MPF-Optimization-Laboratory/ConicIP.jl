@@ -1330,7 +1330,10 @@ function _conicIP(
     cᵀy  = dot(c,z.y)
     yᵀQy = dot(z.y, Qy)
     pobj = 0.5*yᵀQy - cᵀy
-    dobj = pobj + dot(z.w, r0.w) + dot(z.v, r0.v) - dot(z.v, z.s)
+    # Stationary quadratic dual objective. Away from stationarity this
+    # is an estimate, not a certified bound; complementarity is tested
+    # separately and must not be substituted for the objective difference.
+    dobj = -0.5*yᵀQy - dot(d, z.w) + dot(b, z.v)
 
     # Convexity guard. The method assumes Q ⪰ 0 (equilibration preserves
     # this); an iterate with yᵀQy < 0 beyond rounding is a witness that it

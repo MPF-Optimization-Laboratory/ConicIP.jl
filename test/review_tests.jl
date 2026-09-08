@@ -88,3 +88,32 @@ end
     @test ConicIP.fallback_unbounded_ray(Q,c,A,b,cd,G,d;
         timeLimit = 0.0, kktsolver = never_called) === nothing
 end
+
+@testset "Review: objective values and convexity" begin
+    # An unrelated huge positive block must not regularize away a
+    # negative direction in the MOI convexity check.
+    @test !ConicIP._is_psd(sparse(Diagonal([-1.0, 1e16])))
+    @test !ConicIP._is_psd(sparse([1.0 2 0; 2 1 0; 0 0 1e16]))
+    @test ConicIP._is_psd(sparse([1e-16 1.0; 1.0 1e16]))
+    Q = sparse([2.0 0; 0 3]); c = [1.0, 2.0]
+    A = sparse([1.0 0; 0 1; -1 0]); b = [1.0, 0.0, -2.0]
+    G = sparse([1.0 1]); d = [3.0]
+    for eq in (false, true)
+        sol = conicIP(Q,c,A,b,[("R",3)],G,d;
+            equilibrate = eq, maxIters = 1, certFallback = false, verbose = false)
+        expected = -dot(sol.y,Q*sol.y)/2 - dot(d,sol.w) + dot(b,sol.v)
+        @test sol.dobj ≈ expected
+    end
+    import MathOptInterface as MOI
+    model = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+    MOI.set(model, MOI.Silent(), true)
+    x = MOI.add_variable(model)
+    MOI.add_constraint(model, x, MOI.EqualTo(1.0))
+    MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}(),
+        MOI.ScalarQuadraticFunction([MOI.ScalarQuadraticTerm(-2.0,x,x)],
+            MOI.ScalarAffineTerm{Float64}[], 5.0))
+    MOI.set(model, MOI.ObjectiveSense(), MOI.FEASIBILITY_SENSE)
+    MOI.optimize!(model)
+    @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+    @test MOI.get(model, MOI.ObjectiveValue()) == 0.0
+end
