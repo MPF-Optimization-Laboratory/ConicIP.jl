@@ -104,6 +104,20 @@ absorbed by `δ_e` and the refinement rather than requiring the
 preprocessor (this holds for the LDLᵀ route only; `kktsolver_qr` still
 needs independent rows).
 
+A bounded retry is available and off by default (`retry_max = 0`). With
+`retry_max > 0`, a solve that is still above `refine_tol` after
+refinement, on a factorization that repaired a pivot (or whose first
+correction did not reduce the residual), bumps the static shifts,
+`δ ← min(max(δ · retry_factor, shift_floor), shift_max)` for `δ_p` and
+`δ_e` (defaults `10`, `1e-8`, `1e-4`; a zero base shift starts at
+`shift_floor`), refactorizes, solves the same right-hand side again, and
+keeps the better of the two results by unregularized residual — at most
+`retry_max` bumps per factorization. Bumped shifts do not persist: the
+next factorization starts again from `static_reg`. `cone_reg` and
+`dynamic_delta` are never bumped. The solver reports what it did through
+the diagnostics hook described under [The contract](@ref) (verbose `kkt`
+column, `Solution.kkt_repaired`, `Solution.kkt_refactors`).
+
 ```julia
 sol = conicIP(Q, c, A, b, cone_dims; kktsolver = ConicIP.kktsolver_ldl)
 # or, with options:
@@ -271,6 +285,21 @@ What `conicIP` guarantees to a custom solver, and what it expects back:
   recovers the rest only while it contracts. A solver that returns a
   poor solve every time shows as `maxRefinementSteps` refinements per
   step in the verbose `refine` column and a red row.
+- **Diagnostics (optional).** `conicIP` calls
+  `ConicIP.kkt_diagnostics(solve3x3)` on the object level 2 returned.
+  The default method answers `nothing` and nothing more happens. A
+  solver may add a method for its own level-3 type,
+  `ConicIP.kkt_diagnostics(::YourSolve3x3Type)`, returning any object
+  with integer fields `repaired` and `refactors` (for the current
+  factorization) and `repaired_total` and `refactors_total` (summed over
+  the solve). The first pair is printed in the verbose `kkt` column as
+  `repaired/refactors`; the second pair is stored in
+  `Solution.kkt_repaired` and `Solution.kkt_refactors`. `kktsolver_ldl`
+  returns an `LDLSolve3x3` (callable like the closure it replaces) whose
+  `LDLDiagnostics` record also carries the shifts in effect, the
+  positive inertia of the last factorization (recorded only; QDLDL's
+  `Dsigns` forces the pivot signs, so it detects nothing), and the
+  unregularized residual of the last solve.
 - **Failure.** Throw one of `ConicIP.KKT_FAILURES`
   (`SingularException`, `PosDefException`, `LAPACKException`,
   `ZeroPivotException`) from level 2 or level 3 to report a

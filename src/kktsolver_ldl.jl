@@ -47,7 +47,8 @@
 # identity-scaled initial point: every entry is stored structurally, and
 # only values are rewritten before each numeric refactorization.
 
-using QDLDL: qdldl, update_values!, refactor!, solve!
+using QDLDL: qdldl, update_values!, refactor!, solve!,
+             regularized_entries, positive_inertia
 using AMD: amd
 
 """
@@ -145,10 +146,55 @@ function _symmul!(y, K::SparseMatrixCSC, x)
 end
 
 """
+    LDLDiagnostics
+
+Per-factorization and per-solve counters of [`kktsolver_ldl`](@ref),
+reachable through `kkt_diagnostics(solve3x3)` on the object its
+`solve3x3gen` returns.
+
+- `repaired` -- pivots QDLDL's dynamic regularization replaced in the
+  current factorization; `repaired_total` sums them over the solve
+- `pos_inertia` -- positive pivots of the current factorization. Recorded
+  only: with `Dsigns` QDLDL forces every pivot's sign, so the count
+  always matches the quasi-definite pattern and detects nothing
+- `δp`, `δe`, `δc` -- static shifts in effect (`δp`, `δe` grow under the
+  retry policy; `δc` is fixed)
+- `refactors` -- shift bumps applied to the current factorization;
+  `refactors_total` sums them over the solve
+- `last_residual` -- unregularized residual norm `‖rhs − K₀x‖` of the last
+  `solve3x3` return
+"""
+mutable struct LDLDiagnostics
+  repaired        :: Int
+  pos_inertia     :: Int
+  δp              :: Float64
+  δe              :: Float64
+  δc              :: Float64
+  refactors       :: Int
+  refactors_total :: Int
+  repaired_total  :: Int
+  last_residual   :: Float64
+end
+LDLDiagnostics(δp, δe, δc) = LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN)
+
+# The callable `kktsolver_ldl` hands back from `solve3x3gen`: the solve
+# closure, the regularization bump for tests and diagnosis, and the shared
+# diagnostics record (one per `kktsolver_ldl` instance).
+struct LDLSolve3x3{S, B}
+  solve :: S
+  bump! :: B
+  diag  :: LDLDiagnostics
+end
+(s::LDLSolve3x3)(bx, by, bz) = s.solve(bx, by, bz)
+kkt_diagnostics(s::LDLSolve3x3) = s.diag
+
+"""
     kktsolver_ldl(Q, A, G, cone_dims;
                   static_reg = 1e-8, cone_reg = 0.0,
                   dynamic_eps = 1e-13, dynamic_delta = 2e-7,
-                  lift_min = 6, refine_steps = 2, refine_tol = 1e-13)
+                  lift_min = 6, refine_steps = 2, refine_tol = 1e-13,
+                  retry_max = 0, retry_factor = 10.0,
+                  shift_floor = 1e-8, shift_max = 1e-4)
 
 Sparse LDLᵀ KKT solver for the quasi-definite form of the 3×3 system.
 The upper triangle of
@@ -175,6 +221,24 @@ best one seen and never worse than the unrefined solve. The tolerance
 is a target, not a guarantee. `conicIP`'s own refinement against the
 4×4 system runs on top of this.
 
+Retry (off by default, `retry_max = 0`): when a solve is still above the
+refinement tolerance and either the factorization repaired a pivot or
+the first correction failed to reduce the residual, the static shifts
+are bumped, `δ ← min(max(δ·retry_factor, shift_floor), shift_max)` for
+`δ_p` and `δ_e` (a zero base shift starts at `shift_floor`), the matrix
+is refactorized, and the same right-hand side is solved again; the
+better of the two results by unregularized residual is returned. At
+most `retry_max` bumps per factorization. Bumped shifts last for the
+remaining solves with that factorization only: the next `solve3x3gen`
+call restores the base shifts. `δ_c` and `dynamic_delta` are never
+bumped.
+
+Diagnostics: the object `solve3x3gen` returns is callable as before and
+carries an `LDLDiagnostics` record, reachable through
+`ConicIP.kkt_diagnostics(solve3x3)`; `conicIP` prints its counts in the
+verbose `kkt` column and sums them into `Solution.kkt_repaired` and
+`Solution.kkt_refactors`.
+
 No rank assumption on `G`: dependent equality rows are handled by
 `δ_e` and the refinement. Semidefinite blocks are supported through a
 dense k×k block, which is O(k⁴) in memory and not meant for large `k`;
@@ -190,15 +254,26 @@ function kktsolver_ldl(Q, A, G, cone_dims;
                        lift_min::Int = 6,
                        refine_steps::Int = 2,
                        refine_tol::Float64 = 1e-13,
+                       retry_max::Int = 0,
+                       retry_factor::Float64 = 10.0,
+                       shift_floor::Float64 = 1e-8,
+                       shift_max::Float64 = 1e-4,
                        pattern = nothing)
 
-  # `pattern` lets default_kktsolver hand over the pattern it already
-  # analysed; it must have been built with the same lift_min and static_reg.
+  # `pattern` lets default_kktsolver and cached_kktsolver_ldl hand over the
+  # pattern they already analysed; it must have been built with the same
+  # lift_min. The static shifts are written onto the (1,1) and (2,2)
+  # diagonals below, so the pattern's own placeholder shifts do not matter.
   pat = pattern !== nothing ? pattern :
-        _ldl_pattern(Q, A, G, cone_dims; lift_min = lift_min,
-                     δp = static_reg, δe = static_reg)
-  (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa) = pat
-  δp = static_reg; δe = static_reg; δc = cone_reg
+        _ldl_pattern(Q, A, G, cone_dims; lift_min = lift_min)
+  (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa,
+     qdiag_idx, qdiag, ediag_idx) = pat
+  δp0 = static_reg; δe0 = static_reg; δc = cone_reg
+  δp = δp0; δe = δe0
+
+  # Base static shifts in K before the symbolic analysis copies it.
+  K.nzval[qdiag_idx] .= qdiag .+ δp
+  K.nzval[ediag_idx] .= -δe
 
   # Symbolic analysis once, with the ordering the pattern carries; numeric
   # factorizations happen in refactor! after each value update.
@@ -207,12 +282,29 @@ function kktsolver_ldl(Q, A, G, cone_dims;
 
   # Diagonal shifts to remove when evaluating the unregularized residual
   shift = zeros(N)
-  shift[1:n] .= δp
-  shift[n+1:n+p] .= -δe
   shift[oz+1:oz+m] .= -δc
 
+  diag = LDLDiagnostics(δp, δe, δc)
+
+  # Write the static shifts in effect into K, into the factorization's
+  # internal copy, and into `shift`, so that K − Diagonal(shift) is always
+  # the exact unregularized matrix.
+  function write_static!()
+    @inbounds for t in 1:n
+      K.nzval[qdiag_idx[t]] = qdiag[t] + δp
+    end
+    K.nzval[ediag_idx] .= -δe
+    update_values!(Fact, qdiag_idx, view(K.nzval, qdiag_idx))
+    update_values!(Fact, ediag_idx, view(K.nzval, ediag_idx))
+    shift[1:n] .= δp
+    shift[n+1:n+p] .= -δe
+    diag.δp = δp; diag.δe = δe
+    return nothing
+  end
+  write_static!()
+
   rhs  = zeros(N); sol = zeros(N); res = zeros(N); tmp = zeros(N)
-  cand = zeros(N)
+  cand = zeros(N); keep = zeros(N)
   vbuf = Float64[]
 
   # res = rhs − K₀ x for the unregularized K₀ = K_δ − Diagonal(shift);
@@ -225,7 +317,37 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     return norm(res)
   end
 
+  # Numeric refactorization, recording what QDLDL did to the pivots.
+  function numeric_factor!()
+    refactor!(Fact)
+    diag.repaired        = regularized_entries(Fact)
+    diag.repaired_total += diag.repaired
+    diag.pos_inertia     = positive_inertia(Fact)
+    return nothing
+  end
+
+  # One regularization bump: raise δp and δe geometrically (a zero base
+  # shift starts at shift_floor), cap at shift_max, and refactorize. The
+  # bumped shifts stay in effect until the next solve3x3gen call.
+  function bump!()
+    δp = min(max(δp * retry_factor, shift_floor), shift_max)
+    δe = min(max(δe * retry_factor, shift_floor), shift_max)
+    write_static!()
+    numeric_factor!()
+    diag.refactors       += 1
+    diag.refactors_total += 1
+    return nothing
+  end
+
   function solve3x3gen(F::Block, F⁻ᵀ)
+
+    # Every factorization starts from the base shifts: a retry in the
+    # previous iteration does not carry its bumps forward.
+    if δp != δp0 || δe != δe0
+      δp = δp0; δe = δe0
+      write_static!()
+    end
+    diag.refactors = 0
 
     # Rewrite the scaling entries (in K, for the residual, and in the
     # factorization's internal copy), then refactorize numerically.
@@ -262,39 +384,65 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       K.nzval[idx] .= vbuf
       update_values!(Fact, idx, vbuf)
     end
-    refactor!(Fact)
+    numeric_factor!()
+
+    # Solve for the right-hand side loaded in `rhs`, leaving the result in
+    # `sol`. Refinement against the unregularized matrix K₀: each candidate
+    # sol + K_δ⁻¹ res is evaluated before it is accepted: refinement
+    # contracts only when ‖I − K_δ⁻¹K₀‖ < 1, and a correction that
+    # increases the residual is the evidence that it does not, so it is
+    # discarded and the loop ends with the best iterate seen. At most
+    # refine_steps + 1 residual evaluations. Returns the best residual, the
+    # tolerance, and whether the *first* correction already failed to
+    # contract while the residual was still above the tolerance.
+    function solve_loaded!()
+      sol .= rhs
+      solve!(Fact, sol)
+      rtol  = refine_tol * (1 + norm(rhs))
+      rbest = residual!(sol)
+      noncontract = false
+      for k in 1:refine_steps
+        rbest <= rtol && break
+        tmp .= res
+        solve!(Fact, tmp)
+        cand .= sol .+ tmp
+        rcand = residual!(cand)
+        if !(rcand < rbest)
+          noncontract = (k == 1)
+          break
+        end
+        sol .= cand
+        rbest = rcand
+      end
+      return (rbest, rtol, noncontract)
+    end
 
     function solve3x3(bx, by, bz)
       rhs[1:n] .= bx
       rhs[n+1:n+p] .= by
       rhs[oz+1:oz+m] .= .-bz
       rhs[oa+1:N] .= 0.0
-      sol .= rhs
-      solve!(Fact, sol)
-      # Refinement against the unregularized matrix K₀. Each candidate
-      # sol + K_δ⁻¹ res is evaluated before it is accepted: refinement
-      # contracts only when ‖I − K_δ⁻¹K₀‖ < 1, and a correction that
-      # increases the residual is the evidence that it does not, so it is
-      # discarded and the loop ends with the best iterate seen. At most
-      # refine_steps + 1 residual evaluations.
-      if refine_steps > 0
-        rtol  = refine_tol * (1 + norm(rhs))
-        rbest = residual!(sol)
-        for _ in 1:refine_steps
-          rbest <= rtol && break
-          tmp .= res
-          solve!(Fact, tmp)
-          cand .= sol .+ tmp
-          rcand = residual!(cand)
-          rcand < rbest || break
-          sol .= cand
-          rbest = rcand
+      (rbest, rtol, noncontract) = solve_loaded!()
+      # Bounded retry: a solve that misses the tolerance on a factorization
+      # that repaired pivots (or whose refinement did not contract at all)
+      # is repeated with larger static shifts; the better result by
+      # unregularized residual is kept.
+      while rbest > rtol && (diag.repaired > 0 || noncontract) &&
+            diag.refactors < retry_max
+        keep .= sol; rkeep = rbest
+        bump!()
+        (rnew, _, noncontract) = solve_loaded!()
+        if rnew < rkeep
+          rbest = rnew
+        else
+          sol .= keep; rbest = rkeep
         end
       end
+      diag.last_residual = rbest
       return (sol[1:n], sol[n+1:n+p], sol[oz+1:oz+m])
     end
 
-    return solve3x3
+    return LDLSolve3x3(solve3x3, bump!, diag)
 
   end
 
@@ -306,7 +454,11 @@ end
 #
 # Assemble the upper triangle of the quasi-definite KKT matrix with
 # placeholder scaling entries, and the index maps kktsolver_ldl uses to
-# rewrite them. Also used by choose_kktsolver to estimate the
+# rewrite them: `blk_idx` for the scaling blocks, `qdiag_idx`/`ediag_idx`
+# for the (1,1) and (2,2) diagonals, with `qdiag` the diagonal of Q
+# before any shift so that kktsolver_ldl can write its own δp/δe (the
+# placeholders δp, δe here only make the matrix quasi-definite for the
+# fill estimate). Also used by choose_kktsolver to estimate the
 # factorization's fill before committing to a solver.
 function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
                       δp::Float64 = 1e-8, δe::Float64 = 1e-8,
@@ -314,6 +466,7 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
 
   n = size(Q, 1); m = size(A, 1); p = size(G, 1)
   Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  qdiag = Vector{Float64}(diag(Qs))     # Q's diagonal before the δp shift
 
   ranges = cum_range([cd[2] for cd in cone_dims])
   kinds  = Symbol[]              # :diag, :dense, :lift per block
@@ -396,6 +549,10 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
       blk_idx[bi] = idx
     end
   end
+  # Static-shift diagonals; every (i,i) and (n+r,n+r) exists structurally
+  # because of the put! calls above.
+  qdiag_idx = [_nzindex(K, i, i) for i in 1:n]
+  ediag_idx = [_nzindex(K, n + r, n + r) for r in 1:p]
 
   # Expected pivot signs of the quasi-definite pattern
   Dsigns = Vector{Int}(undef, N)
@@ -410,7 +567,8 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
   # the symbolic analysis, and any cached reuse all share it.
   perm = perm_hint === nothing ? amd(K) : perm_hint
 
-  return (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa, nlift, perm)
+  return (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa, nlift, perm,
+            qdiag_idx, qdiag, ediag_idx)
 
 end
 
@@ -458,10 +616,10 @@ function (ks::cached_kktsolver_ldl)(Q, A, G, cone_dims)
     hint = ks.perm
     ks.hits += 1
   end
+  # kktsolver_ldl writes its own static shifts onto the pattern, so only
+  # lift_min has to agree.
   pat = _ldl_pattern(Q, A, G, cone_dims;
                      lift_min = get(ks.kwargs, :lift_min, 6),
-                     δp = get(ks.kwargs, :static_reg, 1e-8),
-                     δe = get(ks.kwargs, :static_reg, 1e-8),
                      perm_hint = hint)
   ks.key = key
   ks.perm = pat.perm

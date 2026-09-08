@@ -92,6 +92,17 @@ println("status: ", sol.status)
 # and that `staticReg` or a different `kktsolver` may be needed. Colour
 # follows Julia's `--color` setting, so it never appears in captured output.
 #
+# ## The kkt column
+#
+# `kkt` is filled in only by KKT solvers that report diagnostics (the
+# sparse LDLᵀ solver does; the dense QR solver leaves it blank). It reads
+# `repaired/refactors` for the factorization that produced the row's
+# iterate: how many pivots dynamic regularization had to replace, and how
+# many times the static shifts were bumped and the matrix refactorized
+# (always `0` unless `kktsolver_ldl` is called with `retry_max > 0`). `0/0`
+# on every row is the healthy pattern; the totals over the solve are in
+# `sol.kkt_repaired` and `sol.kkt_refactors`.
+#
 # ## The exit line
 #
 # The log ends with a one-line verdict. `EXIT -- Below Tolerance!` means all

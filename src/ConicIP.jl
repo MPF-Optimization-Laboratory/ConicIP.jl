@@ -551,8 +551,22 @@ with `Qȳ ≈ 0`, `Gȳ ≈ 0` and `Aȳ ∈ K`. See
 point, predictor, corrector, and refinement corrections); solves made by
 the certificate-fallback auxiliary problems are not included.
 
-Constructors with 12, 13, or 14 positional arguments default the trailing
-fields to `has_certificate = false`, `message = ""`, `kkt_solves = 0`.
+Residual and diagnostic tail:
+
+- `rEq::Real` -- relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))`
+  of the returned point (`prFeas = max(rPr, rEq)`); `NaN` when no iterate
+  was evaluated
+- `rGap::Real` -- relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`,
+  the quantity the termination test compares with `optTol`; `NaN` when unset
+- `kkt_repaired::Int` -- pivots the KKT solver dynamically regularized,
+  summed over every factorization of the solve (0 unless the solver
+  reports diagnostics; see `kkt_diagnostics`)
+- `kkt_refactors::Int` -- refactorizations after a regularization bump
+  (`kktsolver_ldl` with `retry_max > 0`), summed over the solve
+
+Constructors with 12, 13, 14, or 15 positional arguments default the
+trailing fields to `has_certificate = false`, `message = ""`,
+`kkt_solves = 0`, `rEq = rGap = NaN`, `kkt_repaired = kkt_refactors = 0`.
 """
 mutable struct Solution
 
@@ -572,16 +586,25 @@ mutable struct Solution
   message :: String        # diagnostic detail (e.g. the factorization
                            # failure behind an :Error status); "" otherwise
   kkt_solves :: Int        # KKT back-solves performed by the main loop
+  rEq    :: Real           # equality residual ‖Gy − d‖ (relative); NaN if unset
+  rGap   :: Real           # relative gap |vᵀs| / (1 + |pobj + offset|); NaN if unset
+  kkt_repaired  :: Int     # dynamically regularized pivots, summed over the solve
+  kkt_refactors :: Int     # retry refactorizations (shift bumps), summed over the solve
 
 end
 
-# 12/13/14-argument constructors: no certificate / no message / no count
+# 12/13/14/15-argument constructors: no certificate / no message / no count /
+# no residual-and-diagnostics tail. The tail defaults rEq = rGap = NaN and
+# kkt_repaired = kkt_refactors = 0.
 Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj) =
   Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, false, "", 0)
 Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate) =
   Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, "", 0)
 Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, message) =
   Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, message, 0)
+Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, message, kkt_solves) =
+  Solution(y, w, v, s, status, Iter, Mu, prFeas, duFeas, muFeas, pobj, dobj, has_certificate, message, kkt_solves,
+           NaN, NaN, 0, 0)
 
 # Overwrite sol with a *verified* infeasibility ray (dᵀw̄ - bᵀv̄ = -1).
 # The primal iterate is discarded: it means nothing on an empty feasible set.
@@ -788,7 +811,8 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
              normc = norm(c), normb = normsafe(b), normd = normsafe(d))
   sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
                  scaling = scaling, timeLimit = timeLimit - (time() - t_start), kwargs...)
-  unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d)
+  unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d;
+                 objective_offset = get(kwargs, :objective_offset, 0.0))
   # A ray validated on the scaled data need not validate on the original
   # data (tolerances are not scaling-invariant): re-run the validator in
   # the caller's coordinates with the caller's tolerances, and downgrade
@@ -891,6 +915,23 @@ function _conicIP(
 
   # KKT back-solve counter, reported as Solution.kkt_solves
   _nsolve = Ref(0)
+  # Level-3 solve object of the current factorization, read through the
+  # kkt_diagnostics hook (kktsolvers.jl) for the verbose kkt column and
+  # the Solution counters.
+  _s3_cur = Ref{Any}(nothing)
+  # Stamp the solve count and, when the KKT solver reports them, the
+  # regularization diagnostics onto a Solution. Bumps happen inside
+  # solve3x3 calls, after any per-iteration snapshot, so every site that
+  # records the count records the diagnostics too.
+  function _stamp_kkt!(sol)
+    sol.kkt_solves = _nsolve[]
+    dg = kkt_diagnostics(_s3_cur[])
+    if dg !== nothing
+      sol.kkt_repaired  = dg.repaired_total
+      sol.kkt_refactors = dg.refactors_total
+    end
+    return sol
+  end
 
   # Pre-allocated Block for inv(F)' — reused each iteration
   F⁻ᵀ_cache = Block(size(block_sizes, 1))
@@ -999,7 +1040,8 @@ function _conicIP(
     return Solution(y, w, solr.v, solr.s, solr.status, solr.Iter, solr.Mu,
                     solr.prFeas, solr.duFeas, solr.muFeas, solr.pobj,
                     solr.dobj, solr.has_certificate, solr.message,
-                    solr.kkt_solves)
+                    solr.kkt_solves, solr.rEq, solr.rGap,
+                    solr.kkt_repaired, solr.kkt_refactors)
   end
 
   # Number to scale (z's) by
@@ -1135,9 +1177,9 @@ function _conicIP(
   end
 
   # :Error status carrying no iterate (nothing has been computed yet).
-  errsol(msg) = Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                         :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false, msg,
-                         _nsolve[])
+  errsol(msg) = _stamp_kkt!(Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
+                                     :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false, msg,
+                                     _nsolve[]))
 
   if verbose && kktsolver === default_kktsolver
     chosen = choose_kktsolver(Qᵣ, A, G, cone_dims)
@@ -1166,6 +1208,7 @@ function _conicIP(
     #
 
     solve3x3 = solve3x3gen(F, F⁻ᵀ)
+    _s3_cur[] = solve3x3
 
     function solve4x4(r)
 
@@ -1217,8 +1260,8 @@ function _conicIP(
   if verbose
       println("            Optimality                      Objective              Infeasibility       ")
       println()
-      printstyled(@sprintf(" %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-8s \n",
-                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine");
+      printstyled(@sprintf(" %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-6s  %-8s \n",
+                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine","kkt");
                   bold = true)
   end
 
@@ -1227,7 +1270,7 @@ function _conicIP(
   # ────────────────────────────────────────────────────────────
 
   sol     = Solution(copy(z.y), copy(z.w), copy(z.v), copy(z.s), :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
-  sol.kkt_solves = _nsolve[]
+  _stamp_kkt!(sol)
   optBest = Inf
   nref    = 0      # refinement corrections applied in the previous iteration
   rnorm   = 0
@@ -1251,7 +1294,7 @@ function _conicIP(
       err isa KKT_FAILURES || rethrow()
       sol.status = :Error
       sol.message = kkt_error(stage, err)
-      sol.kkt_solves = _nsolve[]
+      _stamp_kkt!(sol)
       return nothing
     end
   end
@@ -1261,7 +1304,7 @@ function _conicIP(
   function nonfinite!(what, stage)
     sol.status = :Error
     sol.message = "non-finite $what ($stage)"
-    sol.kkt_solves = _nsolve[]
+    _stamp_kkt!(sol)
     if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
     return sol
   end
@@ -1270,7 +1313,7 @@ function _conicIP(
 
     # Every solve of the previous iteration is accounted for here; the
     # termination returns below happen before this iteration's first solve.
-    sol.kkt_solves = _nsolve[]
+    _stamp_kkt!(sol)
 
     if over_time()
       if verbose; print("\n > EXIT -- Time limit reached ($(timeLimit) s)\n\n"); end
@@ -1343,7 +1386,7 @@ function _conicIP(
       sol.status  = :Error
       sol.message = "objective Hessian is not positive semidefinite " *
                     "(yᵀQy < 0 at iteration $Iter); ConicIP requires a convex objective"
-      sol.kkt_solves = _nsolve[]
+      _stamp_kkt!(sol)
       if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
       return sol
     end
@@ -1420,6 +1463,7 @@ function _conicIP(
       sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v; sol.s[:] = z.s
       sol.Iter = Iter; sol.Mu = μ;
       sol.duFeas = rDu; sol.prFeas = max(rPr, rEq); sol.muFeas = rCp
+      sol.rEq = rEq; sol.rGap = rGap
       sol.pobj = pobj; sol.dobj = dobj
       optBest = bestMeasure
     end
@@ -1516,9 +1560,14 @@ function _conicIP(
 
     if verbose
       # A row is highlighted in red when the KKT step is still inaccurate
-      # after iterative refinement (see REFINE_WARN_NORM).
-      row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %i\n",
-                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, nref)
+      # after iterative refinement (see REFINE_WARN_NORM). The kkt cell is
+      # repaired/refactors of the factorization that produced this
+      # iterate (the previous iteration's, or the initial point's); blank
+      # when the solver reports no diagnostics.
+      dg  = kkt_diagnostics(_s3_cur[])
+      kkt = dg === nothing ? "" : @sprintf("%d/%d", dg.repaired, dg.refactors)
+      row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %-6i  %s\n",
+                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, nref, kkt)
       if rnorm > REFINE_WARN_NORM
         printstyled(row; bold = true, color = :red)
       else
@@ -1705,7 +1754,7 @@ function _conicIP(
     if !ok
       sol.status = :Error
       sol.message = "no interior point along the search direction (line search, iteration $Iter)"
-      sol.kkt_solves = _nsolve[]
+      _stamp_kkt!(sol)
       if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
       return sol
     end
@@ -1729,7 +1778,7 @@ function _conicIP(
 
   end
 
-  sol.kkt_solves = _nsolve[]
+  _stamp_kkt!(sol)
   if over_time()
     sol.status = :TimeLimit
     return sol

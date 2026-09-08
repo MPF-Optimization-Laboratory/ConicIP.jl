@@ -152,6 +152,21 @@ function _choose_kktsolver(Q, A, G, cone_dims;
 end
 
 """
+    kkt_diagnostics(solve3x3) -> diagnostics or nothing
+
+Hook through which a KKT solver reports per-factorization diagnostics to
+`conicIP`. `solve3x3` is the object a solver's `solve3x3gen(F, F⁻ᵀ)`
+returned; the default answers `nothing` (no diagnostics). A solver that
+returns an object with integer fields `repaired` and `refactors` (for the
+current factorization) and `repaired_total` and `refactors_total` (summed
+over the solve) has the former printed in the verbose `kkt` column as
+`repaired/refactors` and the latter stored in `Solution.kkt_repaired`
+and `Solution.kkt_refactors`. [`kktsolver_ldl`](@ref) implements it with
+`LDLDiagnostics`. Not exported.
+"""
+kkt_diagnostics(::Any) = nothing
+
+"""
     default_kktsolver(Q, A, G, cone_dims)
 
 The default `kktsolver` for [`conicIP`](@ref): dispatches to the solver

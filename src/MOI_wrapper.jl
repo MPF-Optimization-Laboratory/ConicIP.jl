@@ -24,6 +24,10 @@ Settable as constructor keywords or through
   [`preprocess_conicIP`](@ref) before solving (default: `true`)
 - `equilibrate::Bool` -- Ruiz-scale the data before solving (default: `true`)
 - `timeLimit::Float64` -- wall-clock budget in seconds (also `MOI.TimeLimitSec`)
+- `assemble_only::Bool` -- stop `optimize!` once the solver's matrices
+  (`Q_int`, `c_int`, `ineq_A`, `ineq_b`, `cone_dims`, `eq_G`, `eq_d`) are
+  assembled, without calling the solver; the model then reports
+  `OPTIMIZE_NOT_CALLED` and `ResultCount == 0` (default: `false`)
 - plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `refineRelTol`,
   `refineAbsTol`, `staticReg`, `certFallback`, `certFallbackIters`,
   `cache_nestodd` — forwarded to [`conicIP`](@ref)
@@ -78,6 +82,9 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     # opt-in) stay in charge of everything else.
     options::Dict{String, Any}
     silent::Bool
+    # True when the last optimize! stopped after assembly (`assemble_only`);
+    # `sol` is then `nothing`, as before any optimize! call.
+    assembled_only::Bool
 end
 
 # Options settable via MOI.RawOptimizerAttribute (and Optimizer kwargs)
@@ -86,6 +93,7 @@ const _SUPPORTED_OPTIONS = (
     "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
     "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
     "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
+    "assemble_only",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the name
@@ -150,7 +158,7 @@ function Optimizer(; kwargs...)
         Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Float64[],
         Bool[], Bool[], nothing, Float64[], Float64[],
         NaN, NaN,
-        Dict{String, Any}(), false,
+        Dict{String, Any}(), false, false,
     )
     for (k, v) in kwargs
         MOI.set(model, MOI.RawOptimizerAttribute(string(k)), v)
@@ -184,7 +192,7 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
         "certFallback" => true, "certFallbackIters" => 50,
         "cache_nestodd" => false, "kktsolver" => "auto",
         "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
-        "timeLimit" => Inf, "equilibrate" => true)
+        "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false)
     return get(model.options, attr.name, defaults[attr.name])
 end
 
@@ -209,6 +217,7 @@ MOI.get(model::Optimizer, ::MOI.Silent) = model.silent
 
 function MOI.empty!(model::Optimizer)
     model.sol = nothing
+    model.assembled_only = false
     model.max_sense = false
     model.objective_constant = 0.0
     model.n = 0
@@ -567,13 +576,22 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.ineq_A = A; dest.ineq_b = b
     dest.assembly_time = time() - t_start
 
+    # Assembly only: the matrices are available through the fields above;
+    # `sol` stays `nothing`, so every result getter answers as if
+    # optimize! had not been called.
+    if get(dest.options, "assemble_only", false)
+        dest.assembled_only = true
+        dest.solve_time = time() - t_start
+        return index_map, false
+    end
+
     # ── Solve ──
     do_preprocess = get(dest.options, "preprocess", true)
     verbose = dest.silent ? false : get(dest.options, "verbose", false)
     solver = _resolve_kktsolver(get(dest.options, "kktsolver", "auto"))
-    skip = do_preprocess ? ("preprocess", "kktsolver", "verbose") :
-                           ("preprocess", "kktsolver", "verbose", "rank_check",
-                            "fix_singletons")
+    skip = do_preprocess ? ("preprocess", "kktsolver", "verbose", "assemble_only") :
+                           ("preprocess", "kktsolver", "verbose", "assemble_only",
+                            "rank_check", "fix_singletons")
     kw = (; (Symbol(k) => v for (k, v) in dest.options if k ∉ skip)...)
     entry = do_preprocess ? preprocess_conicIP : conicIP
     if dest.Q_int !== nothing && !_is_psd(Q)
@@ -690,7 +708,9 @@ end
 
 function MOI.get(model::Optimizer, ::MOI.RawStatusString)
     if model.sol === nothing
-        return "OPTIMIZE_NOT_CALLED"
+        return model.assembled_only ?
+               "OPTIMIZE_NOT_CALLED: assembly only (assemble_only = true)" :
+               "OPTIMIZE_NOT_CALLED"
     end
     if isempty(model.sol.message)
         return string(model.sol.status)
@@ -877,6 +897,16 @@ function MOI.get(model::Optimizer, ::MOI.ObjectiveBound)
         val = -val
     end
     return val + model.objective_constant
+end
+
+# Relative duality gap |vᵀs| / (1 + |pobj + offset|) of the returned point,
+# the quantity the solver's gap test measures (`Solution.rGap`). NaN when
+# there is no result to describe.
+MOI.supports(::Optimizer, ::MOI.RelativeGap) = true
+function MOI.get(model::Optimizer, ::MOI.RelativeGap)
+    sol = model.sol
+    (sol === nothing || MOI.get(model, MOI.ResultCount()) == 0) && return NaN
+    return Float64(sol.rGap)
 end
 
 MOI.supports(::Optimizer, ::MOI.DualObjectiveValue) = true

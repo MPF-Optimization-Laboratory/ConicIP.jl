@@ -183,7 +183,8 @@ end
 # Map a Solution of the scaled problem back to the original coordinates,
 # renormalize certificates, and recompute the reported residuals from
 # the original data.
-function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d)
+function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d;
+                        objective_offset = 0.0)
   Dc, Dr, De, σ = eq.Dc, eq.Dr, eq.De, eq.σ
   sol.y .= Dc .* sol.y
   sol.s .= sol.s ./ Dr
@@ -208,12 +209,14 @@ function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d)
   end
 
   sol.Mu /= σ
-  return _refresh_point!(sol, Q, c, A, b, G, d)
+  return _refresh_point!(sol, Q, c, A, b, G, d; objective_offset = objective_offset)
 end
 
 # Recompute point diagnostics after any change of coordinates or presolve.
 # In particular, residuals on dropped equality rows must not disappear.
-function _refresh_point!(sol::Solution, Q, c, A, b, G, d)
+# The relative gap uses the one formula of the main loop's termination
+# test, |vᵀs| / (1 + |pobj + objective_offset|).
+function _refresh_point!(sol::Solution, Q, c, A, b, G, d; objective_offset = 0.0)
   y, w, v, s = sol.y, sol.w, sol.v, sol.s
   if all(isfinite, y) && all(isfinite, v) && all(isfinite, s) && all(isfinite, w)
     Qy   = Q * y
@@ -235,6 +238,8 @@ function _refresh_point!(sol::Solution, Q, c, A, b, G, d)
     dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, v)
     sol.duFeas = rDu
     sol.prFeas = max(rPr, rEq)
+    sol.rEq    = rEq
+    sol.rGap   = abs(dot(v, s)) / (1 + abs(pobj + objective_offset))
     sol.pobj   = pobj
     sol.dobj   = dobj
   end
@@ -252,10 +257,9 @@ function _check_postsolve!(sol::Solution, Q, c, A, b, cone_dims, G, d;
         infeasTol = Float64(infeasTol), infeasAbsTol = Float64(infeasAbsTol),
         source = "presolved data")
   end
-  _refresh_point!(sol, Q, c, A, b, G, d)
+  _refresh_point!(sol, Q, c, A, b, G, d; objective_offset = objective_offset)
   if sol.status == :Optimal
-    gap = abs(dot(sol.v, sol.s)) / (1 + abs(sol.pobj + objective_offset))
-    if !(max(sol.prFeas, sol.duFeas, gap) < optTol)
+    if !(max(sol.prFeas, sol.duFeas, sol.rGap) < optTol)
       sol.status = :Error
       sol.message = "presolved point fails the original-data optimality tolerance"
     end
