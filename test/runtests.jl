@@ -5,6 +5,7 @@ using SparseArrays
 using Random
 
 include("testdata.jl")
+include("review_tests.jl")
 
 const tol    = 1e-3
 const optTol = 1e-7

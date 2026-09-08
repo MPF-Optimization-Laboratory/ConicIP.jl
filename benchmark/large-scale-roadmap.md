@@ -409,7 +409,10 @@ refinement kept worsening corrections; the dense flop model scored `p = n` as fr
 over-budget SDP fell through to LDLᵀ; `nestod_soc` overflowed on jointly extreme scales;
 assembly time was not deducted from `TimeLimitSec`. Cleared by the review: LDLᵀ signs
 and pivot-sign vector, fixed pattern, `unequilibrate!` maps, MOI dual signs, lifted
-columns in the flop count. Still open from the review: peak-memory estimate for the
+columns in the flop count. A subsequent Codex review added original-data checks after singleton and
+rank-reduction postsolve: dropped rows must satisfy `optTol`, and lifted rays must
+validate against the full data. `rank_check = :auto` now also recognizes the cached
+LDLᵀ callable. Still open from the review: peak-memory estimate for the
 dense path (the 4 GiB figure is a routing estimate, not a bound).
 
 **Against the last release (v0.4.0, commit `0430b9e`), measured 2026-09-07 after the

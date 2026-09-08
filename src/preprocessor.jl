@@ -190,7 +190,11 @@ function preprocess_conicIP(Q, c::AbstractVector,
     sol.dobj = sol.pobj + dot(w, Gs * y - d) + dot(sol.v, As * y - sol.s - b) -
                dot(sol.v, sol.s)
   end
-  return sol
+  return _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
+      optTol = get(opts0, :optTol, 1e-6),
+      objective_offset = get(opts0, :objective_offset, 0.0),
+      infeasTol = get(opts0, :infeasTol, 1e-7),
+      infeasAbsTol = get(opts0, :infeasAbsTol, 1e-9))
 end
 
 # Singleton equality rows: rows of G with exactly one structural nonzero.
@@ -269,7 +273,7 @@ function _preprocess_core(Q, c::AbstractVector,
   do_rank = rc == :always ? true :
             rc == :never  ? false :
             (ks === default_kktsolver ? choose_kktsolver(Q, A, G, cone_dims) !== kktsolver_ldl :
-                                        ks !== kktsolver_ldl)
+                                        !(ks === kktsolver_ldl || ks isa cached_kktsolver_ldl))
 
   if !do_rank
     if verbose; println("   - Rank detection skipped (KKT solver regularizes)"); end
@@ -428,6 +432,10 @@ function _preprocess_core(Q, c::AbstractVector,
     end
   end
 
-  return sol
+  length(IP) == p && return sol
+  return _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
+      optTol = get(opts, :optTol, 1e-6),
+      objective_offset = get(opts, :objective_offset, 0.0),
+      infeasTol = reltol, infeasAbsTol = abstol)
 
 end

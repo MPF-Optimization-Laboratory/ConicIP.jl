@@ -135,6 +135,11 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- Presolve recomputes feasibility in the original coordinates and retracts
+  `:Optimal` if dropped equality rows violate `optTol`. Singleton postsolve
+  also revalidates certificates against the full Hessian and constraints.
+- `rank_check = :auto` recognizes `cached_kktsolver_ldl` as a regularizing
+  solver, avoiding unnecessary sparse QR rank detection on repeated solves.
 - The verbose "refine" column always printed 1; it now reports the number of
   refinement corrections applied in the previous iteration.
 - An `:Optimal` return now carries the iterate that passed the test. The

@@ -134,7 +134,8 @@ end
 # in place for inspection.
 function _revalidate_certificate!(sol::Solution, Q, c, A, b, cone_dims, G, d;
                                   infeasTol::Float64 = 1e-7,
-                                  infeasAbsTol::Float64 = 1e-9)
+                                  infeasAbsTol::Float64 = 1e-9,
+                                  source = "equilibrated data")
   sol.has_certificate || return sol
   sol.status in (:Infeasible, :DualInfeasible) || return sol
 
@@ -170,7 +171,7 @@ function _revalidate_certificate!(sol::Solution, Q, c, A, b, cone_dims, G, d;
   sol.has_certificate = false
   sol.status = chk100.valid ? almost : :Abandoned
   g3(x) = @sprintf("%.3g", x)
-  sol.message = "$kind certificate valid on the equilibrated data but not " *
+  sol.message = "$kind certificate valid on the $source but not " *
                 "on the original data (residual $(g3(chk.farkas_residual)), " *
                 "cone margin $(g3(chk.cone_margin)) at infeasTol = $(g3(infeasTol))" *
                 (chk100.valid ? "; valid at $(g3(relaxed)))" :
@@ -205,10 +206,13 @@ function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d)
     return sol
   end
 
-  # A point (optimal, best iterate). The loop already evaluated prFeas,
-  # duFeas and muFeas in the original coordinates (see `scaling` in
-  # _conicIP); recompute the feasibility residuals and objectives from
-  # the original data as the postsolve truth, and rescale μ.
+  sol.Mu /= σ
+  return _refresh_point!(sol, Q, c, A, b, G, d)
+end
+
+# Recompute point diagnostics after any change of coordinates or presolve.
+# In particular, residuals on dropped equality rows must not disappear.
+function _refresh_point!(sol::Solution, Q, c, A, b, G, d)
   y, w, v, s = sol.y, sol.w, sol.v, sol.s
   if all(isfinite, y) && all(isfinite, v) && all(isfinite, s) && all(isfinite, w)
     Qy   = Q * y
@@ -232,7 +236,28 @@ function unequilibrate!(sol::Solution, eq, Q, c, A, b, cone_dims, G, d)
     sol.prFeas = max(rPr, rEq)
     sol.pobj   = pobj
     sol.dobj   = dobj
-    sol.Mu     = sol.Mu / σ
+  end
+  return sol
+end
+
+# A numerically reduced problem can pass its stopping test while the
+# restored point fails the caller's tolerance. Keep the point for diagnosis,
+# but retract optimality rather than exposing it as a feasible MOI result.
+function _check_postsolve!(sol::Solution, Q, c, A, b, cone_dims, G, d;
+                           optTol = 1e-6, objective_offset = 0.0,
+                           infeasTol = 1e-7, infeasAbsTol = 1e-9)
+  if sol.has_certificate
+    return _revalidate_certificate!(sol, Q, c, A, b, cone_dims, G, d;
+        infeasTol = Float64(infeasTol), infeasAbsTol = Float64(infeasAbsTol),
+        source = "presolved data")
+  end
+  _refresh_point!(sol, Q, c, A, b, G, d)
+  if sol.status == :Optimal
+    gap = abs(dot(sol.v, sol.s)) / (1 + abs(sol.pobj + objective_offset))
+    if !(max(sol.prFeas, sol.duFeas, gap) < optTol)
+      sol.status = :Error
+      sol.message = "presolved point fails the original-data optimality tolerance"
+    end
   end
   return sol
 end
