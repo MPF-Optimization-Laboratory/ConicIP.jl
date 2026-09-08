@@ -3029,6 +3029,13 @@ end
         @test choose_kktsolver(spzeros(nb, nb), A11, spzeros(0, nb), [("R", nb)];
                                dense_bytes_max = typemax(Int)) ===
               ConicIP.kktsolver_qr
+        # The flop estimate must not materialize L: on this pattern a logical
+        # factorization allocated 20 GiB (an out-of-memory kill on a 7 GB CI
+        # runner); elimination-tree column counts need O(nnz + N).
+        pat11 = ConicIP._ldl_pattern(spzeros(nb, nb), A11, spzeros(0, nb), [("R", nb)])
+        ConicIP._ldl_flops(pat11)                       # compile
+        @test @allocated(ConicIP._ldl_flops(pat11)) < 200 * 2^20
+        @test ConicIP._ldl_flops(pat11) > 1e12         # and it is catastrophic fill
         # The guard precedes the SDP rule, but must not silently route an
         # SDP problem to LDLᵀ (whose SDP blocks are dense k²×k², so the
         # guard would trade one huge allocation for another): it errors,

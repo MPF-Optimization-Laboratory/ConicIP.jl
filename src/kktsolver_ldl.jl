@@ -47,6 +47,7 @@
 # identity-scaled initial point: every entry is stored structurally, and
 # only values are rewritten before each numeric refactorization.
 
+import QDLDL
 using QDLDL: qdldl, update_values!, refactor!, solve!,
              regularized_entries, positive_inertia
 using AMD: amd
