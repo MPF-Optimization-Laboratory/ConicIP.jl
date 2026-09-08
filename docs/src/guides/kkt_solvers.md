@@ -45,10 +45,12 @@ type of the inputs:
    sets the cost of a semidefinite solve; see
    [Semidefinite support](@ref) for the cost model and for what the
    solver does and does not handle.
-2. **Small problems (`n + m + p < 200`) → `kktsolver_qr`.** Dense
+2. **More equality rows than variables, without SDP → `kktsolver_ldl`.**
+   Dense QR requires independent rows and cannot handle `p > n`.
+3. **Small problems (`n + m + p < 200`) → `kktsolver_qr`.** Dense
    factorization wins at small sizes, and the symbolic analysis below
    would cost more than it saves.
-3. **Otherwise, predicted flops decide.** A symbolic analysis of the
+4. **Otherwise, predicted flops decide.** A symbolic analysis of the
    quasi-definite KKT pattern gives the LDLᵀ cost `Σⱼ nnz(L₍:,ⱼ₎)²`; the
    dense cost includes `m(n−p)² + (n−p)³/3`, setup, and back-solves
    ([`dense_kkt_flops`](@ref ConicIP.dense_kkt_flops)). Dense QR is chosen

@@ -50,7 +50,8 @@ terms are dropped, which only makes the estimate optimistic for the
 dense path.
 """
 function dense_kkt_flops(n, m, p; nnzA = 0, nnzQ = 0, iters = 25)
-  r = max(n - p, 0)
+  p > n && return Inf # QR requires independent equality rows.
+  r = n - p
   iters = max(iters, 1)
   # Per iteration: NT-scaled constraint block, reduced Hessian, Cholesky.
   per_iter = 2m*r + m*r^2 + r^3/3
@@ -135,6 +136,9 @@ function _choose_kktsolver(Q, A, G, cone_dims;
   if has_sdp
     return (kktsolver_qr, nothing)
   end
+  # Dense QR cannot factor an overdetermined equality block, regardless
+  # of its predicted cost. LDL regularizes dependent equality rows.
+  p > n && return (kktsolver_ldl, nothing)
   if n + m + p < size_min
     return (kktsolver_qr, nothing)
   end

@@ -433,6 +433,8 @@ phase; the LU fill fields describe identity scaling, not the selected LDLᵀ fac
 The harness still lacks separate setup/factor/back-solve/fallback timers. Earlier
 MOI residual/gap tables above used solver-reported diagnostics and must not be read
 as independently verified evidence at the quoted precision.
+Automatic routing also avoids dense QR when a non-SDP problem has `p > n`;
+its cost model previously extrapolated to an unsupported regime.
 Still open from the review: peak-memory estimate for the
 dense path (the 4 GiB figure is a routing estimate, not a bound).
 

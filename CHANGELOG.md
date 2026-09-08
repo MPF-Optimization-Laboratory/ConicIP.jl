@@ -135,6 +135,9 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- Automatic routing uses LDL for non-SDP problems with more equality rows
+  than variables; dense QR cannot factor these systems. Its flop estimate
+  is `Inf` in this unsupported regime instead of zero or negative.
 - The benchmark independently recomputes MOI residuals and the objective gap
   from original assembled data, includes Hessian nonzeros and internal MOI
   assembly time, and checks both primal and dual cone membership. Its

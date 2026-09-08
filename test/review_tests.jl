@@ -117,3 +117,13 @@ end
     @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
     @test MOI.get(model, MOI.ObjectiveValue()) == 0.0
 end
+
+@testset "Review: overdetermined default routing" begin
+    Q = sparse(1.0I, 2, 2); A = copy(Q)
+    G = sparse([1.0 1; 2 2; -1 -1]); d = [1.0,2.0,-1.0]
+    @test ConicIP.dense_kkt_flops(2,2,3) == Inf
+    @test ConicIP.choose_kktsolver(Q,A,G,[("R",2)]) === ConicIP.kktsolver_ldl
+    sol = conicIP(Q,zeros(2),A,zeros(2),[("R",2)],G,d; verbose=false)
+    @test sol.status == :Optimal
+    @test sol.y ≈ [0.5,0.5] atol=1e-6
+end
