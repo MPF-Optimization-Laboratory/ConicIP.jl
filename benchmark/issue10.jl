@@ -41,7 +41,7 @@ function run_instance(prob; kktsolver, maxIters = 100, verbose = false)
             gib = stats.bytes / 2^30)
 end
 
-function main(which = "all")
+function issue10_main(which = "all")
     println("Downloading gist instance …")
     prob = load_issue10()
     n = length(prob.c); m = size(prob.A, 1); p = size(prob.G, 1)
@@ -76,5 +76,5 @@ function main(which = "all")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main(isempty(ARGS) ? "all" : ARGS[1])
+    issue10_main(isempty(ARGS) ? "all" : ARGS[1])
 end

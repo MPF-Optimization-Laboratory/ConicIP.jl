@@ -5,8 +5,6 @@ using SparseArrays
 using Random
 
 include("testdata.jl")
-include("review_tests.jl")
-include("review_benchmark.jl")
 
 const tol    = 1e-3
 const optTol = 1e-7
@@ -3655,6 +3653,14 @@ end
             @test isempty(opt.ineq_b)
         end
     end
+
+    @testset "Independent review regressions" begin
+        include("review_tests.jl")
+        include("review_benchmark.jl")
+    end
+
+    include("tranche3_tests.jl")
+    include("harness_tests.jl")
 
     include("sdp_tests.jl")
 
