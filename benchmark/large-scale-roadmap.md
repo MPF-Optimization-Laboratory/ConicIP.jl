@@ -526,9 +526,17 @@ Gondzio multiple centrality correctors behind `centralityCorrectors = K` (defaul
 with the Jordan-frame spectral projection for R, Q and S cones (`src/correctors.jl`),
 one extra back-solve per corrector on the current factorization, acceptance by step
 length (δα = 0.1, β ∈ [0.1, 10], γ = 0.1). On the contract mixes and the banded LP/QP,
-K = 2 saves 0–3 iterations for 5–14 extra solves; the default is decided by the
-full-harness sweep over K ∈ {0, 1, 2, 3} (total time down, no instance slower by more
-than 5 %), pending. Item 1 is a design note, `benchmark/hsd-design.md` (embedding with
+K = 2 saves 0–3 iterations for 5–14 extra solves. **Measured 2026-09-07** on the full
+harness (23 instances, `suite.jl --opt centralityCorrectors=K`, sequential runs on a
+quiet machine): shifted-geometric-mean iterations 13.5 / 12.3 / 11.7 / 11.4 for
+K = 0 / 1 / 2 / 3, total KKT solves 882 / 1035 / 1177 / 1322, total time 11.7 / 12.7 /
+13.0 / 13.7 s; every K is slower than 0 on the banded LPs (lp-band-200000 5.7 → 6.4–7.1 s)
+and on chainsing; no instance takes more iterations. The default stays 0: the
+iteration savings do not pay for the extra back-solves and cone operations where one
+factorization is cheap relative to a solve, which is every instance in this set. The
+same sweep for the LDLᵀ shift retry (`retry_max` ∈ {0, 1, 2}, LDLᵀ pinned) fires on one
+instance (nql30, one refactorization) with no change in iterations, solves, or time
+beyond noise; `retry_max = 0` stays the default. Item 1 is a design note, `benchmark/hsd-design.md` (embedding with
 the quadratic term, Newton system through the existing factorization by eliminating
 the τ column, termination and certificates from τ and κ, interactions, test plan,
 `method = :classic | :hsd` migration), awaiting the maintainer's §7 decisions before
@@ -633,6 +641,28 @@ same problem tuple through `benchmark/moi_model.jl` (file instances assembled on
 `ConicIP.Optimizer` with `assemble_only = true`), verifies each answer against the
 original data with the suite's residuals, and `benchmark/compare.jl` joins the CSVs
 (solved and verified counts, shifted geometric means of time and iterations).
+
+**First measurement (2026-09-07, Apple M3 Pro, Julia 1.12.7, 6 BLAS threads, 120 s cap;
+ConicIP at the head of `tranche-3-prep`, Clarabel.jl 0.11.1, ECOS.jl 1.1.3, all three fed
+the same tuple through the MOI builder; "verified" = the harness's own residual, gap and
+cone checks at 1e-6):**
+
+| solver | solved | verified | sgm time, 19 common | sgm iters, common | sgm time, own set |
+|---|---|---|---|---|---|
+| ConicIP | 23/23 | 23 | 0.107 s | 13.9 | 0.156 s |
+| Clarabel | 23/23 | 23 | 0.068 s | 12.9 | 0.110 s |
+| ECOS | 19/23 | 14 | 0.115 s | 16.1 | 0.115 s |
+
+Per instance, Clarabel is faster on 21 of 23 (chainsing 0.25 vs 0.06 s, issue #10 0.22 vs
+0.09 s, sched 0.18 vs 0.08 s, lp-band-200000 5.7 vs 5.2 s) and slower on two (sum-of-norms
+1500: 1.83 vs 1.82 s, a tie; hs35). The iteration gap is one iteration in geometric mean,
+so the remaining 1.6× is per-iteration cost (assembly, scaling, back-solves, cone
+operations), not the algorithm. ECOS times out on lp-band-200000, hits its iteration limit
+on the two large banded QPs through the `QuadtoSOC` bridge, fails the bridge on
+`cvxqp1_s`, and its QP answers do not pass the 1e-6 dual-residual check (the epigraph
+reformulation converges like √tol in the slack direction), so it is not a QP yardstick.
+Not yet done: a broader instance set, Dolan–Moré profiles, and per-phase timing to
+locate the 1.6×.
 
 ## Regimes the harness must cover
 
