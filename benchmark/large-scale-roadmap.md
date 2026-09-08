@@ -456,12 +456,31 @@ v0.4.0 worktree with two compatibility shims (`kkt_solves`, `RawSolver` absent t
 | CBLIB sched_50_50_scaled | 23 / 7.08 / 3.4 GB | 32 / 0.17 / 1.5 GB | 42× |
 
 v0.4.0's residuals on the same instances are typically 1e-8 to 1e-10 (relative, its own
-normalization); the current tree reports 1e-13 to 1e-16 in original coordinates. The one
-regression is the 1500-variable sum-of-norms SOCP (1,500 cones, 6,500 variables): v0.4.0 took the dense path (3.6 GB),
-the current tree LDLᵀ with two more iterations (all SOCs have dimension 3, below
-the lifting threshold); the LDLᵀ route wins on memory
-and loses 0.6 s. The 200 000-variable LP under v0.4.0 exited within a minute with no error
-text (memory, most likely).
+normalization); the current tree reports 1e-13 to 1e-16 in original coordinates. The
+200 000-variable LP under v0.4.0 exited within a minute with no error text (memory, most
+likely).
+
+The one regression is the 1,500-cone sum-of-norms SOCP (n = 6,500; 12 iterations / 1.79 s
+now vs 10 / 1.18 s on v0.4.0). `benchmark/sumnorms_diag.jl` (2026-09-07, same machine)
+attributes it as follows. v0.4.0 did not take the dense path: its `nnz/col ≤ 10` rule sent
+this 2.5 nnz/col instance to `kktsolver_sparse` (UMFPACK LU, 3.6 GB), and today's dense
+`kktsolver_qr` needs 13 s and 14 GiB here, so `ldl_flop_weight` (margin 155×) is not the
+lever. Two of the three extra tenths are the two extra iterations (2 × 0.17 s), which every
+route on the current tree takes because the stopping test now includes the relative gap
+(`rGap`, commit 565203e): v0.4.0 declared optimality at iteration 10 with a relative gap near
+1e-5. The rest is the factorization: the KKT factor has 0.84 M entries (fill 24×, intrinsic to
+the random-sparse G; twelve AMD/SYMAMD variants agree within 0.2 %), QDLDL factors it at
+9.5 GFlop/s single-threaded (142 ms), and UMFPACK's BLAS-3 fronts do it in 115 ms with 6
+threads (183 ms with one): 0.33 s over 12 iterations, of which LDLᵀ's cheaper back-solves
+(23 solves at 2.5 ms vs 43 at 3.1 ms) claw back 0.08 s. Regularization and refinement are not
+the cause: all 24 combinations of `static_reg`, `dynamic_delta`, `refine_steps`, and
+`maxRefinementSteps` take 12 iterations with identical muFeas trajectories, and only
+`refine_steps = 0` costs anything (45–55 KKT solves). Presolve costs 0.21 s on this instance
+(10 %; lead: `_preprocess_core` calls `choose_kktsolver`, whose symbolic analysis
+`default_kktsolver` then repeats), the value rewrite for 1,500 3×3 SOC blocks 0.07 s. The
+LDLᵀ route therefore trades 0.2 s for 2.4 GiB less allocation on the instance whose factor is
+nearly dense; recovering it means BLAS-3 in the factorization (supernodal or a dense
+trailing block), not a default change. No default was changed.
 
 1. MOI assembly directly into the global `A` and `G` by triplet accumulation (one
    `sparse(I, J, V, m, n)` per matrix, not per constraint object); merge compatible
