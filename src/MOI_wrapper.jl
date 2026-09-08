@@ -876,7 +876,7 @@ MOI.get(model::Optimizer, ::MOI.BarrierIterations) =
 
 # The wrapper is its own solver object: `model.sol` is the full `Solution`
 # (iteration and KKT-solve counts, residuals, message) behind the MOI
-# attributes, and benchmark/suite.jl reads it through this attribute.
+# attributes; benchmark scripts read it through this attribute.
 MOI.get(model::Optimizer, ::MOI.RawSolver) = model
 
 # Homogeneous dual objective along a Farkas ray. The ray is normalized so that

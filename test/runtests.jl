@@ -3656,11 +3656,9 @@ end
 
     @testset "Independent review regressions" begin
         include("review_tests.jl")
-        include("review_benchmark.jl")
     end
 
     include("tranche3_tests.jl")
-    include("harness_tests.jl")
 
     include("sdp_tests.jl")
 

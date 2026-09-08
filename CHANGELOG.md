@@ -100,14 +100,6 @@ uses [Semantic Versioning](https://semver.org/).
   back-solve per corrector on the current factorization.
 - MOI option `assemble_only`: `optimize!` returns after assembling the
   solver's matrices (`OPTIMIZE_NOT_CALLED`, `ResultCount == 0`).
-- Benchmark: `benchmark/baselines.jl` runs the instance set through
-  Clarabel, ECOS or ConicIP-via-MOI from one problem tuple
-  (`benchmark/moi_model.jl`), `benchmark/compare.jl` joins result CSVs;
-  `suite.jl --opt key=value,...` passes solver options, `--timeout` kills a
-  child process, and the CSV gains `kktsolver`, `kkt_repaired`,
-  `kkt_refactors` columns. `benchmark/sumnorms_diag.jl` attributes the
-  sum-of-norms SOCP regression; `benchmark/hsd-design.md` is the design
-  note for the homogeneous self-dual embedding.
 - `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
   quasi-definite KKT system (QDLDL.jl backend, pure Julia). Fixed pattern
   with AMD ordering analysed once, numeric refactorization in place each
@@ -160,11 +152,6 @@ uses [Semantic Versioning](https://semver.org/).
   callback (initial point, predictor, corrector, outer refinements). Solves
   a backend performs internally, such as `kktsolver_ldl`'s own refinement,
   are not counted.
-- `benchmark/suite.jl`: reproducible harness with phase timings, solve
-  counts, fill proxies, peak RSS in a fresh process, and residuals
-  recomputed from the original data.
-- `benchmark/large-scale-roadmap.md`: diagnosis of the scale limits and the
-  tranche plan to lift them.
 - The KKT-solver guide documents the callback contract: data and signs,
   the scaling-block types, calls per iteration, ownership of returned
   arrays, accuracy and regularization, and failure reporting.
@@ -173,10 +160,6 @@ uses [Semantic Versioning](https://semver.org/).
 - A certificate return (`:Infeasible`, `:DualInfeasible`) no longer carries
   the discarded iterate's `rEq`/`rGap`; they are `NaN`, like `pobj`, and
   `MOI.RelativeGap` is `NaN` for such a result.
-- `benchmark/suite.jl --opt` rejects entries with an empty key or value;
-  `test/testdata.jl` is no longer included twice when `suite.jl` and
-  `issue10.jl` are loaded into one module (no more "Replacing docs"
-  warnings from the review tests).
 - Automatic routing uses LDL for non-SDP problems with more equality rows
   than variables; dense QR cannot factor these systems. Its flop estimate
   is `Inf` in this unsupported regime instead of zero or negative.

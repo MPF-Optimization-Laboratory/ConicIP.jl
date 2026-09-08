@@ -56,10 +56,6 @@ julia --project -e 'using Pkg; Pkg.test()'
 
 - `benchmark/profile.jl` — profiling script (timing, allocation, type stability)
 - `benchmark/report.md` — performance analysis and improvement roadmap
-- `benchmark/large-scale-roadmap.md` — diagnosis of scale limits and the tranche plan to lift them; update a tranche's Status line when work lands
-- `benchmark/suite.jl` — reproducible harness (phase timings, solve counts, fill proxy, peak RSS per instance in a fresh process, residuals from original data); `--quick` for the small subset; `--opt key=value,...` passes solver options; downloads Maros–Mészáros/CBLIB instances into the gitignored `benchmark/.cache/`
-- `benchmark/baselines.jl` / `benchmark/compare.jl` — the same instances through Clarabel, ECOS, or ConicIP-via-MOI (`--solver`, own env: `julia --project=benchmark`, one-time `Pkg.develop(path=".")`), and a Markdown comparison of two or three result CSVs
-- `benchmark/sumnorms_diag.jl` — attribution of the sum-of-norms SOCP regression (factorization vs back-solves vs iterations vs routing); measurements only, no `src/` changes
 - Run: `julia --project -e 'include("benchmark/profile.jl")'`
 
 ## Git Workflow
