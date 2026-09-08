@@ -10,6 +10,9 @@
 #   julia --project benchmark/suite.jl --only nql30,lp-band-10000
 #   julia --project benchmark/suite.jl --in-process    # no subprocess (no RSS)
 #   julia --project benchmark/suite.jl --out results.csv
+#   julia --project benchmark/suite.jl --opt maxIters=50,kktsolver=ldl
+#                                      # solver options (Int/Float/Bool/String)
+#   julia --project benchmark/suite.jl --timeout 300   # kill a child after 300 s
 #
 # Instances come from three sources:
 #   * synthetic families with bounded factorization fill (banded LP, banded
@@ -182,10 +185,68 @@ verified(sol, res; tol = 1e-6) = sol.status == :Optimal &&
     max(res.rDu, res.rPr, res.rEq, res.gap) <= tol &&
     res.margin >= -tol && res.dual_margin >= -tol
 
+# ──────────────────────────────────────────────────────────────
+#  Solver options (`--opt key=value[,key=value]`)
+# ──────────────────────────────────────────────────────────────
+
+# Parsed once per process from the command line into SOLVER_OPTS; the
+# parent forwards the raw string to each child (see run_subprocess).
+const SOLVER_OPTS = Dict{Symbol, Any}()
+const OPT_STRING = Ref("")
+
+_parse_opt_value(s::AbstractString) = something(
+    tryparse(Int, s), tryparse(Float64, s),
+    s == "true" ? true : s == "false" ? false : nothing, String(s))
+
+# "maxIters=3,optTol=1e-8,equilibrate=false,kktsolver=ldl" →
+# Dict(:maxIters => 3, :optTol => 1e-8, :equilibrate => false, :kktsolver => "ldl")
+function parse_opts(str::AbstractString)
+    opts = Dict{Symbol, Any}()
+    for kv in split(str, ','; keepempty = false)
+        occursin('=', kv) || throw(ArgumentError("--opt entry \"$kv\" is not key=value"))
+        k, v = split(kv, '='; limit = 2)
+        opts[Symbol(strip(k))] = _parse_opt_value(strip(v))
+    end
+    return opts
+end
+
+function set_opts!(str::AbstractString)
+    OPT_STRING[] = String(str)
+    empty!(SOLVER_OPTS)
+    merge!(SOLVER_OPTS, parse_opts(str))
+    return SOLVER_OPTS
+end
+
+# Keyword arguments for the direct API: strings name a KKT solver, and
+# `preprocess` chooses the entry point rather than being forwarded.
+function direct_kwargs(opts = SOLVER_OPTS)
+    kw = Dict{Symbol, Any}(k => v for (k, v) in opts if k != :preprocess)
+    if haskey(kw, :kktsolver)
+        kw[:kktsolver] = ConicIP._resolve_kktsolver(kw[:kktsolver])
+    end
+    return kw
+end
+
+# Name of the KKT solver `choose_kktsolver` picks for this data, or the
+# `--opt kktsolver=` override; "" if the choice itself throws.
+function kkt_solver_name(prob; opts = SOLVER_OPTS)
+    haskey(opts, :kktsolver) && return string(opts[:kktsolver])
+    ks = try
+        ConicIP.choose_kktsolver(prob.Q, prob.A, prob.G, prob.cone_dims)
+    catch
+        return ""
+    end
+    return ks isa Function ? string(nameof(ks)) : string(nameof(typeof(ks)))
+end
+
+# Solution fields another tranche adds (LDLᵀ repair/refactor counters); blank
+# when the running ConicIP does not have them.
+_sol_field(sol, name) = (sol !== nothing && hasproperty(sol, name)) ? getproperty(sol, name) : ""
+
 function solve_direct(prob; preprocess = true)
-    entry = preprocess ? preprocess_conicIP : conicIP
+    entry = (preprocess && get(SOLVER_OPTS, :preprocess, true)) ? preprocess_conicIP : conicIP
     return entry(prob.Q, prob.c, prob.A, prob.b, prob.cone_dims, prob.G, prob.d;
-                 verbose = false)
+                 verbose = false, direct_kwargs()...)
 end
 
 function run_direct(inst::Instance)
@@ -193,6 +254,7 @@ function run_direct(inst::Instance)
     n = length(prob.c); m = size(prob.A, 1); p = size(prob.G, 1)
     data_nnz = nnz(sparse(prob.Q)) + nnz(sparse(prob.A)) + nnz(sparse(prob.G))
     fill = kkt_fill(prob)
+    kktname = kkt_solver_name(prob)
     # Two solves with preprocessing (report the better), one without to
     # estimate the presolve cost by subtraction. This is NOT an instrumented
     # phase time: the two solves can take different routes/iterations.
@@ -212,6 +274,9 @@ function run_direct(inst::Instance)
         "rDu" => res.rDu, "rPr" => res.rPr, "rEq" => res.rEq,
         "gap" => res.gap, "margin" => res.margin, "dual_margin" => res.dual_margin,
         "verified" => verified(sol, res),
+        "kktsolver" => kktname,
+        "kkt_repaired" => _sol_field(sol, :kkt_repaired),
+        "kkt_refactors" => _sol_field(sol, :kkt_refactors),
     )
 end
 
@@ -222,6 +287,9 @@ function run_moi(inst::Instance)
     function once()
         opt = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
         MOI.set(opt, MOI.Silent(), true)
+        for (k, v) in SOLVER_OPTS
+            MOI.set(opt, MOI.RawOptimizerAttribute(string(k)), v)
+        end
         t_asm = @elapsed MOI.copy_to(opt, src)
         t_opt = @elapsed MOI.optimize!(opt)
         return (opt = opt, t_asm = t_asm, t_opt = t_opt)
@@ -243,6 +311,8 @@ function run_moi(inst::Instance)
             c = raw.c_int, A = raw.ineq_A, b = raw.ineq_b,
             G = raw.eq_G, d = raw.eq_d, cone_dims = raw.cone_dims)
     res = residuals(prob, sol)
+    # The assembled data is at hand, so the automatic choice is cheap here.
+    kktname = (raw.ineq_A === nothing || raw.eq_G === nothing) ? "" : kkt_solver_name(prob)
     return Dict(
         "n" => n, "m" => m, "p" => p, "data_nnz" => data_nnz,
         "kkt_nnz" => -1, "lu_nnz" => -1,
@@ -255,6 +325,9 @@ function run_moi(inst::Instance)
         "rDu" => res.rDu, "rPr" => res.rPr, "rEq" => res.rEq,
         "gap" => res.gap, "margin" => res.margin, "dual_margin" => res.dual_margin,
         "verified" => verified(sol, res),
+        "kktsolver" => kktname,
+        "kkt_repaired" => _sol_field(sol, :kkt_repaired),
+        "kkt_refactors" => _sol_field(sol, :kkt_refactors),
     )
 end
 
@@ -283,22 +356,43 @@ end
 const COLUMNS = ["name", "family", "n", "m", "p", "data_nnz", "kkt_nnz", "lu_nnz",
                  "status", "iters", "kkt_solves", "t_total", "t_presolve_est",
                  "t_assembly", "alloc_gib", "maxrss_mb",
-                 "rDu", "rPr", "rEq", "gap", "margin", "dual_margin", "verified"]
+                 "rDu", "rPr", "rEq", "gap", "margin", "dual_margin", "verified",
+                 "kktsolver", "kkt_repaired", "kkt_refactors"]
 
-function run_subprocess(inst::Instance)
-    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) $(@__FILE__) --one $(inst.name)`
-    out = IOBuffer(); err = IOBuffer()
-    ok = success(pipeline(cmd; stdout = out, stderr = err))
+# Run one instance in a fresh Julia process: `script --one name extra_args...`
+# (the script defaults to this file; baselines.jl passes itself). The child
+# is killed after `timeout` seconds (wall clock, warm-up and compilation
+# included) and the row then reads status=TIMEOUT.
+function run_subprocess(inst::Instance; timeout = Inf, script = @__FILE__,
+                        extra_args = String[])
+    args = String["--one", inst.name]
+    isempty(OPT_STRING[]) || append!(args, ["--opt", OPT_STRING[]])
+    append!(args, extra_args)
+    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) $script $args`
     result = Dict{String, Any}()
-    for line in split(String(take!(out)), '\n')
-        occursin('=', line) || continue
-        k, v = split(line, '='; limit = 2)
-        result[String(k)] = String(v)
-    end
-    if !ok
-        # Child stderr (precompilation chatter included) is shown only on failure.
-        println(stderr, String(take!(err)))
-        result["status"] = get(result, "status", "CRASHED")
+    mktempdir() do dir
+        outpath = joinpath(dir, "out"); errpath = joinpath(dir, "err")
+        proc = run(pipeline(cmd; stdout = outpath, stderr = errpath); wait = false)
+        killed = Ref(false)
+        timer = isfinite(timeout) ? Timer(timeout) do _
+            process_running(proc) || return
+            killed[] = true
+            kill(proc)
+        end : nothing
+        wait(proc)
+        timer === nothing || close(timer)
+        for line in eachline(outpath)
+            occursin('=', line) || continue
+            k, v = split(line, '='; limit = 2)
+            result[String(k)] = String(v)
+        end
+        if killed[]
+            result["status"] = "TIMEOUT"
+        elseif !success(proc)
+            # Child stderr (precompilation chatter included) is shown only on failure.
+            println(stderr, read(errpath, String))
+            result["status"] = get(result, "status", "CRASHED")
+        end
     end
     return result
 end
@@ -317,40 +411,26 @@ function environment_header()
     ], "  ")
 end
 
-function main(args)
-    if "--one" in args
-        inst = INSTANCES[findfirst(i -> i.name == args[findfirst(==("--one"), args) + 1], INSTANCES)]
-        for (k, v) in run_one(inst)
-            println(k, "=", v)
-        end
-        return
-    end
-    quick = "--quick" in args
-    inproc = "--in-process" in args
-    only = if "--only" in args
-        Set(split(args[findfirst(==("--only"), args) + 1], ','))
-    else
-        nothing
-    end
-    outpath = if "--out" in args
-        args[findfirst(==("--out"), args) + 1]
-    else
-        mkpath(joinpath(@__DIR__, "results"))
-        joinpath(@__DIR__, "results", "suite-$(Dates.format(now(), "yyyymmdd-HHMM")).csv")
-    end
-    selected = filter(INSTANCES) do inst
-        only !== nothing ? inst.name in only : (!quick || inst.quick)
-    end
+# Value of `--flag value` in args, or `default` when the flag is absent.
+function arg_value(args, flag, default = nothing)
+    i = findfirst(==(flag), args)
+    return i === nothing ? default : args[i + 1]
+end
 
-    println("# ConicIP benchmark suite")
-    println(environment_header())
-    println()
+_num(x) = x isa AbstractString ? something(tryparse(Float64, x), NaN) : x
+
+# Run `selected` instances one after another, printing a progress line per
+# instance and returning the result rows. `runner(inst)` is the in-process
+# path; otherwise each instance goes to a child process running `script`.
+function run_selected(selected; inproc = false, timeout = Inf, runner = run_one,
+                      script = @__FILE__, extra_args = String[])
     rows = Vector{Dict{String, Any}}()
     for inst in selected
         print(rpad(inst.name, 24)); flush(stdout)
         result = try
-            inproc ? Dict{String, Any}(k => v for (k, v) in run_one(inst)) :
-                     run_subprocess(inst)
+            inproc ? Dict{String, Any}(k => v for (k, v) in runner(inst)) :
+                     run_subprocess(inst; timeout = timeout, script = script,
+                                    extra_args = extra_args)
         catch err
             Dict{String, Any}("status" => "FAILED: " * sprint(showerror, err)[1:min(end, 60)])
         end
@@ -359,19 +439,58 @@ function main(args)
         @printf("%-14s iters=%-4s solves=%-4s t=%-9s rss=%s MB\n",
                 get(result, "status", "?"), get(result, "iters", "?"),
                 get(result, "kkt_solves", "?"),
-                fmt(get(result, "t_total", NaN) isa AbstractString ?
-                    parse(Float64, result["t_total"]) : get(result, "t_total", NaN)),
-                fmt(get(result, "maxrss_mb", NaN) isa AbstractString ?
-                    parse(Float64, result["maxrss_mb"]) : get(result, "maxrss_mb", NaN)))
+                fmt(_num(get(result, "t_total", NaN))),
+                fmt(_num(get(result, "maxrss_mb", NaN))))
     end
+    return rows
+end
 
-    open(outpath, "w") do io
-        println(io, "# ", environment_header())
-        println(io, join(COLUMNS, ","))
+# CSV with the environment header as a comment line; `""` for missing cells.
+function write_csv(path, rows; columns = COLUMNS, header = environment_header())
+    open(path, "w") do io
+        println(io, "# ", header)
+        println(io, join(columns, ","))
         for r in rows
-            println(io, join([string(get(r, c, "")) for c in COLUMNS], ","))
+            println(io, join([string(get(r, c, "")) for c in columns], ","))
         end
     end
+    return path
+end
+
+function select_instances(args)
+    quick = "--quick" in args
+    only = "--only" in args ? Set(split(arg_value(args, "--only"), ',')) : nothing
+    return filter(INSTANCES) do inst
+        only !== nothing ? inst.name in only : (!quick || inst.quick)
+    end
+end
+
+function main(args)
+    "--opt" in args && set_opts!(arg_value(args, "--opt"))
+    if "--one" in args
+        name = arg_value(args, "--one")
+        inst = INSTANCES[findfirst(i -> i.name == name, INSTANCES)]
+        for (k, v) in run_one(inst)
+            println(k, "=", v)
+        end
+        return
+    end
+    inproc = "--in-process" in args
+    timeout = parse(Float64, arg_value(args, "--timeout", "Inf"))
+    outpath = if "--out" in args
+        arg_value(args, "--out")
+    else
+        mkpath(joinpath(@__DIR__, "results"))
+        joinpath(@__DIR__, "results", "suite-$(Dates.format(now(), "yyyymmdd-HHMM")).csv")
+    end
+    selected = select_instances(args)
+
+    println("# ConicIP benchmark suite")
+    println(environment_header())
+    isempty(OPT_STRING[]) || println("options: ", OPT_STRING[])
+    println()
+    rows = run_selected(selected; inproc = inproc, timeout = timeout)
+    write_csv(outpath, rows)
     println("\nwrote ", outpath)
 end
 
