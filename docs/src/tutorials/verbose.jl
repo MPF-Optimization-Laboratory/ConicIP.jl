@@ -103,6 +103,16 @@ println("status: ", sol.status)
 # on every row is the healthy pattern; the totals over the solve are in
 # `sol.kkt_repaired` and `sol.kkt_refactors`.
 #
+# ## The cc column
+#
+# `cc` is blank unless `centralityCorrectors > 0`. It then reads
+# `accepted/tried` for the Gondzio centrality correctors of the step that
+# produced the row's iterate: each corrector is one extra back-solve of the
+# current KKT factorization, kept only if it lengthens the step, and the
+# loop stops at the first rejection. `0/0` means the step was already full
+# (or there was no centering target), so nothing was tried. The extra solves
+# are included in `sol.kkt_solves`.
+#
 # ## The exit line
 #
 # The log ends with a one-line verdict. `EXIT -- Below Tolerance!` means all

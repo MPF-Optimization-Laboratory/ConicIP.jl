@@ -47,6 +47,7 @@ Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/
 include("blockmatrices.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
+include("correctors.jl")
 
 ViewTypes   = Union{SubArray}
 VectorTypes = Union{Vector, ViewTypes}
@@ -682,7 +683,8 @@ structurally_zero_cols(M::AbstractMatrix) =
   certFallbackIters = 50,
   refineRelTol = 1e-13,
   refineAbsTol = 1e-12,
-  timeLimit = Inf)
+  timeLimit = Inf,
+  centralityCorrectors = 0)
 
 Interior point solver for the system
 
@@ -757,6 +759,14 @@ Selected keyword arguments:
   of the relative gap test only (`⟨v,s⟩/(1 + |pobj + objective_offset|)`).
   `preprocess_conicIP` passes the constant carried by fixed variables, so a
   reduced problem terminates by the same criterion as the full one.
+- `centralityCorrectors` — number of Gondzio multiple centrality correctors
+  tried per iteration (default `0`, off). Each corrector re-solves the
+  current KKT factorization once for a direction that pushes the trial
+  complementarity toward the box `[0.1·σμ, 10·σμ]` (in the Jordan frame of
+  each cone) and is kept only if it lengthens the step; the loop stops at
+  the first rejected corrector, and nothing is tried when the step is
+  already full. Extra solves are counted in `kkt_solves`; the verbose
+  `cc` column shows `accepted/tried`.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -874,10 +884,16 @@ function _conicIP(
   timeLimit = Inf,         # wall-clock budget in seconds, checked once per iteration
   objective_offset = 0.0,  # constant part of the objective (from presolve), used
                            # only in the relative gap test's denominator
-  scaling = nothing        # set by conicIP when the data are equilibrated: the
+  scaling = nothing,       # set by conicIP when the data are equilibrated: the
                            # termination residuals are evaluated in the
                            # original coordinates (see equilibrate.jl)
+  centralityCorrectors::Integer = 0  # Gondzio correctors per iteration (0 = off;
+                           # see the corrector block after the line search)
   )
+
+  centralityCorrectors >= 0 ||
+    throw(ArgumentError("centralityCorrectors must be a nonnegative integer (got $centralityCorrectors)"))
+  centralityCorrectors = Int(centralityCorrectors)
 
   t_start = time()
   over_time() = time() - t_start > timeLimit
@@ -912,6 +928,15 @@ function _conicIP(
   # Best step seen so far during refinement (restored when a correction
   # increases the residual)
   _Δz_keep = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  # Centrality-corrector scratch (allocated only when the option is on):
+  # trial scaled iterates ṽ, s̃, their product w, the correction Δw, the
+  # corrector right-hand side (zero except the s block), and the candidate
+  # direction Δz + Δz_c.
+  if centralityCorrectors > 0
+    _cc_v  = zeros(m); _cc_s = zeros(m); _cc_w = zeros(m); _cc_dw = zeros(m)
+    _cc_r  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+    _cc_Δz = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  end
 
   # KKT back-solve counter, reported as Solution.kkt_solves
   _nsolve = Ref(0)
@@ -1024,6 +1049,7 @@ function _conicIP(
                    refineRelTol = refineRelTol, refineAbsTol = refineAbsTol,
                    timeLimit = time_left(),
                    objective_offset = objective_offset,
+                   centralityCorrectors = centralityCorrectors,
                    scaling = scaling === nothing ? nothing :
                              (; scaling..., Dc = scaling.Dc[keep_c],
                                             De = scaling.De[keep_r]))
@@ -1260,8 +1286,8 @@ function _conicIP(
   if verbose
       println("            Optimality                      Objective              Infeasibility       ")
       println()
-      printstyled(@sprintf(" %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-6s  %-8s \n",
-                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine","kkt");
+      printstyled(@sprintf(" %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-6s  %-8s  %-5s\n",
+                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine","kkt","cc");
                   bold = true)
   end
 
@@ -1273,6 +1299,8 @@ function _conicIP(
   _stamp_kkt!(sol)
   optBest = Inf
   nref    = 0      # refinement corrections applied in the previous iteration
+  cc_acc  = 0      # centrality correctors accepted / tried in the previous
+  cc_try  = 0      #   iteration (verbose cc column)
   rnorm   = 0
   nstall  = 0      # consecutive iterations with a negligible step
   μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
@@ -1564,10 +1592,13 @@ function _conicIP(
       # repaired/refactors of the factorization that produced this
       # iterate (the previous iteration's, or the initial point's); blank
       # when the solver reports no diagnostics.
+      # The cc cell is accepted/tried centrality correctors of the step
+      # that produced this iterate; blank when the option is off.
       dg  = kkt_diagnostics(_s3_cur[])
       kkt = dg === nothing ? "" : @sprintf("%d/%d", dg.repaired, dg.refactors)
-      row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %-6i  %s\n",
-                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, nref, kkt)
+      cc  = centralityCorrectors > 0 ? @sprintf("%d/%d", cc_acc, cc_try) : ""
+      row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %-6i  %-8s  %s\n",
+                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, nref, kkt, cc)
       if rnorm > REFINE_WARN_NORM
         printstyled(row; bold = true, color = :red)
       else
@@ -1736,6 +1767,67 @@ function _conicIP(
     end
     α_vs === nothing && return sol
     α = min( α_vs[1], α_vs[2] )
+
+    # ────────────────────────────────────────────────────────────
+    #  Gondzio multiple centrality correctors (off by default)
+    #
+    #  Each corrector asks for a longer step α̃ = min(1, α + δα), forms
+    #  the trial scaled complementarity that step would produce,
+    #      ṽ = λ − α̃·FΔv,   s̃ = λ − α̃·F⁻ᵀΔs,   w = ṽ ∘ s̃,
+    #  and a correction Δw = Π_[βmin σμ, βmax σμ](w) − w, capped below at
+    #  −βmax σμ, taken in the Jordan frame of w (correctors.jl). One more
+    #  back-solve with the current factorization gives Δz_c; the candidate
+    #  Δz + Δz_c is kept iff it lengthens the step by at least γ(α̃ − α).
+    #
+    #  Sign of the right-hand side. The fourth block row of the 4×4 system
+    #  is λ∘(FΔv) + λ∘(F⁻ᵀΔs) = r_s, and the step is z ← z − αΔz, so an
+    #  extra direction Δz_c changes the trial complementarity by
+    #      −α·(λ∘FΔz_c.v + λ∘F⁻ᵀΔz_c.s) = −α·r_s   (to first order).
+    #  Solving with r_s = −Δw therefore moves w by +α̃·Δw, toward the box
+    #  (verified numerically in test/tranche3_tests.jl, "corrector sign").
+    #  The corrector rhs is not divided by α̃ (Gondzio's convention): the
+    #  realized move is a fraction of Δw, and the acceptance test decides.
+    # ────────────────────────────────────────────────────────────
+    if centralityCorrectors > 0
+      cc_acc = 0; cc_try = 0
+      σμ = σ*μ
+      for _ in 1:centralityCorrectors
+        α̃ = min(1.0, α + GONDZIO_δα)
+        # A full step needs no lengthening, and a zero centering target
+        # (σ = 0, or μ ≤ 0) leaves no box to aim for.
+        (α̃ > α && σμ > 0) || break
+        _cc_v .= λ .- α̃ .* (F*Δz.v)
+        _cc_s .= λ .- α̃ .* (F⁻ᵀ*Δz.s)
+        cone_prod!(_cc_w, _cc_v, _cc_s)
+        centrality_correction!(_cc_dw, _cc_w, GONDZIO_βmin*σμ, GONDZIO_βmax*σμ,
+                               GONDZIO_βmax*σμ, cone_dims)
+        all(isfinite, _cc_dw) || break
+        # Already inside the box (exactly zero correction): nothing to solve.
+        all(iszero, _cc_dw) && break
+        _cc_r.s .= .-_cc_dw
+        Δz_c = guarded("centrality corrector, iteration $Iter") do
+          solve(_cc_r)
+        end
+        Δz_c === nothing && return sol
+        isfinite4(Δz_c) || break
+        cc_try += 1
+        copy4!(_cc_Δz, Δz)
+        axpy4!(1.0, Δz_c, _cc_Δz)
+        α_new_vs = guarded("centrality corrector line search, iteration $Iter") do
+          ( min( 1, (1-DTB)*maxstep(z.v, _cc_Δz.v) ),
+            min( 1, (1-DTB)*maxstep(z.s, _cc_Δz.s) ) )
+        end
+        α_new_vs === nothing && return sol
+        α_new = min(α_new_vs[1], α_new_vs[2])
+        if α_new >= α + GONDZIO_γ*(α̃ - α)
+          copy4!(Δz, _cc_Δz)
+          α = α_new
+          cc_acc += 1
+        else
+          break
+        end
+      end
+    end
 
     # Verified interiority. maxstep is exact in exact arithmetic, but a
     # step that lands within rounding of the boundary makes the next

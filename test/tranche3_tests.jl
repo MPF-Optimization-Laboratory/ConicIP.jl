@@ -308,4 +308,331 @@
     @test isfinite(gap) && gap < 1e-6
     @test gap == opt.sol.rGap
   end
+
+  @testset "Centrality correctors" begin
+    βmin = ConicIP.GONDZIO_βmin; βmax = ConicIP.GONDZIO_βmax
+    @test ConicIP.GONDZIO_δα == 0.1 && ConicIP.GONDZIO_γ == 0.1
+    @test βmin == 0.1 && βmax == 10.0
+
+    # ── clip_spectral! against dense references ──
+    Random.seed!(41)
+    clip(w, lo, hi, cd) = ConicIP.clip_spectral!(similar(w), w, lo, hi, cd)
+
+    # R: entrywise clamp; identity inside the box is exact
+    w = randn(7)
+    @test clip(w, -0.5, 0.5, [("R", 7)]) == clamp.(w, -0.5, 0.5)
+    @test clip(w, -10.0, 10.0, [("R", 7)]) == w
+    @test_throws ArgumentError clip(w, 1.0, 0.0, [("R", 7)])
+
+    # Q: the Jordan eigenvalues are the extreme eigenvalues of the arrow
+    # matrix Arw(w) = [w₁ w̄ᵀ; w̄ w₁I]; the clipped element keeps the frame
+    # (w̄ direction) and has the clamped extreme eigenvalues.
+    arrow(w) = [w[1] w[2:end]'; w[2:end] w[1]*Matrix(1.0I, length(w)-1, length(w)-1)]
+    for k in (2, 3, 6)
+      w = randn(k); w[1] = 0.3 * norm(w[2:end])           # outside the cone
+      E = eigen(Symmetric(arrow(w)))
+      λlo, λhi = E.values[1], E.values[end]
+      @test λlo ≈ w[1] - norm(w[2:end]) && λhi ≈ w[1] + norm(w[2:end])
+      lo, hi = 0.05, 0.6 * λhi
+      o = clip(w, lo, hi, [("Q", k)])
+      Eo = eigen(Symmetric(arrow(o)))
+      @test Eo.values[1] ≈ clamp(λlo, lo, hi) atol = 1e-12
+      @test Eo.values[end] ≈ clamp(λhi, lo, hi) atol = 1e-12
+      @test norm(o[2:end] / norm(o[2:end]) - w[2:end] / norm(w[2:end])) < 1e-12
+      # eigenvectors of the extreme eigenvalues coincide up to sign
+      @test abs(abs(dot(E.vectors[:, 1], Eo.vectors[:, 1])) - 1) < 1e-10
+      @test abs(abs(dot(E.vectors[:, end], Eo.vectors[:, end])) - 1) < 1e-10
+      # idempotent, and identity inside the box (exact)
+      @test clip(o, lo, hi, [("Q", k)]) ≈ o atol = 1e-14
+      @test clip(o, lo - 1, hi + 1, [("Q", k)]) == o
+    end
+    # both eigenvalues clipped to the same value: the result is a multiple
+    # of the cone identity; a zero w̄ is handled
+    wq = [1.0, 0.2, -0.1]
+    @test clip(wq, 3.0, 3.0, [("Q", 3)]) ≈ [3.0, 0.0, 0.0]
+    @test clip([2.0, 0.0, 0.0], 0.5, 1.0, [("Q", 3)]) == [1.0, 0.0, 0.0]
+    @test clip([2.0], 0.5, 1.0, [("Q", 1)]) == [1.0]
+
+    # S: eigenvalues of mat before/after
+    for r in (2, 4)
+      Ws = Symmetric(randn(r, r)); Ws = Matrix(Ws)
+      w = ConicIP.vecm(Ws)
+      Λ = eigvals(Symmetric(ConicIP.mat(w)))
+      lo, hi = -0.2, 0.7
+      k = length(w)
+      o = clip(w, lo, hi, [("S", k)])
+      @test eigvals(Symmetric(ConicIP.mat(o))) ≈ clamp.(Λ, lo, hi) atol = 1e-12
+      # same eigenvectors: mat(o) and mat(w) commute
+      @test norm(ConicIP.mat(o) * ConicIP.mat(w) - ConicIP.mat(w) * ConicIP.mat(o)) < 1e-12
+      @test clip(o, lo, hi, [("S", k)]) ≈ o atol = 1e-13         # idempotent
+      @test clip(w, minimum(Λ) - 1, maximum(Λ) + 1, [("S", k)]) == w   # exact identity
+    end
+
+    # mixed cone product in one call
+    cdm = [("R", 2), ("Q", 3), ("S", 3)]
+    wm = [-1.0, 5.0, 1.0, 0.2, -0.1, ConicIP.vecm([2.0 0.3; 0.3 -1.0])...]
+    om = clip(wm, 0.0, 1.0, cdm)
+    @test om[1:2] == [0.0, 1.0]
+    @test om[3:5] ≈ clip(wm[3:5], 0.0, 1.0, [("Q", 3)])
+    @test om[6:8] ≈ clip(wm[6:8], 0.0, 1.0, [("S", 3)])
+
+    # centrality_correction!: Π_box(w) − w with the cap, per frame
+    w = randn(6) .* 3
+    lo, hi, cap = 0.1, 1.0, 0.5
+    Δ = ConicIP.centrality_correction!(similar(w), w, lo, hi, cap, [("R", 6)])
+    @test Δ == max.(clamp.(w, lo, hi) .- w, -cap)
+    @test ConicIP.centrality_correction!(similar(w), w, -100.0, 100.0, cap, [("R", 6)]) == zeros(6)
+    Ws = Symmetric(randn(4, 4)); Ws = Matrix(Ws)
+    w = ConicIP.vecm(Ws); Λ = eigvals(Symmetric(Ws))
+    Δ = ConicIP.centrality_correction!(similar(w), w, lo, hi, cap, [("S", 10)])
+    @test eigvals(Symmetric(ConicIP.mat(Δ))) ≈ sort(max.(clamp.(Λ, lo, hi) .- Λ, -cap)) atol = 1e-12
+    @test_throws ArgumentError ConicIP.centrality_correction!(similar(w), w, lo, hi, -1.0, [("S", 10)])
+
+    # ── corrector sign on an LP (mirrors the derivation in ConicIP.jl) ──
+    # With z ← z − αΔz, a direction solving the 4×4 system with r_s = −Δw
+    # must move the trial complementarity toward the box; +Δw must move it
+    # away. The 4×4 solve is replicated from solve4x4 on kktsolver_qr.
+    Random.seed!(3)
+    let n = 8, m = 12, p = 2, DTB = 0.01
+      Q = spzeros(n, n)
+      A = sprandn(m, n, 0.6) + [sparse(1.0I, n, n); sprandn(m - n, n, 0.5)]
+      G = sprandn(p, n, 0.7)
+      y = randn(n); s = 0.5 .+ rand(m); v = 0.5 .+ rand(m); wq = randn(p)
+      b = A*y - s + 0.3*randn(m); d = G*y + 0.2*randn(p)
+      c = A'*v - G'*randn(p) + 0.3*randn(n)
+      cd = [("R", m)]
+      F   = Block([Diagonal(sqrt.(s) ./ sqrt.(v))])
+      F⁻ᵀ = ConicIP.inv_adjoint!(Block(1), F)
+      λ   = F*v
+      @test λ ≈ F⁻ᵀ*s
+      solve3x3 = ConicIP.kktsolver_qr(Q, A, G, cd)(F, F⁻ᵀ)
+      function solve4(r)
+        # (local names: a closure assignment to `Δw` would capture the
+        # correction vector defined below)
+        t1 = F'*(r.s ./ λ)
+        (dy, dw, dv) = solve3x3(r.y, r.w, r.v + t1)
+        return ConicIP.v4x1(dy, dw, dv, t1 - F'*(F*dv))
+      end
+      # 4×4 contract check of the replica
+      Fm = Matrix(F.Blocks[1]); Fim = Matrix(F⁻ᵀ.Blocks[1])
+      K4 = [Matrix(Q) Matrix(G') -Matrix(A') zeros(n, m);
+            Matrix(G) zeros(p, p) zeros(p, m) zeros(p, m);
+            Matrix(A) zeros(m, p) zeros(m, m) -Matrix(1.0I, m, m);
+            zeros(m, n) zeros(m, p) Diagonal(λ)*Fm Diagonal(λ)*Fim]
+      vec4(z) = [z.y; z.w; z.v; z.s]
+      r0 = ConicIP.v4x1(Q*y + G'*wq - A'*v - c, G*y - d, A*y - s - b, λ .* λ)
+      d_aff = solve4(r0)
+      @test norm(K4*vec4(d_aff) - vec4(r0)) < 1e-10
+      ms(x, dd) = ConicIP.maxstep_rp(x, dd)
+      α_aff = min(1, ms(v, d_aff.v), ms(s, d_aff.s))
+      μbar = dot(v, s); μ = μbar/m
+      σ = max(0, min(1, dot(v - α_aff*d_aff.v, s - α_aff*d_aff.s)/μbar))^3
+      lc = -((F⁻ᵀ*d_aff.s) .* (F*d_aff.v)) .+ σ*μ
+      Δz = solve4(ConicIP.v4x1(r0.y, r0.w, r0.v, λ .* λ - lc))
+      α = min(1, (1-DTB)*min(ms(v, Δz.v), ms(s, Δz.s)))
+      @test 0 < α < 1
+      σμ = σ*μ; lo = βmin*σμ; hi = βmax*σμ
+      boxdist(wv) = norm(max.(lo .- wv, 0) .+ max.(wv .- hi, 0))
+      trial(Δ, a) = (λ .- a .* (F*Δ.v)) .* (λ .- a .* (F⁻ᵀ*Δ.s))
+      α̃ = min(1, α + ConicIP.GONDZIO_δα)
+      wt = trial(Δz, α̃)
+      Δw = ConicIP.centrality_correction!(zeros(m), wt, lo, hi, βmax*σμ, cd)
+      @test boxdist(wt) > 0 && norm(Δw) > 0
+      dist = Dict{Float64,Float64}()
+      for sgn in (-1.0, 1.0)
+        rc = ConicIP.v4x1(zeros(n), zeros(p), zeros(m), sgn .* Δw)
+        Δc = solve4(rc)
+        @test norm(K4*vec4(Δc) - vec4(rc)) < 1e-10
+        cand = ConicIP.v4x1(Δz.y + Δc.y, Δz.w + Δc.w, Δz.v + Δc.v, Δz.s + Δc.s)
+        dist[sgn] = boxdist(trial(cand, α̃))
+        # The fourth block row gives the first-order change of the trial
+        # complementarity: −α̃·(λ∘FΔv_c + λ∘F⁻ᵀΔs_c) = −α̃·r_s.
+        @test λ .* (F*Δc.v) .+ λ .* (F⁻ᵀ*Δc.s) ≈ sgn .* Δw atol = 1e-10
+      end
+      @test dist[-1.0] < boxdist(wt)      # r_s = −Δw: strictly closer to the box
+      @test dist[1.0]  > boxdist(wt)      # r_s = +Δw: farther away
+    end
+
+    # ── default 0: the corrector path is not entered ──
+    Random.seed!(20260907)
+    csd = t3_contract_case(t3_mixes[1])
+    args = (csd.Q, csd.c, csd.A, csd.b, t3_mixes[1], csd.G, csd.d)
+    s_unset = conicIP(args...; verbose = false, kktsolver = ConicIP.kktsolver_qr)
+    s_zero  = conicIP(args...; verbose = false, kktsolver = ConicIP.kktsolver_qr,
+                      centralityCorrectors = 0)
+    @test s_unset.status == s_zero.status == :Optimal
+    @test s_unset.Iter == s_zero.Iter
+    @test s_unset.kkt_solves == s_zero.kkt_solves
+    @test all(s_unset.y .=== s_zero.y)
+    capture(f) = mktemp() do path, io
+      redirect_stdout(io) do; f(); end
+      flush(io); read(path, String)
+    end
+    out0 = capture(() -> conicIP(args...; verbose = true, kktsolver = ConicIP.kktsolver_qr))
+    @test occursin("cc", out0)                                 # header
+    @test !occursin(r"\d+/\d+", out0)                          # no cc (or kkt) cells
+    out2 = capture(() -> conicIP(args...; verbose = true, kktsolver = ConicIP.kktsolver_qr,
+                                 centralityCorrectors = 2))
+    cells = [m.match for m in eachmatch(r"(\d+)/(\d+)\s*$"m, out2)]
+    @test length(cells) >= 2
+    @test all(c -> begin
+                     (a, t) = parse.(Int, split(strip(c), '/'))
+                     0 <= a <= t <= 2
+                   end, cells)
+    @test any(c -> strip(c) != "0/0", cells)
+    @test_throws ArgumentError conicIP(args...; verbose = false, centralityCorrectors = -1)
+
+    # ── centralityCorrectors = 2: Optimal, no more iterations, bounded solves ──
+    # Band generators (copies of benchmark/suite.jl's lp_band / qp_band).
+    function t3_lp_band(n; w = 5, seed = 1)
+      Random.seed!(seed)
+      I_ = Int[]; J_ = Int[]; V_ = Float64[]
+      for i in 1:n, j in max(1, i - w):min(n, i + w)
+        push!(I_, i); push!(J_, j); push!(V_, randn())
+      end
+      B = sparse(I_, J_, V_, n, n)
+      A = [B; sparse(1.0I, n, n); -sparse(1.0I, n, n)]
+      b = [-rand(n); fill(-10.0, n); fill(-10.0, n)]
+      return (Q = spzeros(n, n), c = randn(n), A = A, b = b,
+              cone_dims = [("R", 3n)], G = spzeros(0, n), d = zeros(0))
+    end
+    function t3_qp_band(n; w = 3, seed = 1)
+      Random.seed!(seed)
+      I_ = Int[]; J_ = Int[]; V_ = Float64[]
+      for i in 1:n, j in max(1, i - w):i
+        push!(I_, i); push!(J_, j); push!(V_, randn())
+      end
+      L = sparse(I_, J_, V_, n, n)
+      Q = L*L' + sparse(1.0I, n, n)
+      A = [sparse(1.0I, n, n); -sparse(1.0I, n, n)]
+      b = fill(-1.0, 2n)
+      return (Q = Q, c = randn(n), A = A, b = b,
+              cone_dims = [("R", 2n)], G = spzeros(0, n), d = zeros(0))
+    end
+    Random.seed!(20260907)
+    probs = Any[socp_sum_of_norms(150; d = 200), t3_lp_band(2000), t3_qp_band(2000)]
+    for mix in t3_mixes
+      cs = t3_contract_case(mix)
+      push!(probs, (Q = cs.Q, c = cs.c, A = cs.A, b = cs.b, cone_dims = mix, G = cs.G, d = cs.d))
+    end
+    for P in probs
+      s0 = conicIP(P.Q, P.c, P.A, P.b, P.cone_dims, P.G, P.d; verbose = false)
+      s2 = conicIP(P.Q, P.c, P.A, P.b, P.cone_dims, P.G, P.d; verbose = false,
+                   centralityCorrectors = 2)
+      @test s0.status == :Optimal
+      @test s2.status == :Optimal
+      @test s2.Iter <= s0.Iter
+      @test s2.kkt_solves <= s0.kkt_solves + 2 * s0.Iter
+      @test abs(s2.pobj - s0.pobj) <= 1e-5 * (1 + abs(s0.pobj))
+    end
+
+    # ── no corrector solve when α == 1 ──
+    # min ½‖y‖² − 1ᵀy over y ≥ −100: the optimum y = 1 is far from the
+    # bounds and the first Newton step is full (α = 1 exactly). With
+    # maxIters = 1 the corrector loop is skipped, so the solve count and
+    # the iterate match the default path bitwise; from iteration 2 on
+    # α < 1 and each iteration tries (and rejects) one corrector, so the
+    # trajectories stay identical and the count grows by exactly one per
+    # iteration.
+    fs = (Matrix(1.0I, 3, 3), [1.0, 1.0, 1.0], sparse(1.0I, 3, 3), fill(-100.0, 3), [("R", 3)])
+    f0 = conicIP(fs...; verbose = false, maxIters = 1)
+    f2 = conicIP(fs...; verbose = false, maxIters = 1, centralityCorrectors = 2)
+    @test f0.kkt_solves == f2.kkt_solves
+    @test all(f0.y .=== f2.y)
+    g0 = conicIP(fs...; verbose = false, maxIters = 2)
+    g2 = conicIP(fs...; verbose = false, maxIters = 2, centralityCorrectors = 2)
+    @test g2.kkt_solves == g0.kkt_solves + 1
+    outf = capture(() -> conicIP(fs...; verbose = true, centralityCorrectors = 2))
+    cellsf = [strip(m.match) for m in eachmatch(r"\d+/\d+\s*$"m, outf)]
+    @test cellsf[1] == "0/0" && cellsf[2] == "0/0"     # initial point, iteration 1
+    @test all(==("0/1"), cellsf[3:end])
+
+    # ── MOI option round trip ──
+    opt = ConicIP.Optimizer()
+    attr = MOI.RawOptimizerAttribute("centralityCorrectors")
+    @test MOI.supports(opt, attr)
+    @test MOI.get(opt, attr) == 0
+    MOI.set(opt, attr, 2)
+    @test MOI.get(opt, attr) == 2
+    model = MOI.Utilities.CachingOptimizer(
+      MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}()), opt)
+    MOI.set(model, MOI.Silent(), true)
+    x = MOI.add_variables(model, 2)
+    MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    fobj = MOI.ScalarQuadraticFunction(
+      [MOI.ScalarQuadraticTerm(2.0, x[1], x[1]), MOI.ScalarQuadraticTerm(2.0, x[2], x[2])],
+      [MOI.ScalarAffineTerm(-1.0, x[2])], 0.0)
+    MOI.set(model, MOI.ObjectiveFunction{typeof(fobj)}(), fobj)
+    MOI.add_constraint(model, 1.0 * x[1] + 1.0 * x[2], MOI.EqualTo(1.0))
+    MOI.add_constraint(model, x[1], MOI.GreaterThan(0.0))
+    MOI.add_constraint(model, x[2], MOI.GreaterThan(0.0))
+    MOI.optimize!(model)
+    @test MOI.get(model, MOI.TerminationStatus()) == MOI.OPTIMAL
+    MOI.set(opt, attr, -1)
+    @test_throws ArgumentError MOI.optimize!(model)
+
+    # ── infeasibility soundness verdicts are unchanged with correctors on ──
+    no_eq(n) = (zeros(0, n), zeros(0))
+    for K in (0, 2)
+      # (a) ε-feasible box is Optimal
+      ε = 1e-9
+      for nn in (1, 5), cc in (ones(nn), zeros(nn))
+        Ab = [sparse(1.0I, nn, nn); -sparse(1.0I, nn, nn)]
+        bb = [zeros(nn); fill(-ε, nn)]
+        sol = conicIP(zeros(nn, nn), cc, Ab, bb, [("R", 2nn)];
+                      verbose = false, centralityCorrectors = K)
+        @test sol.status == :Optimal && !sol.has_certificate
+        @test minimum(sol.y) > -1e-7 && maximum(sol.y) < ε + 1e-7
+      end
+      # (b) tiny-Q: bounded above the tolerance, a validated ray far below it
+      mk(ε) = (reshape([ε], 1, 1), [1.0], sparse(reshape([1.0], 1, 1)), [0.0], [("R", 1)])
+      for ε in (1e-6, 1e-4, 1e-2)
+        sol = conicIP(mk(ε)...; verbose = false, centralityCorrectors = K)
+        @test sol.status == :Optimal && !sol.has_certificate
+        @test sol.y[1] ≈ 1/ε rtol = 1e-4
+      end
+      sol = conicIP(mk(1e-12)...; verbose = false, centralityCorrectors = K)
+      @test sol.status == :DualInfeasible && sol.has_certificate
+      (chk, _) = ConicIP.validate_unboundedness_certificate(
+        mk(1e-12)..., no_eq(1)..., sol.y; abstol = 1e-9, reltol = 1e-7)
+      @test chk.valid
+      # (c) degenerate blocks: equality-only and cone-only infeasibility
+      Q1 = zeros(1, 1); c1 = [0.0]
+      sol = preprocess_conicIP(Q1, c1, spzeros(0, 1), zeros(0), Tuple{String,Int}[],
+                               reshape([1.0; 1.0], 2, 1), [1.0, 2.0];
+                               verbose = false, centralityCorrectors = K)
+      @test sol.status == :Infeasible && sol.has_certificate
+      A2 = sparse([1.0; -1.0][:, :]); b2 = [1.0, 1.0]; K2 = [("R", 2)]
+      sol = conicIP(Q1, c1, A2, b2, K2; verbose = false, centralityCorrectors = K)
+      @test sol.status == :Infeasible && sol.has_certificate
+      (chk, _, _) = ConicIP.validate_infeasibility_certificate(
+        Q1, c1, A2, b2, K2, no_eq(1)..., sol.w, sol.v; abstol = 1e-9, reltol = 1e-7)
+      @test chk.valid
+      # (e) SOC infeasible, ray in the cone
+      A3 = sparse([1.0 0.0 0.0; 0.0 1.0 0.0; 0.0 0.0 1.0; -1.0 0.0 0.0])
+      b3 = [0.0, 0.0, 0.0, 1.0]; K3 = [("Q", 3), ("R", 1)]
+      sol = conicIP(zeros(3, 3), zeros(3), A3, b3, K3; verbose = false,
+                    centralityCorrectors = K)
+      @test sol.status == :Infeasible && sol.has_certificate
+      @test ConicIP.cone_margin(sol.v, K3) >= -1e-6
+      A4 = sparse([1.0 0.0; 0.0 1.0; -1.0 0.0; 0.0 1.0])
+      b4 = [0.0, 0.0, 0.0, 1.0]; K4 = [("Q", 2), ("R", 2)]
+      sol = conicIP(zeros(2, 2), zeros(2), A4, b4, K4; verbose = false,
+                    centralityCorrectors = K)
+      @test sol.status == :Infeasible && sol.has_certificate
+      # (f) near-optimal and near-certificate: Optimal wins
+      A5 = sparse([1.0; -1.0][:, :]); K5 = [("R", 2)]
+      sol = conicIP(zeros(1, 1), [0.0], A5, [0.0, 0.0], K5; verbose = false,
+                    centralityCorrectors = K)
+      @test sol.status == :Optimal && !sol.has_certificate
+      sol = conicIP(zeros(1, 1), [0.0], A5, [0.0, -1e-10], K5; verbose = false,
+                    centralityCorrectors = K)
+      @test sol.status == :Optimal && !sol.has_certificate
+      sol = conicIP(zeros(2, 2), zeros(2), sparse(1.0I, 2, 2), zeros(2), [("R", 2)],
+                    Matrix(1.0I, 2, 2), zeros(2); verbose = false,
+                    centralityCorrectors = K)
+      @test sol.status == :Optimal && !sol.has_certificate
+      @test norm(sol.y) < 1e-6
+    end
+  end
 end

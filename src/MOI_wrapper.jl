@@ -28,6 +28,9 @@ Settable as constructor keywords or through
   (`Q_int`, `c_int`, `ineq_A`, `ineq_b`, `cone_dims`, `eq_G`, `eq_d`) are
   assembled, without calling the solver; the model then reports
   `OPTIMIZE_NOT_CALLED` and `ResultCount == 0` (default: `false`)
+- `centralityCorrectors::Int` -- Gondzio centrality correctors tried per
+  iteration, each one extra back-solve of the current KKT factorization
+  (default: `0`, off)
 - plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `refineRelTol`,
   `refineAbsTol`, `staticReg`, `certFallback`, `certFallbackIters`,
   `cache_nestodd` — forwarded to [`conicIP`](@ref)
@@ -93,7 +96,7 @@ const _SUPPORTED_OPTIONS = (
     "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
     "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
     "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
-    "assemble_only",
+    "assemble_only", "centralityCorrectors",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the name
@@ -192,7 +195,8 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
         "certFallback" => true, "certFallbackIters" => 50,
         "cache_nestodd" => false, "kktsolver" => "auto",
         "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
-        "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false)
+        "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false,
+        "centralityCorrectors" => 0)
     return get(model.options, attr.name, defaults[attr.name])
 end
 
