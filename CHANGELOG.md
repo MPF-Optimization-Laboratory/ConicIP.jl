@@ -135,6 +135,10 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- Certificate validation rejects overflow during ray normalization and
+  nonfinite residuals. If a structural certificate cannot be represented,
+  the solver returns `:Error` instead of dropping the contradictory row or
+  improving column and solving a different problem.
 - Presolve recomputes feasibility in the original coordinates and retracts
   `:Optimal` if dropped equality rows violate `optTol`. Singleton postsolve
   also revalidates certificates against the full Hessian and constraints.

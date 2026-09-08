@@ -38,3 +38,26 @@ end
     @test sol.status == :Optimal
     @test ks.key[3] == size(G) # Both rows reached LDL; no rank reduction.
 end
+
+@testset "Review: finite normalized certificates" begin
+    Q = spzeros(1, 1); A = spzeros(0, 1); b = zeros(0)
+    cd = Tuple{String,Int}[]; G = spzeros(0, 1); d = zeros(0)
+    chk, ray = ConicIP.validate_unboundedness_certificate(
+        Q, [1e-320], A, b, cd, G, d, [1.0]; abstol = 1e-9, reltol = 1e-7)
+    @test !chk.valid && !chk.finite
+    @test all(isfinite, ray)
+    chk, w, v = ConicIP.validate_infeasibility_certificate(
+        Q, [0.0], A, b, cd, spzeros(1,1), [1e-320], [-1.0], zeros(0);
+        abstol = 1e-9, reltol = 1e-7)
+    @test !chk.valid && !chk.finite
+    @test all(isfinite, w)
+    # Failure to represent the normalized certificate must not make a
+    # contradictory zero row (or improving zero column) disappear.
+    for eq in (false, true)
+        sol = conicIP(Q, [1e-320], A, b, cd; equilibrate = eq, verbose = false)
+        @test sol.status == :Error && !sol.has_certificate
+        sol = conicIP(Q, [0.0], A, b, cd, spzeros(1,1), [1e-320];
+                      equilibrate = eq, verbose = false)
+        @test sol.status == :Error && !sol.has_certificate
+    end
+end

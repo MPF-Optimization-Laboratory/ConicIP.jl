@@ -944,6 +944,9 @@ function _conicIP(
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
       return claim_infeasible!(sol0, w̄, v̄)
     end
+    return Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
+                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false,
+                    "zero equality row certificate could not be normalized and validated", 0)
   end
 
   j0 = findfirst(j -> Zc[j] && c[j] != 0, 1:n)
@@ -954,12 +957,15 @@ function _conicIP(
         abstol = infeasAbsTol, reltol = infeasTol)
     if chk.valid
       if verbose
-        print("\n > EXIT -- Structurally unbounded (zero column $(j0) of [Q; A; G], c[$(j0)] ≠ 0)\n\n")
+        print("\n > EXIT -- Structurally dual infeasible (zero column $(j0) of [Q; A; G], c[$(j0)] ≠ 0)\n\n")
       end
       sol0 = Solution(zeros(n), fill(NaN,p), fill(NaN,m), zeros(m),
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
       return claim_dual_infeasible!(sol0, ȳ, A)
     end
+    return Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
+                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false,
+                    "zero column certificate could not be normalized and validated", 0)
   end
 
   if any(Gzr) || any(Zc)
