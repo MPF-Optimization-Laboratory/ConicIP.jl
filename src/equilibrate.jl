@@ -90,15 +90,16 @@ function equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
                 all(x -> x == 0 || abs(1 - x) <= tol, rn) &&
                 all(x -> x == 0 || abs(1 - x) <= tol, en)
     converged && break
-    sc = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo, hi) for x in cn]
-    sr = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo, hi) for x in rn]
-    se = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo, hi) for x in en]
+    # Limit the applied increments, not just the recorded cumulative
+    # factors. Otherwise Qs/As/Gs drift from the scalings returned below
+    # once a bound is hit, and later sweeps balance a fictitious matrix.
+    sc = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / Dc[i], hi / Dc[i]) for (i,x) in enumerate(cn)]
+    sr = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / Dr[i], hi / Dr[i]) for (i,x) in enumerate(rn)]
+    se = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / De[i], hi / De[i]) for (i,x) in enumerate(en)]
     Qs = Diagonal(sc) * Qs * Diagonal(sc)
     As = Diagonal(sr) * As * Diagonal(sc)
     Gs = Diagonal(se) * Gs * Diagonal(sc)
     Dc .*= sc; Dr .*= sr; De .*= se
-    # keep the cumulative factors bounded as well
-    clamp!(Dc, lo, hi); clamp!(Dr, lo, hi); clamp!(De, lo, hi)
   end
 
   c̃ = Dc .* c

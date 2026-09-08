@@ -413,7 +413,9 @@ columns in the flop count. A subsequent Codex review added original-data checks 
 rank-reduction postsolve: dropped rows must satisfy `optTol`, and lifted rays must
 validate against the full data. `rank_check = :auto` now also recognizes the cached
 LDLᵀ callable. Certificate validators reject nonfinite normalized rays; structural
-certificate failures no longer fall through to row/column deletion. Still open from the review: peak-memory estimate for the
+certificate failures no longer fall through to row/column deletion. Bounded Ruiz
+sweeps now apply the same increments to the working matrices and scaling record.
+Still open from the review: peak-memory estimate for the
 dense path (the 4 GiB figure is a routing estimate, not a bound).
 
 **Against the last release (v0.4.0, commit `0430b9e`), measured 2026-09-07 after the

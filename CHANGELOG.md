@@ -135,6 +135,9 @@ uses [Semantic Versioning](https://semver.org/).
   arrays, accuracy and regularization, and failure reporting.
 
 ### Fixed
+- Ruiz sweeps limit the scaling increments before applying them, keeping
+  the working matrices consistent with cumulative scaling factors when
+  those factors reach their bounds.
 - Certificate validation rejects overflow during ray normalization and
   nonfinite residuals. If a structural certificate cannot be represented,
   the solver returns `:Error` instead of dropping the contradictory row or

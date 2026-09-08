@@ -61,3 +61,16 @@ end
         @test sol.status == :Error && !sol.has_certificate
     end
 end
+
+@testset "Review: bounded Ruiz sweeps" begin
+    # Row 1 and column 1 saturate at 0.1 on the first sweep. Column 2
+    # already has norm 1, and must stay there while row 2 is balanced.
+    A = sparse([1e12 100.0; 1.0 1.0])
+    eq = ConicIP.equilibrate_conicIP(spzeros(2,2), zeros(2), A, zeros(2),
+        [("R",2)], spzeros(0,2), zeros(0); bound = 10.0, iters = 10)
+    @test eq.Dc ≈ [0.1, 0.1]
+    @test eq.Dr[1] ≈ 0.1
+    @test maximum(abs, eq.A[:,2]) ≈ 1.0
+    @test all(x -> 0.1 <= x <= 10.0, [eq.Dc; eq.Dr])
+    @test eq.A ≈ Diagonal(eq.Dr)*A*Diagonal(eq.Dc)
+end
