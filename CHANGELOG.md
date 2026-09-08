@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-08
+
 ### Changed
 - `:Optimal` additionally requires every cone and equality row to pass a
   row-wise relative residual test, `|rᵢ| / (1 + |bᵢ| + (|A||y|)ᵢ + |sᵢ|) < optTol`
@@ -13,7 +15,8 @@ uses [Semantic Versioning](https://semver.org/).
   coordinates. The aggregate 2-norm test alone accepted a point violating a
   small-scale row when the data span many orders of magnitude (an infeasible
   pair `x ≥ 1` at weight 1e-4, `x ≤ 0.5` at weight 1e4 was reported optimal
-  unequilibrated). Iteration counts on the harness are unchanged.
+  unequilibrated). Iteration counts on the test problems and the benchmark
+  set are unchanged.
 - **Breaking (direct API):** the status `:Unbounded` is now `:DualInfeasible`
   and `:AlmostUnbounded` is `:AlmostDualInfeasible`. The validated ray
   certifies dual infeasibility; primal unboundedness additionally needs
@@ -305,7 +308,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.0...v0.3.1
