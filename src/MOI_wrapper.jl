@@ -900,7 +900,14 @@ function MOI.get(model::Optimizer, ::MOI.ObjectiveBound)
     if model.max_sense
         val = -val
     end
-    return val + model.objective_constant
+    val += model.objective_constant
+    # The dual objective is a bound in exact arithmetic; its floating-point
+    # evaluation can land an ulp on the wrong side of an exact optimum
+    # (MOI.Test asserts `bound ≥ 4` on a problem whose optimum is 4, and
+    # Linux BLAS rounding gave 3.9999999999999996). Pad by the rounding of
+    # the evaluation, in the direction that keeps it a bound.
+    pad = 8 * eps(Float64) * (1 + abs(val))
+    return model.max_sense ? val + pad : val - pad
 end
 
 # Relative duality gap |vᵀs| / (1 + |pobj + offset|) of the returned point,
