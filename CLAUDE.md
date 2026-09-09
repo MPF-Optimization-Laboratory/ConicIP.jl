@@ -7,7 +7,7 @@ Pure-Julia conic interior-point solver for quadratic programs with linear, secon
 - GitHub: `MPF-Optimization-Laboratory/ConicIP.jl`
 - Julia compat: `≥ 1.10`
 - Key deps: JuMP, MathOptInterface, WoodburyMatrices
-- Quadratic objectives are handled natively by the direct `conicIP` API; through JuMP/MOI they work via bridges (the wrapper itself accepts only affine objectives)
+- Quadratic objectives are handled natively by both the direct `conicIP` API and the MOI wrapper (`ScalarQuadraticFunction` becomes `Q`; no SOC bridge)
 
 ## Architecture
 

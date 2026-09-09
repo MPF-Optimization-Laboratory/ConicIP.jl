@@ -254,10 +254,14 @@ end
         # instance changes its iteration count, 8 -> 9, and it does so
         # under all three KKT solvers -- which is what makes the count
         # safe to pin here.
+        # Pinned on the unequilibrated trajectory: the argument above is
+        # about the centering of the S blocks at an identical iterate, and
+        # equilibration (which rescales the objective) moves the count.
         prob = sdp_with_equality(n = 4)
         for ks in (ConicIP.kktsolver_qr, ConicIP.kktsolver_sparse,
                    pivot(ConicIP.kktsolver_2x2))
-            sol = sdp_solve(prob; optTol = optTol, kktsolver = ks)
+            sol = sdp_solve(prob; optTol = optTol, kktsolver = ks,
+                            equilibrate = false)
             @test sol.status == :Optimal
             @test sol.Iter == 9
         end

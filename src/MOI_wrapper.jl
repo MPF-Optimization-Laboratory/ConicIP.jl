@@ -16,16 +16,34 @@ Settable as constructor keywords or through
 - `maxIters::Int` -- maximum iterations (default: `100`)
 - `infeasTol::Float64` -- infeasibility/unboundedness certificate tolerance
   (default: `1e-7`)
-- `kktsolver` -- `"auto"` (default; picks by cone mix and sparsity via
-  [`choose_kktsolver`](@ref)), `"qr"`, `"sparse"`, `"2x2"`, or a solver
-  function
+- `kktsolver` -- `"auto"` (default; picks by cone mix and predicted
+  factorization cost via [`choose_kktsolver`](@ref)), `"ldl"`, `"qr"`,
+  `"sparse"`, `"2x2"`, or any callable solver object (a function or an
+  instance such as `cached_kktsolver_ldl()`)
 - `preprocess::Bool` -- remove redundant equality rows via
   [`preprocess_conicIP`](@ref) before solving (default: `true`)
-- plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `staticReg`,
-  `certFallback`, `certFallbackIters`, `cache_nestodd` — forwarded to
-  [`conicIP`](@ref)
+- `equilibrate::Bool` -- Ruiz-scale the data before solving (default: `true`)
+- `timeLimit::Float64` -- wall-clock budget in seconds (also `MOI.TimeLimitSec`)
+- `assemble_only::Bool` -- stop `optimize!` once the solver's matrices
+  (`Q_int`, `c_int`, `ineq_A`, `ineq_b`, `cone_dims`, `eq_G`, `eq_d`) are
+  assembled, without calling the solver; the model then reports
+  `OPTIMIZE_NOT_CALLED` and `ResultCount == 0` (default: `false`)
+- `centralityCorrectors::Int` -- Gondzio centrality correctors tried per
+  iteration, each one extra back-solve of the current KKT factorization
+  (default: `0`, off)
+- plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `refineRelTol`,
+  `refineAbsTol`, `staticReg`, `certFallback`, `certFallbackIters`,
+  `cache_nestodd` — forwarded to [`conicIP`](@ref)
 
 `MOI.Silent` is supported and overrides `verbose`.
+
+# Supported Objectives
+Affine and convex quadratic (`ScalarQuadraticFunction`), both handled
+natively: a quadratic objective becomes the solver's `Q` rather than a
+second-order-cone reformulation, so positive semidefinite but singular
+Hessians are fine. A Hessian that is not positive semidefinite for the
+given sense (a nonconvex QP) is rejected before the solve with
+`TerminationStatus == INVALID_MODEL` and no result.
 
 # Supported Constraints
 - **Vector:** `Zeros`, `Nonnegatives`, `Nonpositives`, `SecondOrderCone`,
@@ -37,57 +55,113 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     max_sense::Bool
     objective_constant::Float64
     n::Int
+    cone_dims::Vector{Tuple{String, Int}} # original assembled cone partition
     c_int::Vector{Float64}         # internal objective vector handed to the solver
-    # Constraint row tracking for primal/dual recovery
-    eq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
+    Q_int::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # internal Hessian (nothing = 0)
+    # Constraint row tracking for primal/dual recovery. Each constraint
+    # index maps to a slot i; the per-slot vectors below are indexed by i.
+    eq_ci_map::Dict{MOI.ConstraintIndex, Int}
+    eq_rows::Vector{UnitRange{Int}}
     eq_offset::Vector{Float64}     # 0 for Zeros, rhs for EqualTo
     eq_is_scalar::Vector{Bool}
     eq_G::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # equality constraint matrix
     eq_d::Vector{Float64}                                 # equality constraint RHS
-    ineq_ci_map::Vector{Pair{Any, UnitRange{Int}}}
+    eq_Gy::Vector{Float64}         # G*y of the returned point, computed once
+    ineq_ci_map::Dict{MOI.ConstraintIndex, Int}
+    ineq_rows::Vector{UnitRange{Int}}
     ineq_sign::Vector{Float64}     # +1 or -1 (Nonpositive/LessThan flip)
     ineq_offset::Vector{Float64}   # 0 for vector, lower/upper for scalar
     ineq_is_scalar::Vector{Bool}
     ineq_is_psd::Vector{Bool}     # true for PSD constraints (√2 scaling)
     ineq_A::Union{Nothing, SparseMatrixCSC{Float64, Int}}  # inequality constraint matrix
     ineq_b::Vector{Float64}                                # inequality constraint RHS
-    # Timing
+    ineq_Ay::Vector{Float64}       # A*y of the returned point, computed once
+    # Timing: solve_time is the whole optimize! (assembly included);
+    # assembly_time is the part before the solver is called.
     solve_time::Float64
+    assembly_time::Float64
     # Solver options: only the ones explicitly set are stored, so the
     # solver's own defaults (and the preprocessor's dynamic staticReg
     # opt-in) stay in charge of everything else.
     options::Dict{String, Any}
     silent::Bool
+    # True when the last optimize! stopped after assembly (`assemble_only`);
+    # `sol` is then `nothing`, as before any optimize! call.
+    assembled_only::Bool
 end
 
 # Options settable via MOI.RawOptimizerAttribute (and Optimizer kwargs)
 const _SUPPORTED_OPTIONS = (
     "verbose", "optTol", "maxIters", "infeasTol", "infeasAbsTol", "DTB",
-    "maxRefinementSteps", "staticReg", "certFallback", "certFallbackIters",
-    "cache_nestodd", "kktsolver", "preprocess",
+    "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
+    "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
+    "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
+    "assemble_only", "centralityCorrectors",
 )
 
-# Map a kktsolver name to the solver constructor. Accepts the constructor
-# itself, or "auto" | "qr" | "sparse" | "2x2"/"pivot".
+# Map a kktsolver name to the solver constructor. Accepts the name
+# "auto" | "ldl" | "qr" | "sparse" | "2x2"/"pivot", or any callable solver
+# object — a function such as `kktsolver_ldl` or a callable struct such as
+# `cached_kktsolver_ldl()` — which is returned as is.
 function _resolve_kktsolver(v)
-    v isa Function && return v
+    v isa Union{AbstractString, Symbol} || return v
     s = lowercase(string(v))
     s == "auto"             && return default_kktsolver
+    s == "ldl"              && return kktsolver_ldl
     s == "qr"               && return kktsolver_qr
     s == "sparse"           && return kktsolver_sparse
     s in ("2x2", "pivot")   && return pivot(kktsolver_2x2)
     throw(ArgumentError(
-        "unknown kktsolver \"$v\" (expected \"auto\", \"qr\", \"sparse\", " *
-        "\"2x2\", or a solver function)"))
+        "unknown kktsolver \"$v\" (expected \"auto\", \"ldl\", \"qr\", " *
+        "\"sparse\", \"2x2\", or a callable solver object)"))
 end
+
+# Convexity guard for the objective: the solver assumes ½yᵀQy is convex,
+# so `Q` (already sign-adjusted for the sense) must be positive
+# semidefinite. A Cholesky attempt on Q + δI with δ tiny relative to the
+# entries accepts singular PSD Hessians (a diagonal with zeros, or the
+# Maros–Mészáros rank-deficient QPs) and rejects indefinite ones.
+function _is_psd(Q::SparseMatrixCSC{Float64, Int})
+    nnz(Q) == 0 && return true
+    all(isfinite, nonzeros(Q)) || return false
+    dq = diag(Q)
+    any(<(0), dq) && return false
+    # For a PSD matrix, a zero diagonal implies a zero row and column.
+    # Congruence-scale the positive diagonal to one before shifting;
+    # a large, unrelated block must not hide negative curvature elsewhere.
+    for j in axes(Q, 2), t in nzrange(Q, j)
+        i = rowvals(Q)[t]
+        if (dq[i] == 0 || dq[j] == 0) && nonzeros(Q)[t] != 0
+            return false
+        end
+    end
+    scale = [x > 0 ? 1 / sqrt(x) : 1.0 for x in dq]
+    Qs = Diagonal(scale) * Q * Diagonal(scale)
+    F = cholesky(Symmetric(Qs); shift = 2e-10, check = false)
+    return issuccess(F)
+end
+
+const _NONCONVEX_MESSAGE =
+    "objective Hessian is not positive semidefinite for the given sense " *
+    "(nonconvex QP); ConicIP solves convex problems only"
+
+# A `Solution` standing in for a solve that was never run because the model
+# is outside the solver's class. `:InvalidModel` maps to
+# `MOI.INVALID_MODEL` with `ResultCount == 0`; the vectors are NaN so an
+# accidental read is visibly meaningless.
+_invalid_model_solution(n::Int, mA::Int, mG::Int, message::String) =
+    Solution(fill(NaN, n), fill(NaN, mG), fill(NaN, mA), fill(NaN, mA),
+             :InvalidModel, 0, NaN, NaN, NaN, NaN, NaN, NaN, false, message, 0)
 
 function Optimizer(; kwargs...)
     model = Optimizer(
-        nothing, false, 0.0, 0, Float64[],
-        Pair{Any, UnitRange{Int}}[], Float64[], Bool[], nothing, Float64[],
-        Pair{Any, UnitRange{Int}}[], Float64[], Float64[], Bool[], Bool[], nothing, Float64[],
-        NaN,
-        Dict{String, Any}(), false,
+        nothing, false, 0.0, 0, Tuple{String, Int}[], Float64[], nothing,
+        Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Bool[],
+        nothing, Float64[], Float64[],
+        Dict{MOI.ConstraintIndex, Int}(), UnitRange{Int}[], Float64[], Float64[],
+        Bool[], Bool[], nothing, Float64[], Float64[],
+        NaN, NaN,
+        Dict{String, Any}(), false, false,
     )
     for (k, v) in kwargs
         MOI.set(model, MOI.RawOptimizerAttribute(string(k)), v)
@@ -116,11 +190,29 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
     defaults = Dict{String, Any}(
         "verbose" => false, "optTol" => 1e-6, "maxIters" => 100,
         "infeasTol" => 1e-7, "infeasAbsTol" => 1e-9, "DTB" => 0.01,
-        "maxRefinementSteps" => 3, "staticReg" => 0.0,
+        "maxRefinementSteps" => 3, "refineRelTol" => 1e-13,
+        "refineAbsTol" => 1e-12, "staticReg" => 0.0,
         "certFallback" => true, "certFallbackIters" => 50,
         "cache_nestodd" => false, "kktsolver" => "auto",
-        "preprocess" => true)
+        "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
+        "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false,
+        "centralityCorrectors" => 0)
     return get(model.options, attr.name, defaults[attr.name])
+end
+
+# MOI.TimeLimitSec is the "timeLimit" option; `nothing` clears it.
+MOI.supports(::Optimizer, ::MOI.TimeLimitSec) = true
+function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, value::Union{Nothing, Real})
+    if value === nothing
+        delete!(model.options, "timeLimit")
+    else
+        model.options["timeLimit"] = Float64(value)
+    end
+    return
+end
+function MOI.get(model::Optimizer, ::MOI.TimeLimitSec)
+    v = get(model.options, "timeLimit", Inf)
+    return isfinite(v) ? v : nothing
 end
 
 MOI.supports(::Optimizer, ::MOI.Silent) = true
@@ -129,23 +221,31 @@ MOI.get(model::Optimizer, ::MOI.Silent) = model.silent
 
 function MOI.empty!(model::Optimizer)
     model.sol = nothing
+    model.assembled_only = false
     model.max_sense = false
     model.objective_constant = 0.0
     model.n = 0
     model.solve_time = NaN
+    model.assembly_time = NaN
+    empty!(model.cone_dims)
     empty!(model.c_int)
+    model.Q_int = nothing
     empty!(model.eq_ci_map)
+    empty!(model.eq_rows)
     empty!(model.eq_offset)
     empty!(model.eq_is_scalar)
     model.eq_G = nothing
     empty!(model.eq_d)
+    empty!(model.eq_Gy)
     empty!(model.ineq_ci_map)
+    empty!(model.ineq_rows)
     empty!(model.ineq_sign)
     empty!(model.ineq_offset)
     empty!(model.ineq_is_scalar)
     empty!(model.ineq_is_psd)
     model.ineq_A = nothing
     empty!(model.ineq_b)
+    empty!(model.ineq_Ay)
 end
 
 function MOI.is_empty(model::Optimizer)
@@ -159,12 +259,14 @@ MOI.get(::Optimizer, ::MOI.SolverVersion) = string(pkgversion(@__MODULE__))
 MOI.supports(::Optimizer, ::MOI.VariableBasisStatus) = false
 MOI.supports(::Optimizer, ::MOI.ConstraintBasisStatus) = false
 
-# Supported objective
+# Supported objective: affine and (convex) quadratic, both native
 MOI.supports(::Optimizer, ::MOI.ObjectiveSense) = true
 function MOI.supports(
     ::Optimizer,
     ::MOI.ObjectiveFunction{F},
-) where {F<:Union{MOI.ScalarAffineFunction{Float64},MOI.VariableIndex}}
+) where {F<:Union{MOI.ScalarAffineFunction{Float64},
+                  MOI.ScalarQuadraticFunction{Float64},
+                  MOI.VariableIndex}}
     return true
 end
 
@@ -203,40 +305,87 @@ end
 #  Extract constraint rows from MOI functions
 # ──────────────────────────────────────────────────────────────
 
-function _extract_vector_constraint(f, n)
-    if f isa MOI.VectorOfVariables
-        dim = length(f.variables)
-        Ai = spzeros(dim, n)
-        bi = zeros(dim)
-        for (i, vi) in enumerate(f.variables)
-            Ai[i, vi.value] = 1.0
-        end
-        return Ai, bi
-    else  # VectorAffineFunction
-        dim = MOI.output_dimension(f)
-        Ai = spzeros(dim, n)
-        bi = collect(Float64, f.constants)
-        for term in f.terms
-            row = term.output_index
-            col = term.scalar_term.variable.value
-            Ai[row, col] += term.scalar_term.coefficient
-        end
-        return Ai, bi
+# Triplet accumulator for one constraint matrix. Every constraint appends
+# its rows here; the matrix is built once by `sparse(I, J, V, m, n)` at the
+# end (duplicates summed), so assembly is linear in the number of
+# nonzeros rather than one small CSC object per constraint.
+struct _Triplets
+    I::Vector{Int}
+    J::Vector{Int}
+    V::Vector{Float64}
+    rhs::Vector{Float64}
+end
+_Triplets() = _Triplets(Int[], Int[], Float64[], Float64[])
+_nrows(t::_Triplets) = length(t.rhs)
+
+# Append the rows of `sign * f(x) + rhs_shift` with `f` a vector function.
+# `rowmap[k]` gives the local row for output index k and `rowscale[k]` a
+# per-row factor (the PSD triangle permutation and √2 scaling); both are
+# `nothing` for the identity. The constants of `f` are appended to the
+# accumulator's rhs *negated* (the solver's convention is A y ≥ b,
+# G y = d with the constant moved to the right-hand side).
+function _append_vector!(t::_Triplets, f, dim::Int, sign::Float64;
+                         rowmap = nothing, rowscale = nothing)
+    r0 = _nrows(t)
+    resize!(t.rhs, r0 + dim)
+    @inbounds for k in 1:dim
+        t.rhs[r0 + k] = 0.0
     end
+    if f isa MOI.VectorOfVariables
+        for (k, vi) in enumerate(f.variables)
+            row = rowmap === nothing ? k : rowmap[k]
+            sc  = rowscale === nothing ? 1.0 : rowscale[k]
+            push!(t.I, r0 + row); push!(t.J, vi.value); push!(t.V, sign * sc)
+        end
+    else  # VectorAffineFunction
+        for term in f.terms
+            k   = term.output_index
+            row = rowmap === nothing ? k : rowmap[k]
+            sc  = rowscale === nothing ? 1.0 : rowscale[k]
+            push!(t.I, r0 + row)
+            push!(t.J, term.scalar_term.variable.value)
+            push!(t.V, sign * sc * term.scalar_term.coefficient)
+        end
+        for (k, ck) in enumerate(f.constants)
+            row = rowmap === nothing ? k : rowmap[k]
+            sc  = rowscale === nothing ? 1.0 : rowscale[k]
+            t.rhs[r0 + row] = -sign * sc * ck
+        end
+    end
+    return (r0 + 1):(r0 + dim)
 end
 
-function _extract_scalar_constraint(f, n)
-    Ai = spzeros(1, n)
-    bi = 0.0
+# Append one row `sign * f(x)` with `f` scalar; the constant of `f` and the
+# set's bound go to the rhs as `sign * (bound − constant)`.
+function _append_scalar!(t::_Triplets, f, sign::Float64, bound::Float64)
+    r = _nrows(t) + 1
+    const_f = 0.0
     if f isa MOI.VariableIndex
-        Ai[1, f.value] = 1.0
-    else  # ScalarAffineFunction
-        bi = f.constant
+        push!(t.I, r); push!(t.J, f.value); push!(t.V, sign)
+    else
+        const_f = f.constant
         for term in f.terms
-            Ai[1, term.variable.value] += term.coefficient
+            push!(t.I, r); push!(t.J, term.variable.value)
+            push!(t.V, sign * term.coefficient)
         end
     end
-    return Ai, bi
+    push!(t.rhs, sign * (bound - const_f))
+    return r:r
+end
+
+_assemble(t::_Triplets, n::Int) =
+    (sparse(t.I, t.J, t.V, _nrows(t), n), copy(t.rhs))
+
+# Append an orthant block of `dim` rows to `cone_dims`, merging it into a
+# preceding orthant block: the cone product is separable over R₊, and one
+# block instead of thousands keeps the per-block loops in the solver short.
+function _push_orthant!(cone_dims, dim::Int)
+    if !isempty(cone_dims) && cone_dims[end][1] == "R"
+        cone_dims[end] = ("R", cone_dims[end][2] + dim)
+    else
+        push!(cone_dims, ("R", dim))
+    end
+    return cone_dims
 end
 
 # ──────────────────────────────────────────────────────────────
@@ -271,23 +420,6 @@ function _psd_moi_vecm_info(d::Int)
 end
 
 """
-Reorder rows of `Ai` and entries of `bi` from MOI triangle order to vecm
-order, and scale off-diagonal rows by √2.
-"""
-function _psd_scale_input!(Ai::SparseMatrixCSC, bi::Vector{Float64}, dim::Int)
-    perm, is_offdiag = _psd_moi_vecm_info(dim)
-    Ai_copy = copy(Ai)
-    bi_copy = copy(bi)
-    s2 = √2
-    for moi_k in 1:dim
-        vecm_k = perm[moi_k]
-        scale = is_offdiag[moi_k] ? s2 : 1.0
-        Ai[vecm_k, :] = scale * Ai_copy[moi_k, :]
-        bi[vecm_k] = scale * bi_copy[moi_k]
-    end
-end
-
-"""
 Convert a vector from vecm order (solver convention) to MOI triangle order,
 dividing off-diagonal entries by √2.
 """
@@ -309,6 +441,7 @@ end
 
 function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     MOI.empty!(dest)
+    t_start = time()
 
     model = MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}())
     index_map = MOI.copy_to(model, src)
@@ -320,14 +453,31 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     sense = MOI.get(model, MOI.ObjectiveSense())
     dest.max_sense = (sense == MOI.MAX_SENSE)
 
+    # MOI objective: ½xᵀQx + aᵀx + const (Q symmetric; a diagonal quadratic
+    # term with coefficient q means ½·q·xᵢ², an off-diagonal one q·xᵢxⱼ).
     c_moi = zeros(n)
     obj_constant = 0.0
-    obj_type = MOI.get(model, MOI.ObjectiveFunctionType())
+    QI = Int[]; QJ = Int[]; QV = Float64[]
+    # A feasibility model ignores any objective retained in the cache.
+    obj_type = sense == MOI.FEASIBILITY_SENSE ? Nothing : MOI.get(model, MOI.ObjectiveFunctionType())
     if obj_type == MOI.ScalarAffineFunction{Float64}
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
         obj_constant = obj.constant
         for term in obj.terms
             c_moi[term.variable.value] += term.coefficient
+        end
+    elseif obj_type == MOI.ScalarQuadraticFunction{Float64}
+        obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
+        obj_constant = obj.constant
+        for term in obj.affine_terms
+            c_moi[term.variable.value] += term.coefficient
+        end
+        for term in obj.quadratic_terms
+            i = term.variable_1.value; j = term.variable_2.value
+            push!(QI, i); push!(QJ, j); push!(QV, term.coefficient)
+            if i != j
+                push!(QI, j); push!(QJ, i); push!(QV, term.coefficient)
+            end
         end
     elseif obj_type == MOI.VariableIndex
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.VariableIndex}())
@@ -336,20 +486,34 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.objective_constant = obj_constant
 
     # ConicIP minimizes (1/2)y'Qy - c'y
-    # For min c_moi'x: set c_int = -c_moi  → minimizes -(-c_moi)'x = c_moi'x
-    # For max c_moi'x: set c_int = c_moi   → minimizes -(c_moi)'x = -c_moi'x
+    # MIN ½xᵀQx + aᵀx: Q_int = Q,  c_int = -a
+    # MAX ½xᵀQx + aᵀx: Q_int = -Q, c_int = a   (Q negative semidefinite)
     c_int = dest.max_sense ? c_moi : -c_moi
     dest.c_int = c_int
-    Q = spzeros(n, n)
+    if isempty(QI)
+        Q = spzeros(n, n)
+        dest.Q_int = nothing
+    else
+        Q = sparse(QI, QJ, dest.max_sense ? -QV : QV, n, n)
+        dest.Q_int = Q
+    end
 
     # ── Constraints ──
-    G_rows = Any[]
-    d_vals = Float64[]
-    A_rows = Any[]
-    b_vals = Float64[]
+    tG = _Triplets()          # equality rows,   G y = d
+    tA = _Triplets()          # cone rows,       A y ≥_K b
     cone_dims = Tuple{String, Int}[]
-    eq_row = 0
-    ineq_row = 0
+
+    function record_eq!(ci, rows, offset, scalar)
+        push!(dest.eq_rows, rows); push!(dest.eq_offset, offset)
+        push!(dest.eq_is_scalar, scalar)
+        dest.eq_ci_map[ci] = length(dest.eq_rows)
+    end
+    function record_ineq!(ci, rows, sign, offset, scalar, psd)
+        push!(dest.ineq_rows, rows); push!(dest.ineq_sign, sign)
+        push!(dest.ineq_offset, offset); push!(dest.ineq_is_scalar, scalar)
+        push!(dest.ineq_is_psd, psd)
+        dest.ineq_ci_map[ci] = length(dest.ineq_rows)
+    end
 
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
         for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
@@ -357,137 +521,106 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
             s = MOI.get(model, MOI.ConstraintSet(), ci)
 
             if F <: Union{MOI.VectorAffineFunction{Float64}, MOI.VectorOfVariables}
-                Ai, bi = _extract_vector_constraint(f, n)
-                dim = size(Ai, 1)
-
+                dim = MOI.output_dimension(f)
                 if S <: MOI.Zeros
-                    # Ai*x + bi = 0 → G = Ai, d = -bi
-                    push!(G_rows, Ai)
-                    append!(d_vals, -bi)
-                    push!(dest.eq_ci_map, ci => (eq_row+1):(eq_row+dim))
-                    push!(dest.eq_offset, 0.0)
-                    push!(dest.eq_is_scalar, false)
-                    eq_row += dim
+                    # f(x) = 0:  G = A_f, d = -const
+                    rows = _append_vector!(tG, f, dim, 1.0)
+                    record_eq!(ci, rows, 0.0, false)
                 elseif S <: MOI.Nonnegatives
-                    # Ai*x + bi ≥ 0 → A_int = Ai, b_int = -bi
-                    push!(A_rows, Ai)
-                    append!(b_vals, -bi)
-                    push!(cone_dims, ("R", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += dim
+                    rows = _append_vector!(tA, f, dim, 1.0)
+                    _push_orthant!(cone_dims, dim)
+                    record_ineq!(ci, rows, 1.0, 0.0, false, false)
                 elseif S <: MOI.Nonpositives
-                    # Ai*x + bi ≤ 0 → -Ai*x - bi ≥ 0 → A_int = -Ai, b_int = bi
-                    push!(A_rows, -Ai)
-                    append!(b_vals, bi)
-                    push!(cone_dims, ("R", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, -1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += dim
+                    # f(x) ≤ 0  →  -f(x) ≥ 0
+                    rows = _append_vector!(tA, f, dim, -1.0)
+                    _push_orthant!(cone_dims, dim)
+                    record_ineq!(ci, rows, -1.0, 0.0, false, false)
                 elseif S <: MOI.SecondOrderCone
-                    push!(A_rows, Ai)
-                    append!(b_vals, -bi)
+                    rows = _append_vector!(tA, f, dim, 1.0)
                     push!(cone_dims, ("Q", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += dim
+                    record_ineq!(ci, rows, 1.0, 0.0, false, false)
                 elseif S <: MOI.PositiveSemidefiniteConeTriangle
-                    # MOI uses unscaled triangle; solver uses vecm (√2 off-diag)
-                    _psd_scale_input!(Ai, bi, dim)
-                    push!(A_rows, Ai)
-                    append!(b_vals, -bi)
+                    # MOI's column-major unscaled triangle → vecm's row-major
+                    # triangle with √2 on the off-diagonal rows, applied to
+                    # the triplets directly.
+                    perm, is_offdiag = _psd_moi_vecm_info(dim)
+                    scale = [od ? √2 : 1.0 for od in is_offdiag]
+                    rows = _append_vector!(tA, f, dim, 1.0;
+                                           rowmap = perm, rowscale = scale)
                     push!(cone_dims, ("S", dim))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+dim))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, 0.0)
-                    push!(dest.ineq_is_scalar, false)
-                    push!(dest.ineq_is_psd, true)
-                    ineq_row += dim
+                    record_ineq!(ci, rows, 1.0, 0.0, false, true)
                 end
 
             elseif F <: Union{MOI.ScalarAffineFunction{Float64}, MOI.VariableIndex}
-                Ai, bi = _extract_scalar_constraint(f, n)
-
                 if S <: MOI.EqualTo{Float64}
-                    # Ai*x + bi = rhs → Ai*x = rhs - bi
                     rhs = MOI.constant(s)
-                    push!(G_rows, Ai)
-                    push!(d_vals, rhs - bi)
-                    push!(dest.eq_ci_map, ci => (eq_row+1):(eq_row+1))
-                    push!(dest.eq_offset, rhs)
-                    push!(dest.eq_is_scalar, true)
-                    eq_row += 1
+                    rows = _append_scalar!(tG, f, 1.0, rhs)
+                    record_eq!(ci, rows, rhs, true)
                 elseif S <: MOI.GreaterThan{Float64}
-                    # Ai*x + bi ≥ lower → Ai*x ≥ lower - bi
                     lower = MOI.constant(s)
-                    push!(A_rows, Ai)
-                    push!(b_vals, lower - bi)
-                    push!(cone_dims, ("R", 1))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+1))
-                    push!(dest.ineq_sign, 1.0)
-                    push!(dest.ineq_offset, lower)
-                    push!(dest.ineq_is_scalar, true)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += 1
+                    rows = _append_scalar!(tA, f, 1.0, lower)
+                    _push_orthant!(cone_dims, 1)
+                    record_ineq!(ci, rows, 1.0, lower, true, false)
                 elseif S <: MOI.LessThan{Float64}
-                    # Ai*x + bi ≤ upper → upper - Ai*x - bi ≥ 0
-                    # (-Ai)*x - (bi - upper) ≥ 0 → A_int = -Ai, b_int = bi - upper
+                    # f(x) ≤ u  →  -f(x) ≥ -u
                     upper = MOI.constant(s)
-                    push!(A_rows, -Ai)
-                    push!(b_vals, bi - upper)
-                    push!(cone_dims, ("R", 1))
-                    push!(dest.ineq_ci_map, ci => (ineq_row+1):(ineq_row+1))
-                    push!(dest.ineq_sign, -1.0)
-                    push!(dest.ineq_offset, upper)
-                    push!(dest.ineq_is_scalar, true)
-                    push!(dest.ineq_is_psd, false)
-                    ineq_row += 1
+                    rows = _append_scalar!(tA, f, -1.0, upper)
+                    _push_orthant!(cone_dims, 1)
+                    record_ineq!(ci, rows, -1.0, upper, true, false)
                 end
             end
         end
     end
 
-    # ── Assemble matrices ──
-    if isempty(G_rows)
-        G = spzeros(0, n)
-        d = zeros(0)
-    else
-        G = sparse(vcat(G_rows...))
-        d = Float64.(d_vals)
-    end
-    dest.eq_G = G
-    dest.eq_d = d
+    # ── Assemble matrices (one sparse() per matrix) ──
+    G, d = _assemble(tG, n)
+    A, b = _assemble(tA, n)
+    dest.cone_dims = cone_dims
+    dest.eq_G = G;   dest.eq_d = d
+    dest.ineq_A = A; dest.ineq_b = b
+    dest.assembly_time = time() - t_start
 
-    if isempty(A_rows)
-        A = spzeros(0, n)
-        b = zeros(0)
-    else
-        A = sparse(vcat(A_rows...))
-        b = Float64.(b_vals)
+    # Assembly only: the matrices are available through the fields above;
+    # `sol` stays `nothing`, so every result getter answers as if
+    # optimize! had not been called.
+    if get(dest.options, "assemble_only", false)
+        dest.assembled_only = true
+        dest.solve_time = time() - t_start
+        return index_map, false
     end
-    dest.ineq_A = A
-    dest.ineq_b = b
 
     # ── Solve ──
     do_preprocess = get(dest.options, "preprocess", true)
     verbose = dest.silent ? false : get(dest.options, "verbose", false)
     solver = _resolve_kktsolver(get(dest.options, "kktsolver", "auto"))
-    kw = (; (Symbol(k) => v for (k, v) in dest.options
-             if k ∉ ("preprocess", "kktsolver", "verbose"))...)
+    skip = do_preprocess ? ("preprocess", "kktsolver", "verbose", "assemble_only") :
+                           ("preprocess", "kktsolver", "verbose", "assemble_only",
+                            "rank_check", "fix_singletons")
+    kw = (; (Symbol(k) => v for (k, v) in dest.options if k ∉ skip)...)
     entry = do_preprocess ? preprocess_conicIP : conicIP
-    t0 = time()
-    dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
-        verbose = verbose, kktsolver = solver, kw...)
-    dest.solve_time = time() - t0
+    if dest.Q_int !== nothing && !_is_psd(Q)
+        # Nonconvex objective: the solver would report a stationary point
+        # as optimal, so it is not called at all.
+        dest.sol = _invalid_model_solution(n, size(A, 1), size(G, 1), _NONCONVEX_MESSAGE)
+    else
+        # Charge all front-end work, including the Hessian check, before
+        # starting the solver's budget. Inner wrappers charge their own
+        # presolve/equilibration work in the same way.
+        if haskey(kw, :timeLimit) && isfinite(kw.timeLimit)
+            kw = merge(kw, (; timeLimit = kw.timeLimit - (time() - t_start)))
+        end
+        dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
+            verbose = verbose, kktsolver = solver, kw...)
+    end
+
+    # Products needed by the result getters, formed once. The inequality
+    # product is used instead of the slack `sol.s` so that ConstraintPrimal
+    # is f(y) at the returned point even when A y − b ≠ s.
+    y = dest.sol.y
+    finite_y = all(isfinite, y)
+    dest.eq_Gy   = (size(G, 1) > 0 && finite_y) ? Vector(G * y) : fill(NaN, size(G, 1))
+    dest.ineq_Ay = (size(A, 1) > 0 && finite_y) ? Vector(A * y) : fill(NaN, size(A, 1))
+    dest.solve_time = time() - t_start
 
     return index_map, false
 end
@@ -498,12 +631,12 @@ end
 
 # A `Solution` carries a ray only when the solver verified one
 # (`has_certificate`). Per the `Solution` field-convention table:
-#   :Unbounded + certificate → sol.y is the primal ray ȳ (cᵀȳ = +1),
+#   :DualInfeasible + certificate → sol.y is the primal ray ȳ (cᵀȳ = +1),
 #                              sol.s = A*ȳ, and sol.w/sol.v are NaN
 #   :Infeasible + certificate → sol.w/sol.v are the Farkas ray
 #                              (dᵀw̄ - bᵀv̄ = -1), and sol.y/sol.s are NaN
 _is_primal_ray(model::Optimizer) =
-    model.sol !== nothing && model.sol.status == :Unbounded && model.sol.has_certificate
+    model.sol !== nothing && model.sol.status == :DualInfeasible && model.sol.has_certificate
 
 _is_dual_ray(model::Optimizer) =
     model.sol !== nothing && model.sol.status == :Infeasible && model.sol.has_certificate
@@ -517,16 +650,20 @@ function MOI.get(model::Optimizer, ::MOI.TerminationStatus)
         return MOI.OPTIMAL
     elseif status == :Infeasible
         return MOI.INFEASIBLE
-    elseif status == :Unbounded
+    elseif status == :DualInfeasible
         return MOI.DUAL_INFEASIBLE
     elseif status == :AlmostInfeasible
         return MOI.ALMOST_INFEASIBLE
-    elseif status == :AlmostUnbounded
+    elseif status == :AlmostDualInfeasible
         return MOI.ALMOST_DUAL_INFEASIBLE
     elseif status == :Abandoned
         return MOI.ITERATION_LIMIT
+    elseif status == :TimeLimit
+        return MOI.TIME_LIMIT
     elseif status == :Error
         return MOI.NUMERICAL_ERROR
+    elseif status == :InvalidModel
+        return MOI.INVALID_MODEL
     else
         return MOI.OTHER_ERROR
     end
@@ -539,7 +676,7 @@ function MOI.get(model::Optimizer, attr::MOI.PrimalStatus)
     status = model.sol.status
     if status == :Optimal
         return MOI.FEASIBLE_POINT
-    elseif status == :Unbounded
+    elseif status == :DualInfeasible
         return MOI.INFEASIBILITY_CERTIFICATE
     else
         return MOI.NO_SOLUTION
@@ -567,7 +704,7 @@ function MOI.get(model::Optimizer, ::MOI.ResultCount)
     status = model.sol.status
     if status == :Optimal
         return 1
-    elseif status in (:Infeasible, :Unbounded) && model.sol.has_certificate
+    elseif status in (:Infeasible, :DualInfeasible) && model.sol.has_certificate
         return 1
     end
     return 0
@@ -575,7 +712,9 @@ end
 
 function MOI.get(model::Optimizer, ::MOI.RawStatusString)
     if model.sol === nothing
-        return "OPTIMIZE_NOT_CALLED"
+        return model.assembled_only ?
+               "OPTIMIZE_NOT_CALLED: assembly only (assemble_only = true)" :
+               "OPTIMIZE_NOT_CALLED"
     end
     if isempty(model.sol.message)
         return string(model.sol.status)
@@ -619,20 +758,25 @@ end
 
 # ConstraintPrimal: return f(x) for constraint f(x) ∈ S
 #
-# Inequality constraints use sol.s (cone slack: s = A_int*y - b_int).
-#   Nonneg/SOC/PSD: f(x) = s           (sign=+1, offset=0)
-#   Nonpositive:    f(x) = -s          (sign=-1, offset=0)
-#   GreaterThan(L): f(x) = s + L       (sign=+1, offset=L)
-#   LessThan(U):    f(x) = U - s       (sign=-1, offset=U)
-# General formula: f(x) = sign * s + offset
+# Inequality rows are stored as A_int y ≥_K b_int with, per constraint,
+# r = A_int[rows,:] y − b_int[rows]:
+#   Nonneg/SOC/PSD: f(x) = r           (sign=+1, offset=0)
+#   Nonpositive:    f(x) = -r          (sign=-1, offset=0)
+#   GreaterThan(L): f(x) = r + L       (sign=+1, offset=L)
+#   LessThan(U):    f(x) = U - r       (sign=-1, offset=U)
+# General formula: f(x) = sign * r + offset.
+# `r` is evaluated from the cached product A_int y (`ineq_Ay`), not from
+# the cone slack `sol.s`: the two agree only at convergence (A y − s = b
+# is a residual the solver drives to zero), and reporting the slack would
+# hide the primal violation of a non-converged iterate.
 #
 # Equality constraints are approximately satisfied:
 #   Zeros:       f(x) ≈ 0    (offset=0)
 #   EqualTo(r):  f(x) ≈ r    (offset=r)
 #
-# On a primal ray (:Unbounded with certificate) the value is the *homogeneous*
-# part only: the constant terms (eq_d, ineq_offset) are dropped, since a ray is
-# a direction rather than a point.
+# On a primal ray (:DualInfeasible with certificate) the value is the *homogeneous*
+# part only: the constant terms (eq_d, ineq_b, ineq_offset) are dropped, since a
+# ray is a direction rather than a point (sol.s holds A_int ȳ there as well).
 function MOI.get(
     model::Optimizer,
     attr::MOI.ConstraintPrimal,
@@ -640,31 +784,33 @@ function MOI.get(
 )
     MOI.check_result_index_bounds(model, attr)
     ray = _is_primal_ray(model)
-    for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
-        if ci_stored == ci
-            # f(x) = G[rows,:]*y - d[rows] + offset  (ray: G[rows,:]*ȳ)
-            residual = ray ? model.eq_G[rows, :] * model.sol.y :
-                model.eq_G[rows, :] * model.sol.y - model.eq_d[rows]
-            if model.eq_is_scalar[i]
-                return ray ? residual[1] : residual[1] + model.eq_offset[i]
-            else
-                return Vector(residual)
-            end
+    i = get(model.eq_ci_map, ci, 0)
+    if i > 0
+        rows = model.eq_rows[i]
+        # f(x) = G[rows,:]*y - d[rows] + offset  (ray: G[rows,:]*ȳ)
+        residual = ray ? model.eq_Gy[rows] : model.eq_Gy[rows] - model.eq_d[rows]
+        if model.eq_is_scalar[i]
+            return ray ? residual[1] : residual[1] + model.eq_offset[i]
+        else
+            return residual
         end
     end
-    for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
-        if ci_stored == ci
-            sgn = model.ineq_sign[i]
-            off = ray ? 0.0 : model.ineq_offset[i]
-            if model.ineq_is_scalar[i]
-                return sgn * model.sol.s[rows[1]] + off
-            else
-                val = Vector(sgn .* model.sol.s[rows])
-                if model.ineq_is_psd[i]
-                    return _psd_vecm_to_moi(val)
-                end
-                return val
+    i = get(model.ineq_ci_map, ci, 0)
+    if i > 0
+        rows = model.ineq_rows[i]
+        sgn = model.ineq_sign[i]
+        off = ray ? 0.0 : model.ineq_offset[i]
+        # r = A[rows,:]*y - b[rows]  (ray: A[rows,:]*ȳ)
+        if model.ineq_is_scalar[i]
+            r = ray ? model.ineq_Ay[rows[1]] : model.ineq_Ay[rows[1]] - model.ineq_b[rows[1]]
+            return sgn * r + off
+        else
+            r = ray ? model.ineq_Ay[rows] : model.ineq_Ay[rows] - model.ineq_b[rows]
+            val = sgn .* r
+            if model.ineq_is_psd[i]
+                return _psd_vecm_to_moi(val)
             end
+            return val
         end
     end
     error("Constraint index $ci not found")
@@ -672,11 +818,11 @@ end
 
 # ConstraintDual: return MOI dual for constraint f(x) ∈ S
 #
-# The solver's v ∈ K* satisfies: Qy - c_int + A_int'v + G'w = 0
-# For sets mapped with sign flip (Nonpositive, LessThan), the MOI dual
-# is negated relative to v. For MAX_SENSE, all duals are negated.
-# Formula: dual = sign * sense_sign * v  (ineq)
-#          dual = sense_sign * w         (eq)
+# The solver's v ∈ K* satisfies the stationarity condition written out
+# below; for sets mapped with a sign flip (Nonpositive, LessThan) the MOI
+# dual is negated relative to v. The formulas are sense-independent: the
+# objective sense is already folded into Q and c_int, and the conic dual
+# convention (dual ∈ S*) does not change with the sense.
 #
 # This is already correct on a dual ray (:Infeasible with certificate): the
 # Farkas ray lives in sol.w/sol.v with the same sign and PSD scaling
@@ -691,27 +837,27 @@ function MOI.get(
     #   eq_dual = -w    (sign from -A' in KKT)
     #   ineq_dual = ineq_sign * v   (ineq_sign accounts for Nonpos/LessThan flip)
     # The conic dual convention is sense-independent (dual ∈ S*).
-    for (i, (ci_stored, rows)) in enumerate(model.eq_ci_map)
-        if ci_stored == ci
-            if model.eq_is_scalar[i]
-                return -model.sol.w[rows[1]]
-            else
-                return Vector(-1.0 .* model.sol.w[rows])
-            end
+    i = get(model.eq_ci_map, ci, 0)
+    if i > 0
+        rows = model.eq_rows[i]
+        if model.eq_is_scalar[i]
+            return -model.sol.w[rows[1]]
+        else
+            return -1.0 .* model.sol.w[rows]
         end
     end
-    for (i, (ci_stored, rows)) in enumerate(model.ineq_ci_map)
-        if ci_stored == ci
-            sgn = model.ineq_sign[i]
-            if model.ineq_is_scalar[i]
-                return sgn * model.sol.v[rows[1]]
-            else
-                val = Vector(sgn .* model.sol.v[rows])
-                if model.ineq_is_psd[i]
-                    return _psd_vecm_to_moi(val)
-                end
-                return val
+    i = get(model.ineq_ci_map, ci, 0)
+    if i > 0
+        rows = model.ineq_rows[i]
+        sgn = model.ineq_sign[i]
+        if model.ineq_is_scalar[i]
+            return sgn * model.sol.v[rows[1]]
+        else
+            val = sgn .* model.sol.v[rows]
+            if model.ineq_is_psd[i]
+                return _psd_vecm_to_moi(val)
             end
+            return val
         end
     end
     error("Constraint index $ci not found")
@@ -723,6 +869,15 @@ end
 
 MOI.supports(::Optimizer, ::MOI.SolveTimeSec) = true
 MOI.get(model::Optimizer, ::MOI.SolveTimeSec) = model.solve_time
+
+MOI.supports(::Optimizer, ::MOI.BarrierIterations) = true
+MOI.get(model::Optimizer, ::MOI.BarrierIterations) =
+    model.sol === nothing ? 0 : Int(model.sol.Iter)
+
+# The wrapper is its own solver object: `model.sol` is the full `Solution`
+# (iteration and KKT-solve counts, residuals, message) behind the MOI
+# attributes; benchmark scripts read it through this attribute.
+MOI.get(model::Optimizer, ::MOI.RawSolver) = model
 
 # Homogeneous dual objective along a Farkas ray. The ray is normalized so that
 # dᵀw̄ - bᵀv̄ = -1, hence bᵀv̄ - dᵀw̄ = +1 — positive, matching the MOI
@@ -745,7 +900,24 @@ function MOI.get(model::Optimizer, ::MOI.ObjectiveBound)
     if model.max_sense
         val = -val
     end
-    return val + model.objective_constant
+    val += model.objective_constant
+    # The dual objective is a bound in exact arithmetic; its floating-point
+    # evaluation can land an ulp on the wrong side of an exact optimum
+    # (MOI.Test asserts `bound ≥ 4` on a problem whose optimum is 4, and
+    # Linux BLAS rounding gave 3.9999999999999996). Pad by the rounding of
+    # the evaluation, in the direction that keeps it a bound.
+    pad = 8 * eps(Float64) * (1 + abs(val))
+    return model.max_sense ? val + pad : val - pad
+end
+
+# Relative duality gap |vᵀs| / (1 + |pobj + offset|) of the returned point,
+# the quantity the solver's gap test measures (`Solution.rGap`). NaN when
+# there is no result to describe or the result is a certificate.
+MOI.supports(::Optimizer, ::MOI.RelativeGap) = true
+function MOI.get(model::Optimizer, ::MOI.RelativeGap)
+    sol = model.sol
+    (sol === nothing || MOI.get(model, MOI.ResultCount()) == 0) && return NaN
+    return Float64(sol.rGap)
 end
 
 MOI.supports(::Optimizer, ::MOI.DualObjectiveValue) = true

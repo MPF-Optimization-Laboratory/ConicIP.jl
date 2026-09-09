@@ -33,26 +33,108 @@ per problem via [`choose_kktsolver`](@ref ConicIP.choose_kktsolver),
 using cone mix, size, and *structural* sparsity — never the storage
 type of the inputs:
 
+0. **Dense storage over budget → `kktsolver_ldl`.** If the dense
+   solver's storage estimate ([`dense_kkt_bytes`](@ref ConicIP.dense_kkt_bytes),
+   roughly `2n² + 2m(n−p) + 2(n−p)²` doubles) exceeds
+   `dense_bytes_max` (default 4 GiB), the LDLᵀ solver is used whatever
+   the rules below would say. This is a routing estimate, not a peak-memory
+   bound. For an SDP problem, exceeding the budget instead raises an
+   `ArgumentError`: sparse SDP scaling blocks would also be dense.
 1. **Any SDP cone → `kktsolver_qr`.** The dense double-QR method is the
    numerically robust choice for the dense SDP scaling blocks. This routing
    sets the cost of a semidefinite solve; see
    [Semidefinite support](@ref) for the cost model and for what the
    solver does and does not handle.
-2. **Small problems (`n + m + p < 1000`) → `kktsolver_qr`.** Dense
-   factorization wins at small sizes; behavior matches the historical
-   default exactly.
-3. **Dense-ish data (more than 10 structural nonzeros per column of
-   `[Q; A; G]` on average) → `kktsolver_qr`.** A sparse-typed matrix
-   with dense columns (e.g. many small SOCs over a 10%-dense `A`)
-   factors faster densely.
-4. **Otherwise → `kktsolver_sparse`.** Large and genuinely sparse —
-   the regime of [issue #10](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/issues/10),
-   where the dense method is slower by orders of magnitude.
+2. **More equality rows than variables, without SDP → `kktsolver_ldl`.**
+   Dense QR requires independent rows and cannot handle `p > n`.
+3. **Small problems (`n + m + p < 200`) → `kktsolver_qr`.** Dense
+   factorization wins at small sizes, and the symbolic analysis below
+   would cost more than it saves.
+4. **Otherwise, predicted flops decide.** A symbolic analysis of the
+   quasi-definite KKT pattern gives the LDLᵀ cost `Σⱼ nnz(L₍:,ⱼ₎)²`; the
+   dense cost includes `m(n−p)² + (n−p)³/3`, setup, and back-solves
+   ([`dense_kkt_flops`](@ref ConicIP.dense_kkt_flops)). Dense QR is chosen
+   when its estimate is below ten times the LDLᵀ estimate (the factor
+   reflects BLAS versus scalar code), otherwise `kktsolver_ldl`. Many
+   small SOCs over a 10%-dense `A` go dense; banded, block-structured, and
+   [issue #10](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/issues/10)-shaped
+   problems go sparse. Nonzeros per column are no longer used: box
+   constraints and identity blocks inflate that count without creating
+   fill, which sent a banded LP with 13 nnz/col to a solver 100× slower.
 
-With `verbose = true` the solver prints the choice it made. Passing
-`kktsolver` explicitly always overrides the heuristic.
+`kktsolver_sparse` is never selected automatically any more; it remains
+available by name. With `verbose = true` the solver prints the choice it
+made. Passing `kktsolver` explicitly always overrides the heuristic.
 
 ## Built-in Solvers
+
+### `kktsolver_ldl`
+
+Sparse LDLᵀ factorization of the symmetric quasi-definite form of the KKT
+system. Negating the third block row of the 3×3 system gives
+
+```
+┌ Q + δ_p I     Gᵀ        −Aᵀ           ┐
+│ G            −δ_e I      0            │
+└ −A            0        −(FᵀF + δ_c I) ┘
+```
+
+whose leading block is positive definite and whose trailing block is
+negative definite, so it has an LDLᵀ factorization with diagonal `D`
+for every symmetric permutation. The pattern is assembled once, ordered
+by AMD, and analysed symbolically once; each iteration rewrites the
+scaling entries and refactorizes numerically in place (QDLDL.jl, pure
+Julia).
+
+Second-order cones of dimension six or more are lifted: `FᵀF = D² + uuᵀ − vvᵀ`
+([`soc_uv`](@ref ConicIP.soc_uv)) becomes a diagonal, two columns, and two
+extra pivots of known sign, `3k + 2` entries instead of `k(k+1)/2`.
+Smaller SOC blocks and SDP blocks are stored densely (the SDP block is
+`O(k⁴)`, which is why SDP problems stay on `kktsolver_qr`).
+
+Regularization is static (`static_reg`, default `1e-8`, on the primal
+and equality blocks) plus QDLDL's dynamic pivot repair; each solve is
+refined against the *unregularized* matrix (`refine_steps`, `refine_tol`),
+so the perturbation acts as a preconditioner rather than a change of
+problem. The refinement is bounded and keeps the best iterate: the
+residual is evaluated after every correction, a correction that does
+not reduce it is discarded and ends the loop, and `refine_tol` is a
+target rather than a guarantee. `G` may have dependent rows: they are
+absorbed by `δ_e` and the refinement rather than requiring the
+preprocessor (this holds for the LDLᵀ route only; `kktsolver_qr` still
+needs independent rows).
+
+A bounded retry is available and off by default (`retry_max = 0`). With
+`retry_max > 0`, a solve that is still above `refine_tol` after
+refinement, on a factorization that repaired a pivot (or whose first
+correction did not reduce the residual), bumps the static shifts,
+`δ ← min(max(δ · retry_factor, shift_floor), shift_max)` for `δ_p` and
+`δ_e` (defaults `10`, `1e-8`, `1e-4`; a zero base shift starts at
+`shift_floor`), refactorizes, solves the same right-hand side again, and
+keeps the better of the two results by unregularized residual — at most
+`retry_max` bumps per factorization. Bumped shifts do not persist: the
+next factorization starts again from `static_reg`. `cone_reg` and
+`dynamic_delta` are never bumped. The solver reports what it did through
+the diagnostics hook described under [The contract](@ref) (verbose `kkt`
+column, `Solution.kkt_repaired`, `Solution.kkt_refactors`).
+
+```julia
+sol = conicIP(Q, c, A, b, cone_dims; kktsolver = ConicIP.kktsolver_ldl)
+# or, with options:
+ks = (Q, A, G, cd) -> ConicIP.kktsolver_ldl(Q, A, G, cd; static_reg = 1e-7)
+sol = conicIP(Q, c, A, b, cone_dims; kktsolver = ks)
+```
+
+For repeated solves of problems with the same structure (new data, same
+sparsity), [`cached_kktsolver_ldl`](@ref ConicIP.cached_kktsolver_ldl)
+keeps the fill-reducing ordering between calls:
+
+```julia
+ks = ConicIP.cached_kktsolver_ldl()
+for t in 1:T
+    sol = conicIP(Q, c[t], A, b[t], cone_dims; kktsolver = ks)
+end
+```
 
 ### `kktsolver_qr`
 
@@ -121,11 +203,15 @@ to [`conicIP`](@ref)), the solver returns a `Solution` with
 throwing; [`preprocess_conicIP`](@ref) removes redundant rows up front,
 and structurally degenerate inputs (an all-zero equality row, a variable
 appearing in no constraint) are detected exactly in `O(nnz)` and either
-deflated or answered with a certified `:Infeasible`/`:Unbounded`.
+deflated or answered with a certified `:Infeasible`/`:DualInfeasible`.
 
 ## Writing a Custom Solver
 
-A custom KKT solver is a three-level nested function:
+A custom KKT solver is a three-level nested function. Note that with the
+default `equilibrate = true` the solver receives the *Ruiz-scaled* data
+(see [`equilibrate_conicIP`](@ref ConicIP.equilibrate_conicIP)); a solver
+that exploits known structure must derive it from the `Q`, `A`, `G` it is
+handed, not from the caller's original matrices.
 
 ```julia
 function my_kktsolver(Q, A, G, cone_dims)
@@ -155,6 +241,72 @@ Pass it to the solver via the `kktsolver` keyword:
 ```julia
 sol = conicIP(Q, c, A, b, cone_dims; kktsolver=my_kktsolver)
 ```
+
+### The contract
+
+What `conicIP` guarantees to a custom solver, and what it expects back:
+
+- **Data.** `Q`, `A`, `G` are whatever `conicIP` was given, after
+  equilibration (dense stays dense, sparse stays sparse; `Q` is
+  symmetric). Level 1 runs once per solve, before the initial point.
+- **Signs.** Level 3 solves exactly the system in the skeleton above:
+  `−Aᵀ` in the first block row and `+A`, `+FᵀF` in the third. A solver
+  that factors the symmetric quasi-definite form (third block row
+  negated: `−A`, `−FᵀF`) must negate the third *right-hand-side* block
+  before its back-solve and return the third *solution* block `c`
+  unnegated — the unknown is the same `c` in both forms. This is what
+  `kktsolver_ldl` does: `rhs[oz+1:oz+m] .= .-bz`, and `sol[oz+1:oz+m]`
+  is returned as is.
+- **Scaling blocks.** `F` is a `Block` whose elements are `Diagonal`
+  (`"R"` cones, and *every* cone at the identity-scaled initial point),
+  `SymWoodbury` (`"Q"`), or `VecCongurance` (`"S"`); `F⁻ᵀ` is its
+  inverse adjoint. `FᵀF` is symmetric positive definite; `F` itself is
+  not self-adjoint for `"S"` blocks. Level 2 runs once per iteration
+  (plus once for the initial point) and may keep any state across
+  iterations; the sparsity pattern of `FᵀF` is fixed after the initial
+  point.
+- **Calls per iteration.** Level 3 is called for the predictor, the
+  corrector, and up to `maxRefinementSteps` refinements of each: between
+  two and `2 + 2·maxRefinementSteps` times per factorization.
+- **Ownership of the result.** Return fresh arrays. `conicIP` builds
+  its step from them and updates it in place during refinement; a view
+  into a buffer that the next call overwrites corrupts the step.
+- **Accuracy.** No tolerance is passed down. `conicIP` measures the 4×4
+  residual of every step and refines it towards `refineAbsTol +
+  refineRelTol·‖r‖`: at most `maxRefinementSteps` corrections, each one
+  more level-3 call, with the residual re-evaluated after every
+  correction; a correction that does not reduce the residual is undone
+  and ends the refinement, so the step used is the best one seen and
+  never worse than the unrefined solve. The tolerance is a target, not
+  a guarantee — a step that still misses it is used as is, and the
+  solve is not aborted for it. A solver may therefore regularize its
+  factorization (`kktsolver_ldl` does) as long as each solve is
+  reasonably accurate for the *unregularized* system; the refinement
+  recovers the rest only while it contracts. A solver that returns a
+  poor solve every time shows as `maxRefinementSteps` refinements per
+  step in the verbose `refine` column and a red row.
+- **Diagnostics (optional).** `conicIP` calls
+  `ConicIP.kkt_diagnostics(solve3x3)` on the object level 2 returned.
+  The default method answers `nothing` and nothing more happens. A
+  solver may add a method for its own level-3 type,
+  `ConicIP.kkt_diagnostics(::YourSolve3x3Type)`, returning any object
+  with integer fields `repaired` and `refactors` (for the current
+  factorization) and `repaired_total` and `refactors_total` (summed over
+  the solve). The first pair is printed in the verbose `kkt` column as
+  `repaired/refactors`; the second pair is stored in
+  `Solution.kkt_repaired` and `Solution.kkt_refactors`. `kktsolver_ldl`
+  returns an `LDLSolve3x3` (callable like the closure it replaces) whose
+  `LDLDiagnostics` record also carries the shifts in effect, the
+  positive inertia of the last factorization (recorded only; QDLDL's
+  `Dsigns` forces the pivot signs, so it detects nothing), and the
+  unregularized residual of the last solve.
+- **Failure.** Throw one of `ConicIP.KKT_FAILURES`
+  (`SingularException`, `PosDefException`, `LAPACKException`,
+  `ZeroPivotException`) from level 2 or level 3 to report a
+  factorization failure; `conicIP` returns `status = :Error` with the
+  stage in `sol.message`. Any other exception propagates as a bug.
+  Return non-finite values and `conicIP` reports
+  `"non-finite ... direction"` the same way.
 
 ### Example: Diagonal QP
 

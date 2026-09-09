@@ -108,6 +108,8 @@ function validate_infeasibility_certificate(Q, c, A, b, cone_dims, G, d, w, v;
 
   w̄ = w/separation
   v̄ = v/separation
+  finite = all(isfinite, w̄) && all(isfinite, v̄)
+  finite || return (CertificateCheck(false, NaN, separation, NaN, false), w, v)
 
   # Gᵀw̄ - Aᵀv̄ ≈ 0
   r = adjmulsafe(G, w̄) - adjmulsafe(A, v̄)
@@ -115,7 +117,7 @@ function validate_infeasibility_certificate(Q, c, A, b, cone_dims, G, d, w, v;
 
   margin = cone_margin(v̄, cone_dims)
 
-  valid = finite &&
+  valid = finite && isfinite(farkas_residual) &&
           farkas_residual <= abstol + reltol*(1 + normsafe(w̄) + normsafe(v̄)) &&
           margin >= -(abstol + reltol)
 
@@ -153,12 +155,14 @@ function validate_unboundedness_certificate(Q, c, A, b, cone_dims, G, d, y;
   end
 
   ȳ = y/separation
+  finite = all(isfinite, ȳ)
+  finite || return (CertificateCheck(false, NaN, separation, NaN, false), y)
 
   farkas_residual = max(norminfsafe(Q*ȳ), norminfsafe(G*ȳ))
 
   margin = cone_margin(A*ȳ, cone_dims)
 
-  valid = finite &&
+  valid = finite && isfinite(farkas_residual) &&
           farkas_residual <= abstol + reltol*(1 + normsafe(ȳ)) &&
           margin >= -(abstol + reltol)
 

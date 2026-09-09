@@ -55,13 +55,13 @@ round.(sol.y, digits=4)
 
 ## Two Ways to Use ConicIP
 
-**Direct API** — full control, supports quadratic objectives:
+**Direct API** — full control over the data and the KKT solver:
 
 ```julia
 sol = conicIP(Q, c, A, b, cone_dims; verbose=false)
 ```
 
-**JuMP/MOI** — algebraic modeling, linear objectives only:
+**JuMP/MOI** — algebraic modeling, affine or convex quadratic objectives:
 
 ```julia
 using JuMP, ConicIP

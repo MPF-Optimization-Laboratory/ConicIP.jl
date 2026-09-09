@@ -76,14 +76,25 @@ Each iteration consists of two phases:
 
 ## Convergence Criteria
 
-The solver monitors three residuals:
+The solver checks primal feasibility, stationarity, complementarity, and a
+relative gap, all in the original coordinates. Define
+`a = ‖|A||y|‖`, `g = ‖|G||y|‖`, `q = ‖|Q||y|‖`,
+`u = ‖|Gᵀ||w|‖`, and `vnorm = ‖|Aᵀ||v|‖`, with entrywise absolute values.
 
-- **Primal feasibility** (`prFeas`): `‖Ay - s - b‖ / (1 + ‖b‖)`
-- **Dual feasibility** (`duFeas`): `‖Qy + Gᵀw - Aᵀv - c‖ / (1 + ‖c‖)`
-- **Complementarity** (`muFeas`): `sᵀv / (1 + |cᵀy|)`
+- **Primal feasibility** (`prFeas`): the maximum of
+  `‖Ay - s - b‖ / (1 + max(‖b‖, a, ‖s‖))` and
+  `‖Gy - d‖ / (1 + max(‖d‖, g))`.
+- **Dual feasibility** (`duFeas`):
+  `‖Qy + Gᵀw - Aᵀv - c‖ / (1 + max(‖c‖, q, u, vnorm))`.
+- **Complementarity** (`muFeas`): `‖λ ∘ λ‖ / (1 + |cᵀy|)`, where
+  `λ` is the Nesterov–Todd scaled cone variable and `∘` is the Jordan product.
+- **Relative gap**: `|sᵀv| / (1 + |pobj + objective_offset|)`.
 
-The solver terminates with status `:Optimal` when all three residuals
-fall below the tolerance `optTol` (default: `1e-6`).
+All four must be below `optTol` (default `1e-6`). These normwise feasibility
+ratios measure backward error; they do not bound each row's absolute violation.
+The complementarity gap equals the objective difference only at stationarity
+and primal feasibility. The reported dual objective is
+`−½yᵀQy − dᵀw + bᵀv`; away from stationarity it is an estimate, not a certified bound.
 
 ### The Certificate Pipeline
 
@@ -160,11 +171,11 @@ Common causes:
 
 **What to try:** Relax constraints or check problem data for errors.
 
-### Status: `:Unbounded`
+### Status: `:DualInfeasible`
 
-The objective decreases without bound over the feasible set. As with
-`:Infeasible`, the status is claimed only after validation against the
-original data.
+The dual problem is infeasible: there is a recession direction along which
+the objective decreases without bound. As with `:Infeasible`, the status is
+claimed only after validation against the original data.
 
 When `sol.has_certificate` is `true`, `sol.y` holds the verified recession
 ray, normalized so that
@@ -176,8 +187,13 @@ cᵀȳ = +1,    Qȳ ≈ 0,    Gȳ ≈ 0,    Aȳ ∈ K
 with `sol.s = A*ȳ`; `w` and `v` are `NaN`. Moving from any feasible point
 along `ȳ` stays feasible and decreases the objective at unit rate.
 
-When `sol.has_certificate` is `false`, unboundedness was detected but no
-usable ray is returned.
+The ray says nothing about whether a feasible point exists. If the primal
+is feasible, it is unbounded; if it is not, the problem is both primal and
+dual infeasible, and the ray is still a valid certificate of the latter.
+(Before v0.5.0 this status was named `:Unbounded`, which over-claimed.)
+
+When `sol.has_certificate` is `false`, dual infeasibility was detected but
+no usable ray is returned.
 
 Common causes:
 - Missing constraints that should bound the feasible region
@@ -185,12 +201,12 @@ Common causes:
 
 **What to try:** Add bounding constraints or verify the objective.
 
-### Status: `:AlmostInfeasible` / `:AlmostUnbounded`
+### Status: `:AlmostInfeasible` / `:AlmostDualInfeasible`
 
 The iteration limit was reached with a candidate ray that validates only
 when the tolerances are relaxed by a factor of 100. This is the gray zone
 between a stall and a proof: the evidence points at infeasibility (or
-unboundedness), but not strongly enough to assert it.
+dual infeasibility), but not strongly enough to assert it.
 
 No certificate is returned — `has_certificate` is `false` and the solution
 fields hold the best iterate, not a ray. Treat the result as advisory.
@@ -223,7 +239,7 @@ indicates a problem with the input data. `sol.message` carries the reason.
 
 [`preprocess_conicIP`](@ref ConicIP.preprocess_conicIP) also returns `:Error`
 when the solve on its reduced equality system claims `:Infeasible` or
-`:Unbounded` but the ray fails to certify the *original* data. That means
+`:DualInfeasible` but the ray fails to certify the *original* data. That means
 the redundancy detection dropped a row that was only dependent to tolerance,
 so the reduced problem's verdict does not transfer; the status is retracted
 rather than reported without a certificate.
@@ -253,10 +269,12 @@ point but the duality gap hasn't closed — try more iterations (`maxIters`).
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `optTol` | `1e-6` | Convergence tolerance for all three residuals |
+| `optTol` | `1e-6` | Convergence tolerance for the primal, dual, equality, complementarity residuals and the relative duality gap |
 | `maxIters` | `100` | Maximum interior-point iterations |
 | `DTB` | `0.01` | Distance-to-boundary parameter; controls step conservatism |
-| `maxRefinementSteps` | `3` | Iterative refinement steps for KKT solve |
+| `maxRefinementSteps` | `3` | Iterative refinement corrections per KKT solve (predictor and corrector) |
+| `refineRelTol`, `refineAbsTol` | `1e-13`, `1e-12` | Refinement stops when `‖r − KΔz‖ ≤ abs + rel·‖r‖` |
+| `timeLimit` | `Inf` | Wall-clock budget in seconds; returns `:TimeLimit` with the best iterate |
 | `infeasTol` | `1e-7` | Relative tolerance for certificate screening and validation |
 | `infeasAbsTol` | `1e-9` | Absolute floor for certificate validation |
 | `staticReg` | `0` | Static regularization of the KKT factorization |
@@ -276,7 +294,7 @@ iterations.
 **`infeasTol`:** Governs certificate detection only, and is deliberately
 decoupled from `optTol` — changing the accuracy you demand of an optimal
 solution should not change how readily the solver declares a problem
-infeasible. Decrease it if the solver reports `:Infeasible` or `:Unbounded`
+infeasible. Decrease it if the solver reports `:Infeasible` or `:DualInfeasible`
 for a problem you know has a solution; increase it if a genuinely infeasible
 problem is reported as `:Abandoned` or `:AlmostInfeasible`.
 

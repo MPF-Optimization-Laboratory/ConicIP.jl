@@ -104,13 +104,12 @@ round(objective_value(model), digits=6)
 
 ## Limitations
 
-!!! note "Quadratic objectives through JuMP are bridged"
-    The MOI wrapper itself accepts only affine objectives. A quadratic
-    objective in JuMP still works: MathOptInterface bridges reformulate it as
-    an epigraph over a second-order cone before it reaches the solver. The
-    direct [`conicIP`](@ref) interface handles a quadratic term in the
-    objective natively, without that reformulation, which is usually faster
-    and more accurate for large quadratic programs.
+!!! note "Quadratic objectives are native"
+    A convex quadratic objective (`@objective(model, Min, x' * Q * x + ...)`)
+    is passed to the solver as its Hessian `Q`, not reformulated through a
+    second-order cone by MathOptInterface bridges. Positive semidefinite but
+    singular Hessians are accepted; the bridge route required strict
+    convexity. Maximization requires a concave quadratic.
 
 Limitations:
 

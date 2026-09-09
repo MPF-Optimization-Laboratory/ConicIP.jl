@@ -12,7 +12,9 @@
 
 using ConicIP, SparseArrays, LinearAlgebra, Downloads
 
-include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
+# Guarded so that this file can be included into a scope that already loaded testdata.jl.
+isdefined(@__MODULE__, :mpb_to_conicip) ||
+    include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
 
 const GIST_URL = "https://gist.githubusercontent.com/mlubin/" *
     "79304a15043498a2f7da35d548f3610c/raw/" *
@@ -41,7 +43,7 @@ function run_instance(prob; kktsolver, maxIters = 100, verbose = false)
             gib = stats.bytes / 2^30)
 end
 
-function main(which = "all")
+function issue10_main(which = "all")
     println("Downloading gist instance …")
     prob = load_issue10()
     n = length(prob.c); m = size(prob.A, 1); p = size(prob.G, 1)
@@ -76,5 +78,5 @@ function main(which = "all")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main(isempty(ARGS) ? "all" : ARGS[1])
+    issue10_main(isempty(ARGS) ? "all" : ARGS[1])
 end
