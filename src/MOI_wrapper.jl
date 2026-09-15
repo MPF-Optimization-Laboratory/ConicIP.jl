@@ -121,27 +121,81 @@ end
 
 # Convexity guard for the objective: the solver assumes ½yᵀQy is convex,
 # so `Q` (already sign-adjusted for the sense) must be positive
-# semidefinite. A Cholesky attempt on Q + δI with δ tiny relative to the
-# entries accepts singular PSD Hessians (a diagonal with zeros, or the
-# Maros–Mészáros rank-deficient QPs) and rejects indefinite ones.
+# semidefinite. The decision is made in this order, each step exact:
+#
+#   1. a nonfinite entry, or a negative diagonal entry, is not PSD;
+#   2. a Hessian whose only nonzeros are on the diagonal is PSD exactly
+#      when that diagonal is nonnegative — no factorization at all, which
+#      is the common case for separable QPs;
+#   3. a zero diagonal entry of a PSD matrix forces a zero row and column,
+#      so a nonzero off it is a rejection;
+#   4. otherwise a sparse Cholesky attempt on Q + δI, with the positive
+#      diagonal congruence-scaled to one first (a large, unrelated block
+#      must not hide negative curvature elsewhere) and δ tiny relative to
+#      the entries, so that singular PSD Hessians (a diagonal with zeros,
+#      or the Maros–Mészáros rank-deficient QPs) still pass.
+#
+# Steps 1-3 are one pass each over the stored values; step 4 costs one
+# sparse factorization, fed only the upper triangle CHOLMOD reads.
 function _is_psd(Q::SparseMatrixCSC{Float64, Int})
     nnz(Q) == 0 && return true
     all(isfinite, nonzeros(Q)) || return false
-    dq = diag(Q)
+    n = size(Q, 2)
+    colptr = Q.colptr; rows = rowvals(Q); vals = nonzeros(Q)
+    dq = zeros(n)
+    offdiag = false
+    @inbounds for j in 1:n, t in colptr[j]:colptr[j+1]-1
+        i = rows[t]
+        if i == j
+            dq[j] = vals[t]
+        elseif vals[t] != 0
+            offdiag = true
+        end
+    end
     any(<(0), dq) && return false
-    # For a PSD matrix, a zero diagonal implies a zero row and column.
-    # Congruence-scale the positive diagonal to one before shifting;
-    # a large, unrelated block must not hide negative curvature elsewhere.
-    for j in axes(Q, 2), t in nzrange(Q, j)
-        i = rowvals(Q)[t]
-        if (dq[i] == 0 || dq[j] == 0) && nonzeros(Q)[t] != 0
+    offdiag || return true
+    @inbounds for j in 1:n, t in colptr[j]:colptr[j+1]-1
+        i = rows[t]
+        if (dq[i] == 0 || dq[j] == 0) && vals[t] != 0
             return false
         end
     end
-    scale = [x > 0 ? 1 / sqrt(x) : 1.0 for x in dq]
-    Qs = Diagonal(scale) * Q * Diagonal(scale)
-    F = cholesky(Symmetric(Qs); shift = 2e-10, check = false)
+    scale = similar(dq)
+    @inbounds for i in 1:n
+        x = dq[i]
+        scale[i] = x > 0 ? 1 / sqrt(x) : 1.0
+    end
+    F = cholesky(Symmetric(_scaled_upper_triangle(Q, scale), :U);
+                 shift = 2e-10, check = false)
     return issuccess(F)
+end
+
+# The upper triangle of Diagonal(s) * Q * Diagonal(s), as a sparse matrix.
+# `Symmetric(·, :U)` hands CHOLMOD a symmetric-stype matrix, which reads
+# the upper triangle and ignores the rest, so the lower half never needs
+# to be built or scaled.
+function _scaled_upper_triangle(Q::SparseMatrixCSC{Float64, Int}, s::Vector{Float64})
+    n = size(Q, 2)
+    colptr = Q.colptr; rows = rowvals(Q); vals = nonzeros(Q)
+    cp = Vector{Int}(undef, n + 1); cp[1] = 1
+    @inbounds for j in 1:n
+        k = 0
+        for t in colptr[j]:colptr[j+1]-1
+            rows[t] <= j && (k += 1)
+        end
+        cp[j+1] = cp[j] + k
+    end
+    rv = Vector{Int}(undef, cp[n+1] - 1)
+    nz = Vector{Float64}(undef, cp[n+1] - 1)
+    @inbounds for j in 1:n
+        k = cp[j]; sj = s[j]
+        for t in colptr[j]:colptr[j+1]-1
+            i = rows[t]
+            i <= j || continue
+            rv[k] = i; nz[k] = (s[i] * vals[t]) * sj; k += 1
+        end
+    end
+    return SparseMatrixCSC(n, n, cp, rv, nz)
 end
 
 const _NONCONVEX_MESSAGE =
