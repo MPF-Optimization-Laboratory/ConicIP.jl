@@ -706,7 +706,8 @@ structurally_zero_cols(M::AbstractMatrix) =
   refineRelTol = 1e-13,
   refineAbsTol = 1e-12,
   timeLimit = Inf,
-  centralityCorrectors = 0)
+  centralityCorrectors = 0,
+  timing = nothing)
 
 Interior point solver for the system
 
@@ -794,6 +795,9 @@ Selected keyword arguments:
   the first rejected corrector, and nothing is tried when the step is
   already full. Extra solves are counted in `kkt_solves`; the verbose
   `cc` column shows `accepted/tried`.
+- `timing` — a [`PhaseTimes`](@ref) object to accumulate per-phase wall
+  times, allocation bytes, and counts into (see `src/timing.jl` for the
+  contract); `nothing` (default) leaves the solver uninstrumented.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -838,25 +842,40 @@ original coordinates; see [`equilibrate_conicIP`](@ref). A custom
 """
 function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                  G = spzeros(0, length(c)), d = zeros(0);
-                 equilibrate = true, timeLimit = Inf, kwargs...)
+                 equilibrate = true, timeLimit = Inf, timing = nothing, kwargs...)
   t_start = time()
-  equilibrate || return _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, kwargs...)
-  eq  = equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
+  # t_gc is assigned (not accumulated) here, at the public entry: a nested
+  # call that also receives `timing` (deflation, the presolve's auxiliary
+  # solve) writes it too, but the outermost call writes last and wins.
+  # `_conicIP` never touches it.
+  gc0 = timing === nothing ? UInt64(0) : Base.gc_time_ns()
+  if !equilibrate
+    sol = _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, timing = timing, kwargs...)
+    timing === nothing || (timing.t_gc = Base.gc_time_ns() - gc0)
+    return sol
+  end
+  eq = @phase timing t_equilibrate b_equilibrate equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
   # The core tests termination on residuals mapped back to the original
   # coordinates, so optTol keeps its meaning under any scaling.
-  scaling = (Dc = eq.Dc, Dr = eq.Dr, De = eq.De, σ = eq.σ,
-             normc = norm(c), normb = normsafe(b), normd = normsafe(d))
+  scaling = @phase timing t_equilibrate b_equilibrate (
+    Dc = eq.Dc, Dr = eq.Dr, De = eq.De, σ = eq.σ,
+    normc = norm(c), normb = normsafe(b), normd = normsafe(d))
   sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
-                 scaling = scaling, timeLimit = timeLimit - (time() - t_start), kwargs...)
-  unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d;
-                 objective_offset = get(kwargs, :objective_offset, 0.0))
-  # A ray validated on the scaled data need not validate on the original
-  # data (tolerances are not scaling-invariant): re-run the validator in
-  # the caller's coordinates with the caller's tolerances, and downgrade
-  # the claim if it fails there.
-  return _revalidate_certificate!(sol, Q, c, A, b, cone_dims, G, d;
-                                  infeasTol = Float64(get(kwargs, :infeasTol, 1e-7)),
-                                  infeasAbsTol = Float64(get(kwargs, :infeasAbsTol, 1e-9)))
+                 scaling = scaling, timeLimit = timeLimit - (time() - t_start),
+                 timing = timing, kwargs...)
+  sol = @phase timing t_postsolve begin
+    unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d;
+                   objective_offset = get(kwargs, :objective_offset, 0.0))
+    # A ray validated on the scaled data need not validate on the original
+    # data (tolerances are not scaling-invariant): re-run the validator in
+    # the caller's coordinates with the caller's tolerances, and downgrade
+    # the claim if it fails there.
+    _revalidate_certificate!(sol, Q, c, A, b, cone_dims, G, d;
+                             infeasTol = Float64(get(kwargs, :infeasTol, 1e-7)),
+                             infeasAbsTol = Float64(get(kwargs, :infeasAbsTol, 1e-9)))
+  end
+  timing === nothing || (timing.t_gc = Base.gc_time_ns() - gc0)
+  return sol
 end
 
 function _conicIP(
@@ -914,8 +933,11 @@ function _conicIP(
   scaling = nothing,       # set by conicIP when the data are equilibrated: the
                            # termination residuals are evaluated in the
                            # original coordinates (see equilibrate.jl)
-  centralityCorrectors::Integer = 0  # Gondzio correctors per iteration (0 = off;
+  centralityCorrectors::Integer = 0,  # Gondzio correctors per iteration (0 = off;
                            # see the corrector block after the line search)
+  timing = nothing         # PhaseTimes to accumulate into (timing.jl); bound
+                           # once here and only ever read, so the closures
+                           # below capture it by value
   )
 
   centralityCorrectors >= 0 ||
@@ -923,6 +945,12 @@ function _conicIP(
   centralityCorrectors = Int(centralityCorrectors)
 
   t_start = time()
+  # t_setup runs from here to the KKT solver construction. It is opened
+  # by hand rather than with @phase because the scratch below is captured
+  # by closures, and a @phase block would give each of those variables
+  # two assignment sites (one per branch) and so box them.
+  t_setup0 = timing === nothing ? UInt64(0) : time_ns()
+  b_setup0 = timing === nothing ? Int64(0)  : _gc_bytes()
   over_time() = time() - t_start > timeLimit
   time_left() = timeLimit - (time() - t_start)
 
@@ -1065,6 +1093,12 @@ function _conicIP(
   if any(Gzr) || any(Zc)
     keep_r = findall(.!Gzr)
     keep_c = findall(.!Zc)
+    # The recursive call accumulates into the same object; this call's own
+    # work so far is setup.
+    if timing !== nothing
+      timing.t_setup += time_ns() - t_setup0
+      timing.b_setup += _gc_bytes() - b_setup0
+    end
     solr = _conicIP(Q[keep_c, keep_c], c[keep_c], A[:, keep_c], b, cone_dims,
                    G[keep_r, keep_c], d[keep_r];
                    kktsolver = kktsolver, optTol = optTol, DTB = DTB,
@@ -1077,6 +1111,7 @@ function _conicIP(
                    timeLimit = time_left(),
                    objective_offset = objective_offset,
                    centralityCorrectors = centralityCorrectors,
+                   timing = timing,
                    scaling = scaling === nothing ? nothing :
                              (; scaling..., Dc = scaling.Dc[keep_c],
                                             De = scaling.De[keep_r]))
@@ -1246,6 +1281,10 @@ function _conicIP(
     err isa KKT_FAILURES || rethrow()
     return errsol(kkt_error("solver setup", err))
   end
+  if timing !== nothing
+    timing.t_setup += time_ns() - t_setup0
+    timing.b_setup += _gc_bytes() - b_setup0
+  end
 
   function solve4x4gen(λ, F, F⁻ᵀ, solve3x3gen = solve3x3gen)
 
@@ -1262,10 +1301,17 @@ function _conicIP(
 
     solve3x3 = solve3x3gen(F, F⁻ᵀ)
     _s3_cur[] = solve3x3
+    # The wall time of this factorization is charged by the caller
+    # (t_init for the initial point, t_kktupdate in the loop).
+    if timing !== nothing
+      timing.n_kktupdate += 1
+      kkt_attach_timing!(solve3x3, timing)
+    end
 
     function solve4x4(r)
 
       _nsolve[] += 1
+      timing === nothing || (timing.n_solve += 1)
       cone_div!(_div_buf, r.s, λ)
       t1 = F'*_div_buf
       (Δy, Δw, Δv)  = solve3x3(r.y, r.w, r.v + t1)
@@ -1289,7 +1335,9 @@ function _conicIP(
   # single assignment site and is not boxed when the predictor closure
   # captures it.
   r_init = v4x1(c, d, b, zeros(m))
-  z  = try
+  # t_init: the identity-scaling factorization and solve, and the shift
+  # into the interior (neither counts toward t_kktupdate / t_direction).
+  z  = @phase timing t_init try
     solve4x4gen(e,I,I)(r_init)
   catch err
     err isa KKT_FAILURES || rethrow()
@@ -1299,7 +1347,7 @@ function _conicIP(
   # A nonfinite initial point would reach LAPACK through maxstep below.
   isfinite4(z) || return errsol("non-finite initial point (initial point)")
 
-  (α_v, α_s) = try
+  (α_v, α_s) = @phase timing t_init try
     (maxstep(z.v, nothing), maxstep(z.s, nothing))
   catch err
     err isa KKT_FAILURES || rethrow()
@@ -1307,8 +1355,10 @@ function _conicIP(
   end
 
   # Change to +
-  z.v = z.v - α_v*e
-  z.s = z.s - α_s*e
+  @phase timing t_init begin
+    z.v = z.v - α_v*e
+    z.s = z.s - α_s*e
+  end
 
   if verbose
       println("            Optimality                      Objective              Infeasibility       ")
@@ -1364,7 +1414,23 @@ function _conicIP(
     return sol
   end
 
+  # t_loop is the wall time of the whole iterate loop. The loop is left
+  # through `return` at many sites, so the phase is opened here and every
+  # `return` inside the loop goes through exit_loop, which closes it and
+  # passes the value on; the break/exhaustion path closes it after the
+  # loop. The loop children (t_scaling … t_linesearch) are @phase spans
+  # inside the body, laid out so that no closure-captured loop variable
+  # (F, λ, r0, r, solve, d_aff, Δz) is assigned inside a span other than
+  # as `x = @phase … expr`, which keeps its single assignment site.
+  t_loop0 = timing === nothing ? UInt64(0) : time_ns()
+  function exit_loop(x)
+    timing === nothing || (timing.t_loop += time_ns() - t_loop0)
+    return x
+  end
+
   for Iter = 1:maxIters
+
+    timing === nothing || (timing.n_passes += 1)
 
     # Every solve of the previous iteration is accounted for here; the
     # termination returns below happen before this iteration's first solve.
@@ -1373,23 +1439,23 @@ function _conicIP(
     if over_time()
       if verbose; print("\n > EXIT -- Time limit reached ($(timeLimit) s)\n\n"); end
       sol.status = :TimeLimit
-      return sol
+      return exit_loop(sol)
     end
 
     # Nesterov-Todd scaling matrix. nestod_sdc factors both cone iterates,
     # so a boundary iterate surfaces here as a PosDefException.
-    Fλ = guarded("NT scaling, iteration $Iter") do
+    Fλ = @phase timing t_scaling b_scaling guarded("NT scaling, iteration $Iter") do
       Fi = nt_scaling(z.v, z.s)
       inv_adjoint!(F⁻ᵀ_cache, Fi)
       (Fi, Fi*z.v)                 # λ = F*z.v is also F⁻ᵀ*z.s
     end
-    Fλ === nothing && return sol
+    Fλ === nothing && return exit_loop(sol)
     (F, λ) = Fλ
     F⁻ᵀ    = F⁻ᵀ_cache
     # A scaling that is non-finite without having thrown would reach
     # inv_adjoint! and the KKT solve as Inf/NaN.
     all(isfinite, λ) ||
-      return nonfinite!("NT scaling", "NT scaling, iteration $Iter")
+      return exit_loop(nonfinite!("NT scaling", "NT scaling, iteration $Iter"))
 
     # The KKT factorization is deferred until after the termination and
     # certificate checks below: a converged iterate never pays for it, and
@@ -1398,23 +1464,30 @@ function _conicIP(
     # Products of the iterate with the data, each formed once per
     # iteration and shared by the residuals, the objective, and the
     # infeasibility screens.
-    Qy   = Q*z.y
-    Gᵀw_Aᵀv = Gᵀ*z.w - Aᵀ*z.v
+    rleft = @phase timing t_residuals b_residuals begin
+      Qy   = Q*z.y
+      Gᵀw_Aᵀv = Gᵀ*z.w - Aᵀ*z.v
 
-    #         ┌                   ┐ ┌     ┐
-    # rleft = │ Q   G'   -A'      │ │ z.y │
-    #         │ G                 │ │ z.w │  V = block(λ)*F⁻ᵀ
-    #         │ A              -I │ │ z.v │    = block(λ)*λ
-    #         │           S     V │ │ z.s │
-    #         └                   ┘ └     ┘
-    cone_prod!(_prod_buf1, λ, λ)
-    rleft = v4x1( Qy + Gᵀw_Aᵀv ,
-                  G*z.y        ,
-                  A*z.y - z.s  ,
-                  _prod_buf1   )
+      #         ┌                   ┐ ┌     ┐
+      # rleft = │ Q   G'   -A'      │ │ z.y │
+      #         │ G                 │ │ z.w │  V = block(λ)*F⁻ᵀ
+      #         │ A              -I │ │ z.v │    = block(λ)*λ
+      #         │           S     V │ │ z.s │
+      #         └                   ┘ └     ┘
+      cone_prod!(_prod_buf1, λ, λ)
+      v4x1( Qy + Gᵀw_Aᵀv ,
+            G*z.y        ,
+            A*z.y - z.s  ,
+            _prod_buf1   )
+    end
 
     # True Residual of nonlinear KKT System
-    r0 = v4x1(rleft.y - c, rleft.w - d, rleft.v - b, rleft.s);
+    r0 = @phase timing t_residuals b_residuals v4x1(rleft.y - c, rleft.w - d, rleft.v - b, rleft.s)
+
+    # Residual norms, objectives, best-iterate bookkeeping, certificate
+    # screens and the termination verdicts, as one span so that the
+    # termination returns stay inside it.
+    @phase timing t_residuals b_residuals begin
 
     # Gap
     μbar = dot(z.v,z.s)
@@ -1443,7 +1516,7 @@ function _conicIP(
                     "(yᵀQy < 0 at iteration $Iter); ConicIP requires a convex objective"
       _stamp_kkt!(sol)
       if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
-      return sol
+      return exit_loop(sol)
     end
 
     # rGap is the relative duality gap measured as the complementarity
@@ -1658,37 +1731,40 @@ function _conicIP(
     if optimal
       if verbose; print("\n > EXIT -- Below Tolerance!\n\n"); end
       sol.status = :Optimal
-      return sol
+      return exit_loop(sol)
     end
 
     if claim == :Infeasible
       if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
-      return claim_infeasible!(sol, w̄, v̄)
+      return exit_loop(claim_infeasible!(sol, w̄, v̄))
     end
 
     if claim == :DualInfeasible
       if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
-      return claim_dual_infeasible!(sol, ȳ, A)
+      return exit_loop(claim_dual_infeasible!(sol, ȳ, A))
     end
 
     # Cause of Divergence Unknown
     if !(isfinite(μ) && isfinite(rDu) && isfinite(rPr) && isfinite(rCp))
       if verbose; print("\n > EXIT -- Error!\n\n"); end
-      sol.status = :Error; return sol
+      sol.status = :Error; return exit_loop(sol)
     end
+
+    end # @phase t_residuals
 
     # ────────────────────────────────────────────────────────────
     #  Factorization (only for an iterate that is going to be stepped)
     # ────────────────────────────────────────────────────────────
 
-    solve = try
+    # t_kktupdate: scaling-block assembly and numeric factorization.
+    solve = @phase timing t_kktupdate b_kktupdate try
       solve4x4gen(λ,F,F⁻ᵀ)         # Caches 4x4 solver
                                    # (used a few times, at least 2)
     catch err
       err isa KKT_FAILURES || rethrow()
       sol.status = :Error
       sol.message = kkt_error("factorization, iteration $Iter", err)
-      return sol
+      return exit_loop(sol)
     end
 
     # ────────────────────────────────────────────────────────────
@@ -1723,12 +1799,19 @@ function _conicIP(
     # The tolerance is a target, not a guarantee: a step that still misses
     # it is used as is. Returns false after stamping sol when a correction
     # solve fails.
+    # Timing: the whole call is t_dir_refine (inclusive diagnostic inside
+    # t_direction, which the call sites wrap); the residual evaluations
+    # are t_dir_refine_resid. A failed correction leaves the span early
+    # and unaccounted.
     function refine!(Δz, r, stage)
+      @phase timing t_dir_refine begin
       nr   = norm(r)
       rtol = refineAbsTol + refineRelTol * nr
-      rres = step_residual!(Δz, r)
+      timing === nothing || (timing.n_refine_resid += 1)
+      rres = @phase timing t_dir_refine_resid step_residual!(Δz, r)
       k    = 0                          # this call's own budget
       while k < maxRefinementSteps && rres > rtol
+        timing === nothing || (timing.n_refine_attempt += 1)
         Δzr = guarded("refinement, $stage") do
           solve(_rIr)
         end
@@ -1740,7 +1823,8 @@ function _conicIP(
         copy4!(_Δz_keep, Δz)
         axpy4!(1.0, Δzr, Δz)
         k += 1
-        rnew = step_residual!(Δz, r)
+        timing === nothing || (timing.n_refine_resid += 1)
+        rnew = @phase timing t_dir_refine_resid step_residual!(Δz, r)
         if !(rnew < rres)               # also catches a NaN residual
           copy4!(Δz, _Δz_keep)
           break
@@ -1749,30 +1833,37 @@ function _conicIP(
       end
       nref += k                         # iteration total, for the verbose row
       rnorm = rres / (1 + nr)
-      return true
+      true
+      end # @phase t_dir_refine
     end
     nref = 0
 
-    d_aff = guarded("predictor, iteration $Iter") do
+    # t_direction covers the base solve (also t_dir_base) and the
+    # refinement; the finiteness checks between them are left out.
+    d_aff = @phase timing t_direction b_direction @phase timing t_dir_base guarded("predictor, iteration $Iter") do
       solve(r0)
     end
-    d_aff === nothing && return sol
+    d_aff === nothing && return exit_loop(sol)
     isfinite4(d_aff) ||
-      return nonfinite!("predictor direction", "predictor, iteration $Iter")
-    refine!(d_aff, r0, "predictor, iteration $Iter") || return sol
+      return exit_loop(nonfinite!("predictor direction", "predictor, iteration $Iter"))
+    (@phase timing t_direction b_direction refine!(d_aff, r0, "predictor, iteration $Iter")) ||
+      return exit_loop(sol)
 
-    α_aff_vs = guarded("predictor line search, iteration $Iter") do
+    α_aff_vs = @phase timing t_linesearch b_linesearch guarded("predictor line search, iteration $Iter") do
       ( min( maxstep( z.v, d_aff.v ) , 1 ),
         min( maxstep( z.s, d_aff.s ) , 1 ) )
     end
-    α_aff_vs === nothing && return sol
+    α_aff_vs === nothing && return exit_loop(sol)
     α_aff = min( α_aff_vs[1] , α_aff_vs[2] )
+
+    # t_rhs: centering parameter and the corrector right-hand side.
+    r = @phase timing t_rhs b_rhs begin
 
     # >> ρ  = (z.v - α_aff*d_aff.v)'*(z.s - α_aff*d_aff.s)/μbar
     ρ  = fts(z.v, α_aff, d_aff.v, z.s, α_aff,d_aff.s)/μbar
     σ  = max(0,min(1,ρ))^3
     (isfinite(ρ) && isfinite(σ)) ||
-      return nonfinite!("centering parameter", "predictor, iteration $Iter")
+      return exit_loop(nonfinite!("centering parameter", "predictor, iteration $Iter"))
 
     # ────────────────────────────────────────────────────────────
     #  Corrector
@@ -1786,22 +1877,25 @@ function _conicIP(
     axpy!(-σ*μ, e, lc);
     scal!(length(e), -1., lc, 1)
 
-    r  =  v4x1(r0.y, r0.w, r0.v, rleft.s - lc)
+    v4x1(r0.y, r0.w, r0.v, rleft.s - lc)
+
+    end # @phase t_rhs
 
     # ────────────────────────────────────────────────────────────
     #  Take newton step, with iterative refinement
     # ────────────────────────────────────────────────────────────
 
-    Δz = guarded("corrector, iteration $Iter") do
+    Δz = @phase timing t_direction b_direction @phase timing t_dir_base guarded("corrector, iteration $Iter") do
       solve(r)
     end
-    Δz === nothing && return sol
+    Δz === nothing && return exit_loop(sol)
     isfinite4(Δz) ||
-      return nonfinite!("corrector direction", "corrector, iteration $Iter")
+      return exit_loop(nonfinite!("corrector direction", "corrector, iteration $Iter"))
 
-    refine!(Δz, r, "corrector, iteration $Iter") || return sol
+    (@phase timing t_direction b_direction refine!(Δz, r, "corrector, iteration $Iter")) ||
+      return exit_loop(sol)
     isfinite4(Δz) ||
-      return nonfinite!("search direction", "search direction, iteration $Iter")
+      return exit_loop(nonfinite!("search direction", "search direction, iteration $Iter"))
 
     # ────────────────────────────────────────────────────────────
     # Make Step
@@ -1810,11 +1904,11 @@ function _conicIP(
     # maxstep is homogeneous of degree -1 in the direction, so scaling the
     # step back from the boundary by (1-DTB) is the same as searching along
     # Δz/(1-DTB) — without forming the scaled direction.
-    α_vs = guarded("line search, iteration $Iter") do
+    α_vs = @phase timing t_linesearch b_linesearch guarded("line search, iteration $Iter") do
       ( min( 1, (1-DTB)*maxstep(z.v, Δz.v) ),
         min( 1, (1-DTB)*maxstep(z.s, Δz.s) ) )
     end
-    α_vs === nothing && return sol
+    α_vs === nothing && return exit_loop(sol)
     α = min( α_vs[1], α_vs[2] )
 
     # ────────────────────────────────────────────────────────────
@@ -1837,10 +1931,15 @@ function _conicIP(
     #  The corrector rhs is not divided by α̃ (Gondzio's convention): the
     #  realized move is a fraction of Δw, and the acceptance test decides.
     # ────────────────────────────────────────────────────────────
+    #  Timing: the corrector formation and its line search are
+    #  t_linesearch, the extra back-solve is t_direction; a `break`
+    #  leaves the current span unaccounted.
+    # ────────────────────────────────────────────────────────────
     if centralityCorrectors > 0
       cc_acc = 0; cc_try = 0
       σμ = σ*μ
       for _ in 1:centralityCorrectors
+        @phase timing t_linesearch b_linesearch begin
         α̃ = min(1.0, α + GONDZIO_δα)
         # A full step needs no lengthening, and a zero centering target
         # (σ = 0, or μ ≤ 0) leaves no box to aim for.
@@ -1854,11 +1953,13 @@ function _conicIP(
         # Already inside the box (exactly zero correction): nothing to solve.
         all(iszero, _cc_dw) && break
         _cc_r.s .= .-_cc_dw
-        Δz_c = guarded("centrality corrector, iteration $Iter") do
+        end
+        Δz_c = @phase timing t_direction b_direction guarded("centrality corrector, iteration $Iter") do
           solve(_cc_r)
         end
-        Δz_c === nothing && return sol
+        Δz_c === nothing && return exit_loop(sol)
         isfinite4(Δz_c) || break
+        @phase timing t_linesearch b_linesearch begin
         cc_try += 1
         copy4!(_cc_Δz, Δz)
         axpy4!(1.0, Δz_c, _cc_Δz)
@@ -1866,7 +1967,7 @@ function _conicIP(
           ( min( 1, (1-DTB)*maxstep(z.v, _cc_Δz.v) ),
             min( 1, (1-DTB)*maxstep(z.s, _cc_Δz.s) ) )
         end
-        α_new_vs === nothing && return sol
+        α_new_vs === nothing && return exit_loop(sol)
         α_new = min(α_new_vs[1], α_new_vs[2])
         if α_new >= α + GONDZIO_γ*(α̃ - α)
           copy4!(Δz, _cc_Δz)
@@ -1875,6 +1976,7 @@ function _conicIP(
         else
           break
         end
+        end
       end
     end
 
@@ -1882,6 +1984,7 @@ function _conicIP(
     # step that lands within rounding of the boundary makes the next
     # NT scaling fail (a terminal :Error today). Check the trial iterate
     # exactly and back off geometrically before accepting it.
+    @phase timing t_linesearch b_linesearch begin
     ok = false
     for _ in 1:30
       _trial_v .= z.v .- α .* Δz.v
@@ -1897,7 +2000,7 @@ function _conicIP(
       sol.message = "no interior point along the search direction (line search, iteration $Iter)"
       _stamp_kkt!(sol)
       if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
-      return sol
+      return exit_loop(sol)
     end
 
     # >> z = z - α*Δz;
@@ -1905,7 +2008,9 @@ function _conicIP(
 
     # The next iteration's nt_scaling factors this iterate.
     isfinite4(z) ||
-      return nonfinite!("iterate", "line search, iteration $Iter")
+      return exit_loop(nonfinite!("iterate", "line search, iteration $Iter"))
+    timing === nothing || (timing.n_steps += 1)
+    end # @phase t_linesearch
 
     # Stall: three consecutive negligible steps mean the iteration is no
     # longer moving. Leave the loop and let the post-loop screens decide
@@ -1918,6 +2023,7 @@ function _conicIP(
     end
 
   end
+  exit_loop(nothing)                   # break / exhaustion path
 
   _stamp_kkt!(sol)
   if over_time()
@@ -1935,6 +2041,9 @@ function _conicIP(
   #  :AlmostDualInfeasible rather than claiming.
   # ────────────────────────────────────────────────────────────
 
+  # t_final: the post-loop screens and validations (the fallback solves
+  # below are t_fallback; the final status assignment is not timed).
+  @phase timing t_final begin
   (pchk, w̄, v̄) = validate_infeasibility_certificate(
                     Q, c, A, b, cone_dims, G, d, sol.w, sol.v;
                     abstol = infeasAbsTol, reltol = infeasTol)
@@ -1961,6 +2070,7 @@ function _conicIP(
   # evidence that no interior optimum exists.
   μ_diverged = length(μ_history) > 1 && (!isfinite(μ_history[end]) ||
                 μ_history[end] >= 1e3*minimum(μ_history))
+  end # @phase t_final
 
   # ── WP5 fallback: recover a ray by an auxiliary min-norm QP ──
   #  Only when both 1× validations failed AND there is evidence a ray
@@ -1978,11 +2088,13 @@ function _conicIP(
     # Each solve is gated on the deadline separately: the first can use
     # up what is left of the budget, and the second must not then start.
     if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0 && !over_time()
-      ray = fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
+      # The auxiliary solve runs untimed inside (no `timing` reaches it).
+      ray = @phase timing t_fallback fallback_infeasibility_ray(
+                                       Q, c, A, b, cone_dims, G, d;
                                        maxIters = certFallbackIters,
                                        timeLimit = max(time_left(), 0.0))
       if ray !== nothing
-        (fchk, fw̄, fv̄) = validate_infeasibility_certificate(
+        (fchk, fw̄, fv̄) = @phase timing t_final validate_infeasibility_certificate(
                             Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
                             abstol = infeasAbsTol, reltol = infeasTol)
         if fchk.valid
@@ -1993,11 +2105,12 @@ function _conicIP(
     end
 
     if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0 && !over_time()
-      ray = fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
+      ray = @phase timing t_fallback fallback_unbounded_ray(
+                                   Q, c, A, b, cone_dims, G, d;
                                    maxIters = certFallbackIters,
                                    timeLimit = max(time_left(), 0.0))
       if ray !== nothing
-        (fchk, fȳ) = validate_unboundedness_certificate(
+        (fchk, fȳ) = @phase timing t_final validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, ray;
                        abstol = infeasAbsTol, reltol = infeasTol)
         if fchk.valid
