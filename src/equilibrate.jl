@@ -19,26 +19,131 @@
 # symmetric matrix [Q Aᵀ Gᵀ; A 0 0; G 0 0]; each sweep multiplies the
 # current scaling by 1/√(row norm).
 
-# Column-wise and row-wise ∞-norms of a sparse matrix.
-function _col_infnorms(S::SparseMatrixCSC)
-  out = zeros(size(S, 2))
+# Column-wise and row-wise ∞-norms of a sparse matrix, accumulated into
+# `out` with `max`. A sweep needs the largest column norm over the three
+# blocks of one KKT column, so the accumulating form lets one buffer serve
+# them all and keeps the sweep free of allocation.
+function _col_infnorms!(out, S::SparseMatrixCSC)
+  colptr = S.colptr; vals = S.nzval
   @inbounds for j in 1:size(S, 2)
-    mx = 0.0
-    for t in S.colptr[j]:S.colptr[j+1]-1
-      mx = max(mx, abs(S.nzval[t]))
+    mx = out[j]
+    for t in colptr[j]:colptr[j+1]-1
+      mx = max(mx, abs(vals[t]))
     end
     out[j] = mx
   end
   return out
 end
-function _row_infnorms(S::SparseMatrixCSC)
-  out = zeros(size(S, 1))
+function _row_infnorms!(out, S::SparseMatrixCSC)
   rows = S.rowval; vals = S.nzval
   @inbounds for t in eachindex(vals)
     i = rows[t]
     out[i] = max(out[i], abs(vals[t]))
   end
   return out
+end
+
+# S .= Diagonal(dl) * S * Diagonal(dr) on the stored values, in the same
+# multiplication order as the two-sided product it replaces
+# (`(dl[i] * S[i,j]) * dr[j]`), so the scaled entries are bitwise identical
+# to the matrix the allocating form would have built.
+function _scale_rows_cols!(S::SparseMatrixCSC, dl, dr)
+  colptr = S.colptr; rows = S.rowval; vals = S.nzval
+  @inbounds for j in 1:size(S, 2)
+    dj = dr[j]
+    for t in colptr[j]:colptr[j+1]-1
+      vals[t] = (dl[rows[t]] * vals[t]) * dj
+    end
+  end
+  return S
+end
+
+# Diagonal(dl) * M * Diagonal(dr), one allocation for a sparse M; the
+# generic fallback keeps any other storage type (dense stays dense).
+_scaled(M, dl, dr) = Diagonal(dl) * M * Diagonal(dr)
+_scaled(M::SparseMatrixCSC, dl, dr) =
+  _scale_rows_cols!(SparseMatrixCSC(size(M, 1), size(M, 2), copy(M.colptr),
+                                    copy(M.rowval), copy(M.nzval)), dl, dr)
+
+# Slot of the mirror entry (j,i) for every stored (i,j), or `nothing` when
+# the structure is not symmetric. Walking the columns in order appends the
+# entries of column i of Sᵀ in increasing row order, which is exactly the
+# CSC order of column i of S when S is structurally symmetric — so the
+# running cursor `ptr[i]` is the mirror slot, and any mismatch proves the
+# structure asymmetric.
+function _mirror_slots(S::SparseMatrixCSC)
+  n = size(S, 2)
+  size(S, 1) == n || return nothing
+  colptr = S.colptr; rows = S.rowval
+  ptr = copy(colptr)
+  mirror = Vector{Int}(undef, length(rows))
+  @inbounds for j in 1:n, t in colptr[j]:colptr[j+1]-1
+    i = rows[t]
+    q = ptr[i]
+    (q < colptr[i+1] && rows[q] == j) || return nothing
+    ptr[i] = q + 1
+    mirror[t] = q
+  end
+  return mirror
+end
+
+# σ * (Diagonal(d) * M * Diagonal(d)), symmetrized. The two-sided diagonal
+# product is not bitwise symmetric (the products are formed in different
+# orders above and below the diagonal), so the result is averaged with its
+# transpose: solvers and user callbacks may check `issymmetric(Q)`.
+_congruence_generic(M, d, σ) =
+  (X = σ * (Diagonal(d) * M * Diagonal(d)); (X + X') / 2)
+_congruence(M, d, σ) = _congruence_generic(M, d, σ)
+function _congruence(M::SparseMatrixCSC, d, σ)
+  mirror = _mirror_slots(M)
+  mirror === nothing && return _congruence_generic(M, d, σ)
+  colptr = M.colptr; rows = M.rowval; vals = M.nzval
+  out = similar(vals)
+  @inbounds for j in 1:size(M, 2)
+    dj = d[j]
+    for t in colptr[j]:colptr[j+1]-1
+      out[t] = σ * ((d[rows[t]] * vals[t]) * dj)
+    end
+  end
+  # Average each entry with its mirror, visiting every pair once (the
+  # lower triangle, where the mirror slot still holds its unaveraged value).
+  @inbounds for j in 1:size(M, 2), t in colptr[j]:colptr[j+1]-1
+    if rows[t] >= j
+      q = mirror[t]
+      a = (out[t] + out[q]) / 2
+      out[t] = a; out[q] = a
+    end
+  end
+  return SparseMatrixCSC(size(M, 1), size(M, 2), copy(colptr), copy(rows), out)
+end
+
+# ‖ |M| x ‖₂ and ‖ |M|ᵀ x ‖₂ without materializing |M|. The accumulation
+# order matches `SparseArrays`' own `mul!`, so the norms are bitwise equal
+# to the ones the allocating form produced.
+_absmul_norm(M, x) = norm(_absmat(M) * x)
+_absmulT_norm(M, x) = norm(_absmat(M)' * x)
+function _absmul_norm(M::SparseMatrixCSC, x)
+  colptr = M.colptr; rows = M.rowval; vals = M.nzval
+  out = zeros(size(M, 1))
+  @inbounds for j in 1:size(M, 2)
+    xj = x[j]
+    for t in colptr[j]:colptr[j+1]-1
+      out[rows[t]] += abs(vals[t]) * xj
+    end
+  end
+  return norm(out)
+end
+function _absmulT_norm(M::SparseMatrixCSC, x)
+  colptr = M.colptr; rows = M.rowval; vals = M.nzval
+  out = Vector{Float64}(undef, size(M, 2))
+  @inbounds for j in 1:size(M, 2)
+    acc = 0.0
+    for t in colptr[j]:colptr[j+1]-1
+      acc += abs(vals[t]) * x[rows[t]]
+    end
+    out[j] = acc
+  end
+  return norm(out)
 end
 
 """
@@ -71,15 +176,22 @@ function equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
   ranges = cum_range([cd[2] for cd in cone_dims])
   uniform = [cd[1] != "R" for cd in cone_dims]
 
-  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  # Private working copies: the sweeps rescale their stored values in
+  # place, so they must not alias the caller's matrices.
+  Qs = sparse(Q); Qs === Q && (Qs = copy(Qs))
+  As = sparse(A); As === A && (As = copy(As))
+  Gs = sparse(G); Gs === G && (Gs = copy(Gs))
   Dc = ones(n); Dr = ones(m); De = ones(p)
   lo = 1 / bound; hi = bound
+  cn = zeros(n); rn = zeros(m); en = zeros(p)
+  sc = ones(n); sr = ones(m); se = ones(p)
 
   for _ in 1:iters
     # KKT row norms: variable rows see Q, Aᵀ, Gᵀ; cone rows see A; equality rows see G
-    cn = max.(_col_infnorms(Qs), _col_infnorms(As), _col_infnorms(Gs))
-    rn = _row_infnorms(As)
-    en = _row_infnorms(Gs)
+    fill!(cn, 0.0); fill!(rn, 0.0); fill!(en, 0.0)
+    _col_infnorms!(cn, Qs); _col_infnorms!(cn, As); _col_infnorms!(cn, Gs)
+    _row_infnorms!(rn, As)
+    _row_infnorms!(en, Gs)
     for (u, I) in zip(uniform, ranges)
       if u && !isempty(I)
         mx = maximum(view(rn, I))
@@ -93,12 +205,24 @@ function equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
     # Limit the applied increments, not just the recorded cumulative
     # factors. Otherwise Qs/As/Gs drift from the scalings returned below
     # once a bound is hit, and later sweeps balance a fictitious matrix.
-    sc = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / Dc[i], hi / Dc[i]) for (i,x) in enumerate(cn)]
-    sr = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / Dr[i], hi / Dr[i]) for (i,x) in enumerate(rn)]
-    se = [x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / De[i], hi / De[i]) for (i,x) in enumerate(en)]
-    Qs = Diagonal(sc) * Qs * Diagonal(sc)
-    As = Diagonal(sr) * As * Diagonal(sc)
-    Gs = Diagonal(se) * Gs * Diagonal(sc)
+    @inbounds for i in eachindex(cn)
+      x = cn[i]
+      sc[i] = x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / Dc[i], hi / Dc[i])
+    end
+    @inbounds for i in eachindex(rn)
+      x = rn[i]
+      sr[i] = x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / Dr[i], hi / Dr[i])
+    end
+    @inbounds for i in eachindex(en)
+      x = en[i]
+      se[i] = x == 0 ? 1.0 : clamp(1 / sqrt(x), lo / De[i], hi / De[i])
+    end
+    # Rescale the stored values in place: a sweep is a pure reweighting of
+    # the existing nonzeros, so there is no reason to build three new
+    # sparse matrices per sweep.
+    _scale_rows_cols!(Qs, sc, sc)
+    _scale_rows_cols!(As, sr, sc)
+    _scale_rows_cols!(Gs, se, sc)
     Dc .*= sc; Dr .*= sr; De .*= se
   end
 
@@ -110,14 +234,11 @@ function equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
   nc = norm(c̃, Inf)
   σ = (nc == 0 || σ_range[1] <= nc <= σ_range[2]) ? 1.0 :
       1 / clamp(nc, 1e-8, 1e8)
-  # Scale the caller's matrices in their own storage type. The two-sided
-  # diagonal product is not bitwise symmetric (the products are formed in
-  # different orders above and below the diagonal), so symmetrize
-  # explicitly: solvers and user callbacks may check `issymmetric(Q)`.
-  Q̃ = σ * (Diagonal(Dc) * Q * Diagonal(Dc))
-  Q̃ = (Q̃ + Q̃') / 2
-  Ã = Diagonal(Dr) * A * Diagonal(Dc)
-  G̃ = Diagonal(De) * G * Diagonal(Dc)
+  # Scale the caller's matrices in their own storage type, each in a
+  # single pass over its stored values (see `_congruence` / `_scaled`).
+  Q̃ = _congruence(Q, Dc, σ)
+  Ã = _scaled(A, Dr, Dc)
+  G̃ = _scaled(G, De, Dc)
   return (Q = Q̃, c = σ .* c̃, A = Ã, b = Dr .* b, G = G̃, d = De .* d,
           Dc = Dc, Dr = Dr, De = De, σ = σ)
 end
@@ -224,16 +345,18 @@ function _refresh_point!(sol::Solution, Q, c, A, b, G, d; objective_offset = 0.0
     # Same backward-error normalization as the termination test in
     # _conicIP: the residual is relative to the right-hand side or to the
     # componentwise products |Q||y|, |Gᵀ||w|, |Aᵀ||v|, |A||y|, |G||y|.
-    absQ = _absmat(Q); absA = _absmat(A); absG = _absmat(G)
+    # The |Q|, |A|, |G| products are taken a value at a time rather than
+    # through a materialized copy of each matrix: postsolve is otherwise
+    # three full sparse allocations for three norms.
     ay = abs.(y); aw = abs.(w); av = abs.(v)
-    nQy = norm(absQ * ay)
-    nGw = isempty(w) ? 0.0 : norm(absG' * aw)
-    nAv = isempty(v) ? 0.0 : norm(absA' * av)
+    nQy = _absmul_norm(Q, ay)
+    nGw = isempty(w) ? 0.0 : _absmulT_norm(G, aw)
+    nAv = isempty(v) ? 0.0 : _absmulT_norm(A, av)
     rDu  = norm(Qy + (G' * w - A' * v) - c) / (1 + max(norm(c), nQy, nGw, nAv))
     rPr  = isempty(b) ? 0.0 :
-           norm(A * y - s - b) / (1 + max(norm(b), norm(absA * ay), norm(s)))
+           norm(A * y - s - b) / (1 + max(norm(b), _absmul_norm(A, ay), norm(s)))
     rEq  = isempty(d) ? 0.0 :
-           norm(G * y - d) / (1 + max(norm(d), norm(absG * ay)))
+           norm(G * y - d) / (1 + max(norm(d), _absmul_norm(G, ay)))
     pobj = 0.5 * dot(y, Qy) - cᵀy
     dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, v)
     sol.duFeas = rDu

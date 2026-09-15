@@ -121,27 +121,81 @@ end
 
 # Convexity guard for the objective: the solver assumes ½yᵀQy is convex,
 # so `Q` (already sign-adjusted for the sense) must be positive
-# semidefinite. A Cholesky attempt on Q + δI with δ tiny relative to the
-# entries accepts singular PSD Hessians (a diagonal with zeros, or the
-# Maros–Mészáros rank-deficient QPs) and rejects indefinite ones.
+# semidefinite. The decision is made in this order, each step exact:
+#
+#   1. a nonfinite entry, or a negative diagonal entry, is not PSD;
+#   2. a Hessian whose only nonzeros are on the diagonal is PSD exactly
+#      when that diagonal is nonnegative — no factorization at all, which
+#      is the common case for separable QPs;
+#   3. a zero diagonal entry of a PSD matrix forces a zero row and column,
+#      so a nonzero off it is a rejection;
+#   4. otherwise a sparse Cholesky attempt on Q + δI, with the positive
+#      diagonal congruence-scaled to one first (a large, unrelated block
+#      must not hide negative curvature elsewhere) and δ tiny relative to
+#      the entries, so that singular PSD Hessians (a diagonal with zeros,
+#      or the Maros–Mészáros rank-deficient QPs) still pass.
+#
+# Steps 1-3 are one pass each over the stored values; step 4 costs one
+# sparse factorization, fed only the upper triangle CHOLMOD reads.
 function _is_psd(Q::SparseMatrixCSC{Float64, Int})
     nnz(Q) == 0 && return true
     all(isfinite, nonzeros(Q)) || return false
-    dq = diag(Q)
+    n = size(Q, 2)
+    colptr = Q.colptr; rows = rowvals(Q); vals = nonzeros(Q)
+    dq = zeros(n)
+    offdiag = false
+    @inbounds for j in 1:n, t in colptr[j]:colptr[j+1]-1
+        i = rows[t]
+        if i == j
+            dq[j] = vals[t]
+        elseif vals[t] != 0
+            offdiag = true
+        end
+    end
     any(<(0), dq) && return false
-    # For a PSD matrix, a zero diagonal implies a zero row and column.
-    # Congruence-scale the positive diagonal to one before shifting;
-    # a large, unrelated block must not hide negative curvature elsewhere.
-    for j in axes(Q, 2), t in nzrange(Q, j)
-        i = rowvals(Q)[t]
-        if (dq[i] == 0 || dq[j] == 0) && nonzeros(Q)[t] != 0
+    offdiag || return true
+    @inbounds for j in 1:n, t in colptr[j]:colptr[j+1]-1
+        i = rows[t]
+        if (dq[i] == 0 || dq[j] == 0) && vals[t] != 0
             return false
         end
     end
-    scale = [x > 0 ? 1 / sqrt(x) : 1.0 for x in dq]
-    Qs = Diagonal(scale) * Q * Diagonal(scale)
-    F = cholesky(Symmetric(Qs); shift = 2e-10, check = false)
+    scale = similar(dq)
+    @inbounds for i in 1:n
+        x = dq[i]
+        scale[i] = x > 0 ? 1 / sqrt(x) : 1.0
+    end
+    F = cholesky(Symmetric(_scaled_upper_triangle(Q, scale), :U);
+                 shift = 2e-10, check = false)
     return issuccess(F)
+end
+
+# The upper triangle of Diagonal(s) * Q * Diagonal(s), as a sparse matrix.
+# `Symmetric(·, :U)` hands CHOLMOD a symmetric-stype matrix, which reads
+# the upper triangle and ignores the rest, so the lower half never needs
+# to be built or scaled.
+function _scaled_upper_triangle(Q::SparseMatrixCSC{Float64, Int}, s::Vector{Float64})
+    n = size(Q, 2)
+    colptr = Q.colptr; rows = rowvals(Q); vals = nonzeros(Q)
+    cp = Vector{Int}(undef, n + 1); cp[1] = 1
+    @inbounds for j in 1:n
+        k = 0
+        for t in colptr[j]:colptr[j+1]-1
+            rows[t] <= j && (k += 1)
+        end
+        cp[j+1] = cp[j] + k
+    end
+    rv = Vector{Int}(undef, cp[n+1] - 1)
+    nz = Vector{Float64}(undef, cp[n+1] - 1)
+    @inbounds for j in 1:n
+        k = cp[j]; sj = s[j]
+        for t in colptr[j]:colptr[j+1]-1
+            i = rows[t]
+            i <= j || continue
+            rv[k] = i; nz[k] = (s[i] * vals[t]) * sj; k += 1
+        end
+    end
+    return SparseMatrixCSC(n, n, cp, rv, nz)
 end
 
 const _NONCONVEX_MESSAGE =
@@ -326,13 +380,59 @@ end
 _Triplets() = _Triplets(Int[], Int[], Float64[], Float64[])
 _nrows(t::_Triplets) = length(t.rhs)
 
+# Column of a variable. `cols` is indexed by `VariableIndex.value` and
+# built once per `optimize!` by `_variable_columns`; it is the identity in
+# all but name whenever the caller's indices are already 1:n, which is
+# what every MOI.Utilities cache hands us.
+@inline _col(cols::Vector{Int}, vi::MOI.VariableIndex) = @inbounds cols[vi.value]
+
+# Columns of the variables of `model`, indexed by `VariableIndex.value`,
+# together with the variables themselves. The k-th variable of
+# `ListOfVariableIndices()` takes column k, the numbering a `copy_to` into
+# a fresh cache would have assigned. Returns `nothing` when the index
+# values are not a usable index range (nonpositive, or so spread out after
+# deletions that the lookup would dwarf the model), in which case
+# `optimize!` normalizes through a cache copy instead.
+function _variable_columns(model::MOI.ModelLike)
+    vars = MOI.get(model, MOI.ListOfVariableIndices())
+    n = length(vars)
+    maxv = 0
+    for v in vars
+        v.value > 0 || return nothing
+        maxv = max(maxv, v.value)
+    end
+    maxv > 100 * n + 10_000 && return nothing
+    cols = zeros(Int, maxv)
+    for (k, v) in enumerate(vars)
+        cols[v.value] = k
+    end
+    return (cols, vars)
+end
+
+# Index map of a `src` read in place: the k-th variable becomes column k
+# (the result vectors are indexed by column, exactly as when a `copy_to`
+# did the renumbering), while constraints keep the caller's own indices,
+# which is what this wrapper's `eq_ci_map` / `ineq_ci_map` are keyed by.
+function _column_index_map(model::MOI.ModelLike, vars::Vector{MOI.VariableIndex})
+    map = MOI.Utilities.IndexMap()
+    for (k, v) in enumerate(vars)
+        map[v] = MOI.VariableIndex(k)
+    end
+    for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
+        for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
+            map[ci] = ci
+        end
+    end
+    return map
+end
+
 # Append the rows of `sign * f(x) + rhs_shift` with `f` a vector function.
 # `rowmap[k]` gives the local row for output index k and `rowscale[k]` a
 # per-row factor (the PSD triangle permutation and √2 scaling); both are
 # `nothing` for the identity. The constants of `f` are appended to the
 # accumulator's rhs *negated* (the solver's convention is A y ≥ b,
 # G y = d with the constant moved to the right-hand side).
-function _append_vector!(t::_Triplets, f, dim::Int, sign::Float64;
+function _append_vector!(t::_Triplets, cols::Vector{Int}, f, dim::Int, sign::Float64;
                          rowmap = nothing, rowscale = nothing)
     r0 = _nrows(t)
     resize!(t.rhs, r0 + dim)
@@ -343,7 +443,7 @@ function _append_vector!(t::_Triplets, f, dim::Int, sign::Float64;
         for (k, vi) in enumerate(f.variables)
             row = rowmap === nothing ? k : rowmap[k]
             sc  = rowscale === nothing ? 1.0 : rowscale[k]
-            push!(t.I, r0 + row); push!(t.J, vi.value); push!(t.V, sign * sc)
+            push!(t.I, r0 + row); push!(t.J, _col(cols, vi)); push!(t.V, sign * sc)
         end
     else  # VectorAffineFunction
         for term in f.terms
@@ -351,7 +451,7 @@ function _append_vector!(t::_Triplets, f, dim::Int, sign::Float64;
             row = rowmap === nothing ? k : rowmap[k]
             sc  = rowscale === nothing ? 1.0 : rowscale[k]
             push!(t.I, r0 + row)
-            push!(t.J, term.scalar_term.variable.value)
+            push!(t.J, _col(cols, term.scalar_term.variable))
             push!(t.V, sign * sc * term.scalar_term.coefficient)
         end
         for (k, ck) in enumerate(f.constants)
@@ -365,15 +465,15 @@ end
 
 # Append one row `sign * f(x)` with `f` scalar; the constant of `f` and the
 # set's bound go to the rhs as `sign * (bound − constant)`.
-function _append_scalar!(t::_Triplets, f, sign::Float64, bound::Float64)
+function _append_scalar!(t::_Triplets, cols::Vector{Int}, f, sign::Float64, bound::Float64)
     r = _nrows(t) + 1
     const_f = 0.0
     if f isa MOI.VariableIndex
-        push!(t.I, r); push!(t.J, f.value); push!(t.V, sign)
+        push!(t.I, r); push!(t.J, _col(cols, f)); push!(t.V, sign)
     else
         const_f = f.constant
         for term in f.terms
-            push!(t.I, r); push!(t.J, term.variable.value)
+            push!(t.I, r); push!(t.J, _col(cols, term.variable))
             push!(t.V, sign * term.coefficient)
         end
     end
@@ -447,24 +547,19 @@ end
 #  optimize!
 # ──────────────────────────────────────────────────────────────
 
-function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
-    MOI.empty!(dest)
-    t_start = time()
-    # Opt-in phase timing: everything this wrapper does around the solver
-    # call (assembly, the Hessian check, the result products) is front-end
-    # work, charged to `t_frontend`; the solver fills the other phases.
-    pt = get(dest.options, "timing", nothing)
-    gc0 = gc_start(pt)
-    t_front = time_ns()
-
-    model = MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}())
-    index_map = MOI.copy_to(model, src)
-
-    n = MOI.get(model, MOI.NumberOfVariables())
+# Build the solver's data `(Q, c, A, b, cone_dims, G, d)` from `model`,
+# whose k-th variable occupies column `cols[k-th index value]`, and fill
+# the constraint-tracking fields of `dest`. This is a function barrier:
+# `model` and `cols` are concrete inside, so the MOI getters and the term
+# loops are statically dispatched however `optimize!` obtained the model.
+function _assemble_model!(dest::Optimizer, model, cols::Vector{Int}, n::Int)
     dest.n = n
 
     # ── Objective ──
-    sense = MOI.get(model, MOI.ObjectiveSense())
+    # `model` is any ModelLike, so the getters are annotated with the types
+    # the MOI attributes are documented to return; without them inference
+    # widens to Any and every comparison below admits `missing`.
+    sense = MOI.get(model, MOI.ObjectiveSense())::MOI.OptimizationSense
     dest.max_sense = (sense == MOI.MAX_SENSE)
 
     # MOI objective: ½xᵀQx + aᵀx + const (Q symmetric; a diagonal quadratic
@@ -473,21 +568,24 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     obj_constant = 0.0
     QI = Int[]; QJ = Int[]; QV = Float64[]
     # A feasibility model ignores any objective retained in the cache.
-    obj_type = sense == MOI.FEASIBILITY_SENSE ? Nothing : MOI.get(model, MOI.ObjectiveFunctionType())
+    obj_type = sense == MOI.FEASIBILITY_SENSE ? Nothing :
+               MOI.get(model, MOI.ObjectiveFunctionType())::Type
     if obj_type == MOI.ScalarAffineFunction{Float64}
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
         obj_constant = obj.constant
         for term in obj.terms
-            c_moi[term.variable.value] += term.coefficient
+            c_moi[_col(cols, term.variable)] += term.coefficient
         end
     elseif obj_type == MOI.ScalarQuadraticFunction{Float64}
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
         obj_constant = obj.constant
         for term in obj.affine_terms
-            c_moi[term.variable.value] += term.coefficient
+            c_moi[_col(cols, term.variable)] += term.coefficient
         end
+        nq = length(obj.quadratic_terms)
+        sizehint!(QI, 2nq); sizehint!(QJ, 2nq); sizehint!(QV, 2nq)
         for term in obj.quadratic_terms
-            i = term.variable_1.value; j = term.variable_2.value
+            i = _col(cols, term.variable_1); j = _col(cols, term.variable_2)
             push!(QI, i); push!(QJ, j); push!(QV, term.coefficient)
             if i != j
                 push!(QI, j); push!(QJ, i); push!(QV, term.coefficient)
@@ -495,7 +593,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         end
     elseif obj_type == MOI.VariableIndex
         obj = MOI.get(model, MOI.ObjectiveFunction{MOI.VariableIndex}())
-        c_moi[obj.value] = 1.0
+        c_moi[_col(cols, obj)] = 1.0
     end
     dest.objective_constant = obj_constant
 
@@ -538,19 +636,19 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                 dim = MOI.output_dimension(f)
                 if S <: MOI.Zeros
                     # f(x) = 0:  G = A_f, d = -const
-                    rows = _append_vector!(tG, f, dim, 1.0)
+                    rows = _append_vector!(tG, cols, f, dim, 1.0)
                     record_eq!(ci, rows, 0.0, false)
                 elseif S <: MOI.Nonnegatives
-                    rows = _append_vector!(tA, f, dim, 1.0)
+                    rows = _append_vector!(tA, cols, f, dim, 1.0)
                     _push_orthant!(cone_dims, dim)
                     record_ineq!(ci, rows, 1.0, 0.0, false, false)
                 elseif S <: MOI.Nonpositives
                     # f(x) ≤ 0  →  -f(x) ≥ 0
-                    rows = _append_vector!(tA, f, dim, -1.0)
+                    rows = _append_vector!(tA, cols, f, dim, -1.0)
                     _push_orthant!(cone_dims, dim)
                     record_ineq!(ci, rows, -1.0, 0.0, false, false)
                 elseif S <: MOI.SecondOrderCone
-                    rows = _append_vector!(tA, f, dim, 1.0)
+                    rows = _append_vector!(tA, cols, f, dim, 1.0)
                     push!(cone_dims, ("Q", dim))
                     record_ineq!(ci, rows, 1.0, 0.0, false, false)
                 elseif S <: MOI.PositiveSemidefiniteConeTriangle
@@ -559,7 +657,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                     # the triplets directly.
                     perm, is_offdiag = _psd_moi_vecm_info(dim)
                     scale = [od ? √2 : 1.0 for od in is_offdiag]
-                    rows = _append_vector!(tA, f, dim, 1.0;
+                    rows = _append_vector!(tA, cols, f, dim, 1.0;
                                            rowmap = perm, rowscale = scale)
                     push!(cone_dims, ("S", dim))
                     record_ineq!(ci, rows, 1.0, 0.0, false, true)
@@ -568,17 +666,17 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
             elseif F <: Union{MOI.ScalarAffineFunction{Float64}, MOI.VariableIndex}
                 if S <: MOI.EqualTo{Float64}
                     rhs = MOI.constant(s)
-                    rows = _append_scalar!(tG, f, 1.0, rhs)
+                    rows = _append_scalar!(tG, cols, f, 1.0, rhs)
                     record_eq!(ci, rows, rhs, true)
                 elseif S <: MOI.GreaterThan{Float64}
                     lower = MOI.constant(s)
-                    rows = _append_scalar!(tA, f, 1.0, lower)
+                    rows = _append_scalar!(tA, cols, f, 1.0, lower)
                     _push_orthant!(cone_dims, 1)
                     record_ineq!(ci, rows, 1.0, lower, true, false)
                 elseif S <: MOI.LessThan{Float64}
                     # f(x) ≤ u  →  -f(x) ≥ -u
                     upper = MOI.constant(s)
-                    rows = _append_scalar!(tA, f, -1.0, upper)
+                    rows = _append_scalar!(tA, cols, f, -1.0, upper)
                     _push_orthant!(cone_dims, 1)
                     record_ineq!(ci, rows, -1.0, upper, true, false)
                 end
@@ -592,6 +690,39 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.cone_dims = cone_dims
     dest.eq_G = G;   dest.eq_d = d
     dest.ineq_A = A; dest.ineq_b = b
+    return Q, c_int, A, b, cone_dims, G, d
+end
+
+function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
+    MOI.empty!(dest)
+    t_start = time()
+    # Opt-in phase timing: everything this wrapper does around the solver
+    # call (assembly, the Hessian check, the result products) is front-end
+    # work, charged to `t_frontend`; the solver fills the other phases.
+    pt = get(dest.options, "timing", nothing)
+    gc0 = gc_start(pt)
+    t_front = time_ns()
+
+    # Read `src` where it stands. Copying it into a private cache first
+    # would duplicate every term vector in the model — the dominant
+    # front-end cost on large instances — and buys only the renumbering of
+    # the variables, which `_variable_columns` does in one pass and
+    # `_column_index_map` reports back to the caller. The copy stays as the
+    # fallback for a model whose variable index values are not a usable
+    # index range.
+    vc = _variable_columns(src)
+    if vc === nothing
+        model = MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}())
+        index_map = MOI.copy_to(model, src)
+        n = MOI.get(model, MOI.NumberOfVariables())
+        Q, c_int, A, b, cone_dims, G, d =
+            _assemble_model!(dest, model, collect(1:n), n)
+    else
+        cols, vars = vc
+        n = length(vars)
+        index_map = _column_index_map(src, vars)
+        Q, c_int, A, b, cone_dims, G, d = _assemble_model!(dest, src, cols, n)
+    end
     dest.assembly_time = time() - t_start
 
     # Assembly only: the matrices are available through the fields above;
