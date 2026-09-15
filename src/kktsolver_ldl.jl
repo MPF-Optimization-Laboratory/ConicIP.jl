@@ -507,7 +507,12 @@ function kktsolver_ldl(Q, A, G, cone_dims;
         end
       end
       diag.last_residual = rbest
-      return (sol[1:n], sol[n+1:n+p], sol[oz+1:oz+m])
+      # Views, not slices: three copies of the solution per back-solve were
+      # the third-largest allocation site in the loop. The documented
+      # contract lets a backend hand back views of its own workspace — the
+      # main loop copies what it needs out before calling again — but a
+      # caller that keeps a result across two solves must copy it itself.
+      return (view(sol, 1:n), view(sol, (n+1):(n+p)), view(sol, (oz+1):(oz+m)))
     end
 
     return LDLSolve3x3(solve3x3, bump!, diag)

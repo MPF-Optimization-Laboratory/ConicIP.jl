@@ -817,6 +817,11 @@ solves the system
 └             ┘ └   ┘   └   ┘
 ```
 
+`a`, `b` and `c` may be fresh vectors or views into the solver's own
+workspace, valid only until the next call to `L` — `conicIP` copies them
+into its direction buffers before calling again. [`kktsolver_ldl`](@ref)
+returns views; the other built-in solvers return fresh vectors.
+
 We can also wrap a 2x2 solver using pivot3gen(solve2x2gen)
 The 2x2 solves the system
 
@@ -978,6 +983,22 @@ function _conicIP(
   # rleft.s / r0.s for the whole iteration and must not be overwritten.
   _res_buf1  = zeros(m)
   _res_buf2  = zeros(m)
+  # Block products F*Δv and F⁻ᵀ*Δs inside step_residual!; kept apart from
+  # _res_buf1/_res_buf2 because the cone product that consumes them must
+  # not alias its own output.
+  _res_buf3  = zeros(m)
+  _res_buf4  = zeros(m)
+  # solve4x4! scratch: the v-block right-hand side handed to solve3x3, and
+  # the two Block products of the Δs recovery. All three are live only for
+  # the duration of one solve.
+  _s3_rhs    = zeros(m)
+  _dir_buf1  = zeros(m)
+  _dir_buf2  = zeros(m)
+  # Corrector right-hand side: the two Block products of d_aff, and the
+  # s-block itself (its y/w/v blocks alias r0's).
+  _rhs_buf1  = zeros(m)
+  _rhs_buf2  = zeros(m)
+  _rhs_s     = zeros(m)
   # Trial iterate for the interiority check of the line search
   _trial_v   = zeros(m)
   _trial_s   = zeros(m)
@@ -986,14 +1007,24 @@ function _conicIP(
   # Best step seen so far during refinement (restored when a correction
   # increases the residual)
   _Δz_keep = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  # The directions the loop owns. `solve4x4!` writes into the buffer it is
+  # given, so each direction that has to outlive another needs its own:
+  # the predictor d_aff is still read while the corrector rhs is formed,
+  # the corrector Δz is read by the line search and by every refinement
+  # residual, and the refinement correction Δzr is consumed immediately.
+  _d_aff = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  _Δz    = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+  _Δzr   = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   # Centrality-corrector scratch (allocated only when the option is on):
   # trial scaled iterates ṽ, s̃, their product w, the correction Δw, the
   # corrector right-hand side (zero except the s block), and the candidate
   # direction Δz + Δz_c.
   if centralityCorrectors > 0
     _cc_v  = zeros(m); _cc_s = zeros(m); _cc_w = zeros(m); _cc_dw = zeros(m)
+    _cc_b1 = zeros(m); _cc_b2 = zeros(m)   # FΔv and F⁻ᵀΔs
     _cc_r  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
     _cc_Δz = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
+    _Δz_c  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   end
 
   # KKT back-solve counter, reported as Solution.kkt_solves
@@ -1288,7 +1319,7 @@ function _conicIP(
   function solve4x4gen(λ, F, F⁻ᵀ, solve3x3gen = solve3x3gen)
 
     #
-    # solve4x4gen(λ, F)(r) solves the 4x4 KKT System
+    # solve4x4gen(λ, F)(out, r) solves the 4x4 KKT System into `out`
     # ┌                  ┐ ┌    ┐   ┌     ┐
     # │ Q   G'  -A'      │ │ Δy │ = │ r.y │
     # │ G                │ │ Δw │   │ r.w │ S = block(λ)*F
@@ -1307,15 +1338,26 @@ function _conicIP(
       kkt_attach_timing!(solve3x3, timing)
     end
 
-    function solve4x4(r)
+    # The direction is written into the caller's `out`; nothing on this
+    # path allocates (bar an SDP scaling block's cone products). `out.s`
+    # doubles as the t1 scratch, so `out` must not alias `r` — every call
+    # site pairs a distinct preallocated direction with its right-hand
+    # side. The three vectors a backend's solve3x3 returns may be views
+    # into its own workspace, so they are copied out before that workspace
+    # is touched again.
+    function solve4x4!(out::v4x1, r)
 
       _nsolve[] += 1
       timing === nothing || (timing.n_solve += 1)
       cone_div!(_div_buf, r.s, λ)
-      t1 = F'*_div_buf
-      (Δy, Δw, Δv)  = solve3x3(r.y, r.w, r.v + t1)
-      axpy!(-1, F'*(F*Δv), t1) # > Δs = t1 - F*(F*Δv)
-      return v4x1(Δy,Δw,Δv,t1)
+      mul_adjoint!(out.s, F, _div_buf)    # t1 = F'*(r.s ○\ λ)
+      _s3_rhs .= r.v .+ out.s
+      (Δy, Δw, Δv)  = solve3x3(r.y, r.w, _s3_rhs)
+      copyto!(out.y, Δy); copyto!(out.w, Δw); copyto!(out.v, Δv)
+      mul!(_dir_buf1, F, out.v)
+      mul_adjoint!(_dir_buf2, F, _dir_buf1)
+      axpy!(-1, _dir_buf2, out.s)         # > Δs = t1 - F'*(F*Δv)
+      return out
 
     end
 
@@ -1342,7 +1384,7 @@ function _conicIP(
     return x
   end
   z  = try
-    solve4x4gen(e,I,I)(r_init)
+    solve4x4gen(e,I,I)(v4x1(zeros(n), zeros(p), zeros(m), zeros(m)), r_init)
   catch err
     err isa KKT_FAILURES || rethrow()
     return exit_init(errsol(kkt_error("initial point", err)))
@@ -1787,8 +1829,10 @@ function _conicIP(
     # left in the preallocated _rIr:
     #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
     function step_residual!(Δz, r)
-      cone_prod!(_res_buf1, λ, F*Δz.v)
-      cone_prod!(_res_buf2, λ, F⁻ᵀ*Δz.s)
+      mul!(_res_buf3, F, Δz.v)
+      cone_prod!(_res_buf1, λ, _res_buf3)
+      mul!(_res_buf4, F⁻ᵀ, Δz.s)
+      cone_prod!(_res_buf2, λ, _res_buf4)
       mul!(_rkkt.y, Q, Δz.y)
       mul!(_rkkt.y, Gᵀ, Δz.w, 1.0, 1.0)
       mul!(_rkkt.y, Aᵀ, Δz.v, -1.0, 1.0)
@@ -1825,7 +1869,7 @@ function _conicIP(
       while k < maxRefinementSteps && rres > rtol
         timing === nothing || (timing.n_refine_attempt += 1)
         Δzr = guarded("refinement, $stage") do
-          solve(_rIr)
+          solve(_Δzr, _rIr)
         end
         Δzr === nothing && return false
         if !isfinite4(Δzr)
@@ -1853,7 +1897,7 @@ function _conicIP(
     # t_direction covers the base solve (also t_dir_base) and the
     # refinement; the finiteness checks between them are left out.
     d_aff = @phase timing t_direction b_direction @phase timing t_dir_base guarded("predictor, iteration $Iter") do
-      solve(r0)
+      solve(_d_aff, r0)
     end
     d_aff === nothing && return exit_loop(sol)
     isfinite4(d_aff) ||
@@ -1881,15 +1925,19 @@ function _conicIP(
     #  Corrector
     # ────────────────────────────────────────────────────────────
 
-    F⁻ᵀdfs = F⁻ᵀ*d_aff.s
-    Fdfs   = F*d_aff.v
+    F⁻ᵀdfs = mul!(_rhs_buf1, F⁻ᵀ, d_aff.s)
+    Fdfs   = mul!(_rhs_buf2, F, d_aff.v)
 
     # >> lc = -(F⁻ᵀdfs ∘ Fdfs) + (σ*μ)[1]*e;
     cone_prod!(_prod_buf2, F⁻ᵀdfs, Fdfs); lc = _prod_buf2
     axpy!(-σ*μ, e, lc);
     scal!(length(e), -1., lc, 1)
 
-    v4x1(r0.y, r0.w, r0.v, rleft.s - lc)
+    # The y, w and v blocks are r0's (read only from here on); the s block
+    # is the loop's own buffer, distinct from rleft.s (_prod_buf1) and
+    # from lc (_prod_buf2).
+    _rhs_s .= rleft.s .- lc
+    v4x1(r0.y, r0.w, r0.v, _rhs_s)
 
     end # @phase t_rhs
 
@@ -1898,7 +1946,7 @@ function _conicIP(
     # ────────────────────────────────────────────────────────────
 
     Δz = @phase timing t_direction b_direction @phase timing t_dir_base guarded("corrector, iteration $Iter") do
-      solve(r)
+      solve(_Δz, r)
     end
     Δz === nothing && return exit_loop(sol)
     isfinite4(Δz) ||
@@ -1957,8 +2005,8 @@ function _conicIP(
         # (σ = 0, or μ ≤ 0) leaves no box to aim for.
         cc_go = α̃ > α && σμ > 0
         if cc_go
-          _cc_v .= λ .- α̃ .* (F*Δz.v)
-          _cc_s .= λ .- α̃ .* (F⁻ᵀ*Δz.s)
+          mul!(_cc_b1, F,   Δz.v); _cc_v .= λ .- α̃ .* _cc_b1
+          mul!(_cc_b2, F⁻ᵀ, Δz.s); _cc_s .= λ .- α̃ .* _cc_b2
           cone_prod!(_cc_w, _cc_v, _cc_s)
           centrality_correction!(_cc_dw, _cc_w, GONDZIO_βmin*σμ, GONDZIO_βmax*σμ,
                                  GONDZIO_βmax*σμ, cone_dims)
@@ -1970,7 +2018,7 @@ function _conicIP(
         @phase_stop timing t_linesearch b_linesearch t_cc0 b_cc0
         cc_go || break
         Δz_c = @phase timing t_direction b_direction guarded("centrality corrector, iteration $Iter") do
-          solve(_cc_r)
+          solve(_Δz_c, _cc_r)
         end
         Δz_c === nothing && return exit_loop(sol)
         isfinite4(Δz_c) || break
