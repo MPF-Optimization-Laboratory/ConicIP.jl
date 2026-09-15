@@ -970,5 +970,21 @@
     @test all(iszero, small.zn) && all(iszero, small.sn)
     @test all(iszero, small.ij) && all(iszero, small.iw)
 
+    # ── SOC block sizing is static: a warmed product allocates nothing ──
+    # `size(Blk, 1)` on the non-concrete union member was a dynamic call,
+    # 16 B per product at block dimension 1024.
+    function blk_mul_alloc(f!, B, y, x)
+      f!(y, B, x); f!(y, B, x)
+      return @allocated f!(y, B, x)
+    end
+    nq = 1024
+    zq = [10.0; fill(0.001, nq - 1)]; sq = [12.0; fill(0.002, nq - 1)]
+    Bq = Block([ConicIP.nestod_soc(zq, sq)])
+    @test Bq.Blocks[1] isa ConicIP.SOCBlock
+    @test size(Bq) == (nq, nq)
+    yq = zeros(nq); xq = randn(nq)
+    @test blk_mul_alloc(mul!, Bq, yq, xq) == 0
+    @test blk_mul_alloc(ConicIP.mul_adjoint!, Bq, yq, xq) == 0
+    @test blk_mul_alloc(mul!, Block([Diagonal(rand(nq))]), yq, xq) == 0
   end
 end

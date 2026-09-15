@@ -51,9 +51,32 @@ mutable struct Block <: AbstractMatrix{Real}
 
 end
 
+# Row count of one block, taken from the concrete types first: `size` on a
+# `BlockElem` is a dynamic call (the union's `SymWoodbury{Float64}` member is
+# not concrete), and the in-place product below needs the total dimension on
+# every call, before its unchecked loop.
+@inline function _blk_dim(Blk)
+  if Blk isa DiagBlock
+    return length(Blk.diag)
+  elseif Blk isa SOCBlock
+    return length(Blk.A.diag)
+  else
+    return size(Blk, 1)::Int
+  end
+end
+
+# Total row (= column) count, summed without materializing a comprehension.
+function _block_dim(A::Block)
+  n = 0
+  @inbounds for i in eachindex(A.Blocks)
+    n += _blk_dim(A.Blocks[i])
+  end
+  return n
+end
+
 function Base.size(A::Block)
   if length(A.Blocks) == 0; return (0,0); end
-  n = sum([size(B,1) for B in A.Blocks])
+  n = _block_dim(A)
   return (n,n)
 end
 
@@ -243,29 +266,32 @@ end
 function _block_mul!(y::AbstractVector, A::Block, x::AbstractVector, adj::Bool)
   # Every dimension is checked BEFORE the loop: the loop writes `y[off+t]`
   # with `@inbounds`, so a destination shorter than the blocks span would
-  # corrupt memory past its end and only then reach a check. `size(A, 1)`
-  # sums the block sizes, O(#blocks) against the O(n) product. The loop also
-  # indexes from 1, so an offset-axes argument is refused rather than misread.
+  # corrupt memory past its end and only then reach a check. `_block_dim` is
+  # O(#blocks), negligible against the O(n) product. The loop also indexes
+  # from 1, so an offset-axes argument is refused rather than misread.
   Base.require_one_based_indexing(y, x)
-  n = size(A, 1)
+  n = _block_dim(A)
   (length(y) == length(x) == n) ||
     throw(DimensionMismatch("Block product: blocks span $n rows, destination " *
                             "has length $(length(y)), source $(length(x))"))
   off = 0
   @inbounds for i in eachindex(A.Blocks)
     Blk = A.Blocks[i]
-    # ::Int matters: `size(::SymWoodbury{Float64}, 1)` is inferred as Any
-    # (the type is not concrete), which would make `off` — and with it every
-    # index below — dynamic, and box the loop.
-    k = size(Blk, 1)::Int
+    # The size comes out of the concrete branches: `size(::SymWoodbury{Float64},
+    # 1)` is a dynamic call (the type is not concrete), and paying it per block
+    # on every product costs both the dispatch and, at large block dimensions,
+    # an allocation.
     if Blk isa DiagBlock
       d = Blk.diag
+      k = length(d)
       for t = 1:k
         y[off+t] = d[t] * x[off+t]
       end
     elseif Blk isa SOCBlock
+      k = length(Blk.A.diag)
       _blk_mul!(view(y, (off+1):(off+k)), Blk, view(x, (off+1):(off+k)), adj)
     else
+      k = size(Blk, 1)::Int
       rng = (off+1):(off+k)
       _blk_mul!(view(y, rng), Blk, view(x, rng), adj)
     end
