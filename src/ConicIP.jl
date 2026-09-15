@@ -155,6 +155,16 @@ function _absprod_norm!(out, M, x, D = nothing, σ = 1.0)
   return norm(out) / σ
 end
 
+# ‖x ./ D‖ for a positive diagonal D (vector), formed through `buf` so that
+# `norm` sees exactly the vector the allocating `norm(x ./ D)` handed it —
+# the value is bit-identical, the temporary is not allocated. `normsafe`'s
+# convention for an empty block is kept.
+function _norm_div!(buf, x, D)
+  isempty(x) && return 0.0
+  buf .= x ./ D
+  return norm(buf)
+end
+
 # Largest row-wise relative residual of a block of rows,
 #   max_i |r_i| / (1 + |b_i| + prod_i + |s_i|),
 # with `prod` the componentwise product |M||y| already in the original
@@ -1301,6 +1311,24 @@ function _conicIP(
   # Scratch for those products: |y|, |w|, |v| and the outputs
   _absy = zeros(n); _absw = zeros(p); _absv = zeros(m)
   _nrm_n = zeros(n); _nrm_m = zeros(m); _nrm_p = zeros(p)
+  # Scratch owned by the residual/termination span. `rleft` and `r0` are
+  # v4x1 shells around these (v4x1 aliases, it never copies), so every
+  # block needs its own buffer and none may be reused inside a pass:
+  #   _Qy    Q*y, read again by pobj/dobj, the convexity guard and the
+  #          dual-infeasibility screen;
+  #   _GwAv  Gᵀw − Aᵀv, read again by the primal-infeasibility screen;
+  #   _rl_y/_rl_w/_rl_v  the y/w/v blocks of rleft (rleft.s is _prod_buf1,
+  #          which the corrector right-hand side also reads);
+  #   _r0_y/_r0_w/_r0_v  the same blocks of r0. The corrector right-hand
+  #          side aliases these three by reference and the refinement
+  #          reads them, so they stay live for the whole pass and are
+  #          overwritten only at the top of the next one.
+  # _div_n/_div_m/_div_p are one-shot scratch for the ‖x ./ D‖ of the
+  # equilibrated branch, dead again as soon as the norm is taken.
+  _Qy    = zeros(n); _GwAv = zeros(n)
+  _rl_y  = zeros(n); _rl_w = zeros(p); _rl_v = zeros(m)
+  _r0_y  = zeros(n); _r0_w = zeros(p); _r0_v = zeros(m)
+  _div_n = zeros(n); _div_m = zeros(m); _div_p = zeros(p)
 
   # Sanity Checks
   ◂ = nothing
@@ -1798,9 +1826,16 @@ function _conicIP(
     # Products of the iterate with the data, each formed once per
     # iteration and shared by the residuals, the objective, and the
     # infeasibility screens.
+    # Every product lands in a buffer the loop owns (see the declarations
+    # above); the only allocation left is the O(1) v4x1 shell. The second
+    # `mul!` accumulates with β = 1, which on both the sparse and the dense
+    # path forms the full row product before adding it to the output, so
+    # `Gᵀw − Aᵀv` is computed exactly as the two separate products and a
+    # subtraction were.
     rleft = @phase timing t_residuals b_residuals begin
-      Qy   = Q*z.y
-      Gᵀw_Aᵀv = Gᵀ*z.w - Aᵀ*z.v
+      Qy = mul!(_Qy, Q, z.y)
+      mul!(_GwAv, Gᵀ, z.w)
+      Gᵀw_Aᵀv = mul!(_GwAv, Aᵀ, z.v, -1.0, 1.0)
 
       #         ┌                   ┐ ┌     ┐
       # rleft = │ Q   G'   -A'      │ │ z.y │
@@ -1809,14 +1844,19 @@ function _conicIP(
       #         │           S     V │ │ z.s │
       #         └                   ┘ └     ┘
       cone_prod!(_prod_buf1, λ, λ)
-      v4x1( Qy + Gᵀw_Aᵀv ,
-            G*z.y        ,
-            A*z.y - z.s  ,
-            _prod_buf1   )
+      _rl_y .= Qy .+ Gᵀw_Aᵀv
+      mul!(_rl_w, G, z.y)
+      mul!(_rl_v, A, z.y); _rl_v .-= z.s
+      v4x1(_rl_y, _rl_w, _rl_v, _prod_buf1)
     end
 
     # True Residual of nonlinear KKT System
-    r0 = @phase timing t_residuals b_residuals v4x1(rleft.y - c, rleft.w - d, rleft.v - b, rleft.s)
+    r0 = @phase timing t_residuals b_residuals begin
+      _r0_y .= _rl_y .- c
+      _r0_w .= _rl_w .- d
+      _r0_v .= _rl_v .- b
+      v4x1(_r0_y, _r0_w, _r0_v, _prod_buf1)
+    end
 
     # Residual norms, objectives, best-iterate bookkeeping, certificate
     # screens and the termination verdicts, as one span so that the
@@ -1901,11 +1941,14 @@ function _conicIP(
       nAv = _absprod_norm!(_nrm_n, absAᵀ, _absv, Dc, σs)
       nAy = _absprod_norm!(_nrm_m, absA,  _absy, Dr)
       nGy = _absprod_norm!(_nrm_p, absG,  _absy, De)
-      rDu = norm(r0.y ./ Dc)/σs / (1 + max(scaling.normc, nQy, nGw, nAv))
-      rPr = normsafe(r0.v ./ Dr) /
-            (1 + max(scaling.normb, nAy, normsafe(z.s ./ Dr)))
+      # `_norm_div!` is ‖x ./ D‖ through a scratch buffer: the same value
+      # the allocating quotient gave, without the temporary.
+      nr0v = _norm_div!(_div_m, r0.v, Dr)
+      nzsc = _norm_div!(_div_m, z.s, Dr)
+      rDu = _norm_div!(_div_n, r0.y, Dc)/σs / (1 + max(scaling.normc, nQy, nGw, nAv))
+      rPr = nr0v / (1 + max(scaling.normb, nAy, nzsc))
       rCp = normsafe(r0.s)/σs/(1+abs(cᵀy)/σs)
-      rEq = normsafe(r0.w ./ De) / (1 + max(scaling.normd, nGy))
+      rEq = _norm_div!(_div_p, r0.w, De) / (1 + max(scaling.normd, nGy))
       rGap = abs(μbar)/(σs + abs(pobj + σs*objective_offset))
     end
 
