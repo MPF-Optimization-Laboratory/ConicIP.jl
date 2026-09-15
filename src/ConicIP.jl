@@ -1278,14 +1278,25 @@ function _conicIP(
                                      :Error, 0, 0, Inf, Inf, Inf, NaN, NaN, false, msg,
                                      _nsolve[]))
 
-  if verbose && kktsolver === default_kktsolver
-    chosen = choose_kktsolver(Qᵣ, A, G, cone_dims)
+  # Route once when the default router is in charge: `default_kktsolver`
+  # would repeat this call, and so would the verbose line below, each time
+  # paying for a symbolic analysis and an AMD ordering of the KKT pattern.
+  routed = kktsolver === default_kktsolver ?
+           _choose_kktsolver(Qᵣ, A, G, cone_dims) : nothing
+
+  if verbose && routed !== nothing
     nnz_pc = (_structural_nnz(Q) + _structural_nnz(A) + _structural_nnz(G)) / max(n, 1)
-    @printf(" > KKT solver: %s (auto, %.1f nnz/col)\n", nameof(chosen), nnz_pc)
+    @printf(" > KKT solver: %s (auto, %.1f nnz/col)\n", nameof(routed[1]), nnz_pc)
   end
 
   solve3x3gen = try
-    kktsolver(Qᵣ,A,G,cone_dims)
+    if routed === nothing
+      kktsolver(Qᵣ,A,G,cone_dims)
+    elseif routed[2] === nothing
+      routed[1](Qᵣ,A,G,cone_dims)
+    else
+      kktsolver_ldl(Qᵣ,A,G,cone_dims; pattern = routed[2])
+    end
   catch err
     err isa KKT_FAILURES || rethrow()
     return exit_setup(errsol(kkt_error("solver setup", err)))
