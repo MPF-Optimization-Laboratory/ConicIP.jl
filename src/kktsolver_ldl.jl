@@ -121,13 +121,12 @@ function _dense_FtF(Blk::VecCongurance)
 end
 _dense_FtF(Blk::AbstractMatrix) = Blk'Blk
 
-# Position of the structural entry (i, j) in K.nzval (K upper triangular).
-function _nzindex(K::SparseMatrixCSC, i::Int, j::Int)
-  r = @view K.rowval[K.colptr[j]:K.colptr[j+1]-1]
-  t = searchsortedfirst(r, i)
-  (t <= length(r) && r[t] == i) || error("structural entry ($i,$j) missing")
-  return K.colptr[j] - 1 + t
-end
+# `sparse(M)` without the copy when M already is one. The pattern assembly
+# and the structure key below only read these matrices, and a
+# SparseMatrixCSC always stores each column's row indices in ascending
+# order, which is exactly what the CSC assembly needs.
+_csc(M::SparseMatrixCSC) = M
+_csc(M::AbstractMatrix)  = sparse(M)
 
 # y = K x for K stored as its upper triangle.
 function _symmul!(y, K::SparseMatrixCSC, x)
@@ -533,7 +532,7 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
                       perm_hint = nothing)
 
   n = size(Q, 1); m = size(A, 1); p = size(G, 1)
-  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  Qs = _csc(Q); As = _csc(A); Gs = _csc(G)
   qdiag = Vector{Float64}(diag(Qs))     # Q's diagonal before the δp shift
 
   ranges = cum_range([cd[2] for cd in cone_dims])
@@ -549,78 +548,152 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
   oz = n + p                      # offset of the z block
   oa = n + p + m                  # offset of the auxiliary block
 
-  # ── Upper-triangular pattern with placeholder values ──
-  Ii = Int[]; Jj = Int[]; Vv = Float64[]
-  function put!(i, j, v)
-    push!(Ii, i); push!(Jj, j); push!(Vv, v)
+  # The assembly below indexes K's columns straight from the source
+  # patterns, so a shape that does not fit the KKT block structure has to
+  # be rejected before the first @inbounds loop rather than inside it.
+  mcone = isempty(ranges) ? 0 : last(last(ranges))
+  (size(Qs, 2) == n && size(As, 2) == n && size(Gs, 2) == n && mcone == m) ||
+    throw(DimensionMismatch(
+      "_ldl_pattern: Q, A and G must have $n columns and cone_dims must " *
+      "cover all $m rows of A (got $(size(Qs, 2)), $(size(As, 2)), " *
+      "$(size(Gs, 2)) columns and $mcone cone rows)"))
+
+  # ── Upper triangle of K, assembled straight into CSC in O(nnz) ──
+  #
+  # Column layout (every column's rows come out ascending, because each
+  # source loop below runs over the source matrix column by column and the
+  # block entries of a column all sit below its data entries):
+  #
+  #   j ≤ n      strict upper triangle of Q's column j, then (j,j) = Qⱼⱼ + δp
+  #              (always present, whatever Q's pattern);
+  #   n + r      row r of G (as column r of Gᵀ), then (n+r, n+r) = −δe;
+  #   oz + i     column i of −Aᵀ, then the scaling entries of i's cone block;
+  #   oa + 2k∓1  a lifted block's two spike columns, then their pivots.
+  #
+  # Building the column counts first and filling through a per-column write
+  # cursor replaces the COO triplet list, its `sparse()` assembly, and the
+  # binary search that used to locate every scaling entry afterwards: the
+  # cursor *is* the index, so `blk_idx`, `qdiag_idx` and `ediag_idx` fall
+  # out of the same pass.
+  colptr = zeros(Int, N + 1)            # counts in colptr[c+1], cumsum below
+  @inbounds for j in 1:n
+    cnt = 1                             # the (j,j) entry, always present
+    for t in nzrange(Qs, j)
+      Qs.rowval[t] >= j && break
+      cnt += 1
+    end
+    colptr[j+1] = cnt
   end
-  rows, cols, vals = findnz(Qs)
-  for t in eachindex(rows)
-    rows[t] <= cols[t] && put!(rows[t], cols[t], vals[t])
+  @inbounds for j in 1:size(Gs, 2), t in nzrange(Gs, j)
+    colptr[n + Gs.rowval[t] + 1] += 1
   end
-  for i in 1:n
-    put!(i, i, δp)                # summed onto Qᵢᵢ by sparse()
+  @inbounds for r in 1:p
+    colptr[n + r + 1] += 1              # the −δe pivot
   end
-  rows, cols, vals = findnz(Gs)
-  for t in eachindex(rows)
-    put!(cols[t], n + rows[t], vals[t])
-  end
-  for r in 1:p
-    put!(n + r, n + r, -δe)
-  end
-  rows, cols, vals = findnz(As)
-  for t in eachindex(rows)
-    put!(cols[t], oz + rows[t], -vals[t])
+  @inbounds for j in 1:size(As, 2), t in nzrange(As, j)
+    colptr[oz + As.rowval[t] + 1] += 1
   end
   ilift = 0
-  for (kind, I) in zip(kinds, ranges)
-    if kind == :diag
-      for i in I; put!(oz + i, oz + i, -1.0); end
-    elseif kind == :dense
-      for b in I, a in first(I):b
-        put!(oz + a, oz + b, a == b ? -1.0 : 1.0)
-      end
+  @inbounds for (kind, I) in zip(kinds, ranges)
+    if kind == :dense
+      f = first(I)
+      for b in I; colptr[oz + b + 1] += b - f + 1; end
     else
-      ilift += 1
-      ca = oa + 2ilift - 1; cb = oa + 2ilift
-      for i in I
-        put!(oz + i, oz + i, -1.0)
-        put!(oz + i, ca, -1.0)
-        put!(oz + i, cb,  1.0)
+      for i in I; colptr[oz + i + 1] += 1; end
+      if kind == :lift
+        ilift += 1
+        colptr[oa + 2ilift] += length(I) + 1        # column oa + 2ilift − 1
+        colptr[oa + 2ilift + 1] += length(I) + 1    # column oa + 2ilift
       end
-      put!(ca, ca,  1.0)
-      put!(cb, cb, -1.0)
     end
   end
-  K = sparse(Ii, Jj, Vv, N, N)
+  colptr[1] = 1
+  @inbounds for c in 1:N; colptr[c+1] += colptr[c]; end
+  rowval = Vector{Int}(undef, colptr[N+1] - 1)
+  nzval  = Vector{Float64}(undef, colptr[N+1] - 1)
+  w = colptr[1:N]                       # per-column write cursor
 
-  # ── Index maps from each block's entries into K.nzval ──
+  qdiag_idx = Vector{Int}(undef, n)
+  @inbounds for j in 1:n
+    k = w[j]
+    for t in nzrange(Qs, j)
+      i = Qs.rowval[t]
+      i >= j && break
+      rowval[k] = i; nzval[k] = Qs.nzval[t]; k += 1
+    end
+    rowval[k] = j; nzval[k] = qdiag[j] + δp
+    qdiag_idx[j] = k
+    w[j] = k + 1
+  end
+  @inbounds for j in 1:size(Gs, 2), t in nzrange(Gs, j)
+    c = n + Gs.rowval[t]; k = w[c]
+    rowval[k] = j; nzval[k] = Gs.nzval[t]; w[c] = k + 1
+  end
+  ediag_idx = Vector{Int}(undef, p)
+  @inbounds for r in 1:p
+    c = n + r; k = w[c]
+    rowval[k] = c; nzval[k] = -δe; w[c] = k + 1
+    ediag_idx[r] = k
+  end
+  @inbounds for j in 1:size(As, 2), t in nzrange(As, j)
+    c = oz + As.rowval[t]; k = w[c]
+    rowval[k] = j; nzval[k] = -As.nzval[t]; w[c] = k + 1
+  end
+
+  # ── Scaling blocks, recording each entry's index into K.nzval as it is
+  #    written (same order as the block updates in kktsolver_ldl) ──
   blk_idx = Vector{Vector{Int}}(undef, length(kinds))
   ilift = 0
-  for (bi, (kind, I)) in enumerate(zip(kinds, ranges))
+  @inbounds for (bi, (kind, I)) in enumerate(zip(kinds, ranges))
+    nI = length(I)
     if kind == :diag
-      blk_idx[bi] = [_nzindex(K, oz + i, oz + i) for i in I]
+      idx = Vector{Int}(undef, nI)
+      for (q, i) in enumerate(I)
+        c = oz + i; k = w[c]
+        rowval[k] = c; nzval[k] = -1.0; w[c] = k + 1
+        idx[q] = k
+      end
+      blk_idx[bi] = idx
     elseif kind == :dense
-      idx = Int[]
-      for b in I, a in first(I):b
-        push!(idx, _nzindex(K, oz + a, oz + b))
+      f = first(I)
+      idx = Vector{Int}(undef, (nI * (nI + 1)) >> 1)
+      q = 0
+      for b in I
+        c = oz + b
+        for a in f:b
+          k = w[c]
+          rowval[k] = oz + a; nzval[k] = (a == b ? -1.0 : 1.0); w[c] = k + 1
+          idx[q += 1] = k
+        end
       end
       blk_idx[bi] = idx
     else
       ilift += 1
       ca = oa + 2ilift - 1; cb = oa + 2ilift
-      idx = Int[]
-      for i in I; push!(idx, _nzindex(K, oz + i, oz + i)); end
-      for i in I; push!(idx, _nzindex(K, oz + i, ca)); end
-      for i in I; push!(idx, _nzindex(K, oz + i, cb)); end
-      push!(idx, _nzindex(K, ca, ca)); push!(idx, _nzindex(K, cb, cb))
+      idx = Vector{Int}(undef, 3nI + 2)
+      for (q, i) in enumerate(I)
+        c = oz + i; k = w[c]
+        rowval[k] = c; nzval[k] = -1.0; w[c] = k + 1
+        idx[q] = k
+      end
+      for (q, i) in enumerate(I)
+        k = w[ca]
+        rowval[k] = oz + i; nzval[k] = -1.0; w[ca] = k + 1
+        idx[nI + q] = k
+      end
+      for (q, i) in enumerate(I)
+        k = w[cb]
+        rowval[k] = oz + i; nzval[k] = 1.0; w[cb] = k + 1
+        idx[2nI + q] = k
+      end
+      k = w[ca]; rowval[k] = ca; nzval[k] =  1.0; w[ca] = k + 1
+      idx[3nI + 1] = k
+      k = w[cb]; rowval[k] = cb; nzval[k] = -1.0; w[cb] = k + 1
+      idx[3nI + 2] = k
       blk_idx[bi] = idx
     end
   end
-  # Static-shift diagonals; every (i,i) and (n+r,n+r) exists structurally
-  # because of the put! calls above.
-  qdiag_idx = [_nzindex(K, i, i) for i in 1:n]
-  ediag_idx = [_nzindex(K, n + r, n + r) for r in 1:p]
+  K = SparseMatrixCSC(N, N, colptr, rowval, nzval)
 
   # Expected pivot signs of the quasi-definite pattern
   Dsigns = Vector{Int}(undef, N)
@@ -642,7 +715,7 @@ end
 
 # Structure key of a problem, for reusing an ordering across solves.
 _ldl_structure_key(Q, A, G, cone_dims) = begin
-  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  Qs = _csc(Q); As = _csc(A); Gs = _csc(G)
   (size(Qs), size(As), size(Gs), copy(cone_dims),
    copy(Qs.colptr), copy(Qs.rowval), copy(As.colptr), copy(As.rowval),
    copy(Gs.colptr), copy(Gs.rowval))
