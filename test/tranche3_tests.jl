@@ -939,4 +939,36 @@
       @test s.y .* cs ≈ ones(nb) atol = 1e-3
     end
   end
+
+  @testset "Interface review fixes" begin
+    # ── Block mul! checks every dimension before its unchecked loop ──
+    # The destination matched the source but not the blocks: the loop wrote
+    # past the end of `y` under @inbounds and only then compared the spans.
+    storage = [7.0, 11.0, 13.0]
+    yv = view(storage, 1:1)
+    xv = view([1.0, 2.0], 1:1)
+    Bd = Block([Diagonal([2.0, 3.0])])
+    @test_throws DimensionMismatch mul!(yv, Bd, xv)
+    @test storage == [7.0, 11.0, 13.0]          # nothing was written
+    @test_throws DimensionMismatch ConicIP.mul_adjoint!(yv, Bd, xv)
+    @test storage == [7.0, 11.0, 13.0]
+    # Destination and source of equal, wrong length, and mismatched pairs.
+    @test_throws DimensionMismatch mul!(zeros(3), Bd, zeros(3))
+    @test_throws DimensionMismatch mul!(zeros(2), Bd, zeros(3))
+    # The correctly sized product is untouched.
+    @test mul!(zeros(2), Bd, [1.0, -2.0]) == Bd * [1.0, -2.0]
+
+    # ── the in-place SOC scaling routines check their scratch first ──
+    zs = [2.0, 0.1, 0.1]; ss = [3.0, 0.2, -0.1]
+    sc = ConicIP.SOCScratch(3)
+    W = ConicIP.nestod_soc!(sc, zs, ss)
+    @test W * zs ≈ ConicIP.nestod_soc(zs, ss) * zs
+    small = ConicIP.SOCScratch(2)
+    @test_throws DimensionMismatch ConicIP.nestod_soc!(small, zs, ss)
+    @test_throws DimensionMismatch ConicIP.nestod_soc!(sc, zs, ss[1:2])
+    @test_throws DimensionMismatch ConicIP.soc_inv_adjoint!(small, W)
+    @test all(iszero, small.zn) && all(iszero, small.sn)
+    @test all(iszero, small.ij) && all(iszero, small.iw)
+
+  end
 end

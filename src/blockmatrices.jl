@@ -241,8 +241,16 @@ function _blk_mul!(y, Blk::VecCongurance, x, adj::Bool)
 end
 
 function _block_mul!(y::AbstractVector, A::Block, x::AbstractVector, adj::Bool)
-  length(y) == length(x) ||
-    throw(DimensionMismatch("Block product: destination has length $(length(y)), source $(length(x))"))
+  # Every dimension is checked BEFORE the loop: the loop writes `y[off+t]`
+  # with `@inbounds`, so a destination shorter than the blocks span would
+  # corrupt memory past its end and only then reach a check. `size(A, 1)`
+  # sums the block sizes, O(#blocks) against the O(n) product. The loop also
+  # indexes from 1, so an offset-axes argument is refused rather than misread.
+  Base.require_one_based_indexing(y, x)
+  n = size(A, 1)
+  (length(y) == length(x) == n) ||
+    throw(DimensionMismatch("Block product: blocks span $n rows, destination " *
+                            "has length $(length(y)), source $(length(x))"))
   off = 0
   @inbounds for i in eachindex(A.Blocks)
     Blk = A.Blocks[i]
@@ -263,8 +271,6 @@ function _block_mul!(y::AbstractVector, A::Block, x::AbstractVector, adj::Bool)
     end
     off += k
   end
-  off == length(y) ||
-    throw(DimensionMismatch("Block product: blocks span $off rows, destination has $(length(y))"))
   return y
 end
 

@@ -476,6 +476,15 @@ written into `sc` instead of freshly allocated vectors.
 """
 function nestod_soc!(sc::SOCScratch, z, s)
 
+  # The loops below write `sc`'s n-length buffers under `@inbounds` while
+  # reading `z` and `s` at the same indices, so the buffers and both
+  # iterates have to agree in length — and be one-based — before the first
+  # of them runs, not after.
+  Base.require_one_based_indexing(z, s)
+  sc.n == length(z) == length(s) ||
+    throw(DimensionMismatch("nestod_soc!: scratch is sized for $(sc.n), " *
+                            "z has length $(length(z)), s $(length(s))"))
+
   n = length(z)
   qz = QFunit(z); qs = QFunit(s)
   (qz > 0 && qs > 0) || throw(LinearAlgebra.PosDefException(1))
@@ -526,6 +535,13 @@ function soc_inv_adjoint!(sc::SOCScratch, W::SOCBlock)
   # WoodburyMatrices.calc_inv: W′ = inv(A), X = W′B,
   # Z = safeinv(-safeinv(D) - dot(B, X)), result SymWoodbury(W′, X, Z).
   d = W.A.diag; B = W.B; D = W.D
+  # Same precondition as nestod_soc!: the inverse's factors are written into
+  # `sc`'s buffers under `@inbounds` at the indices of `W`'s own factors.
+  Base.require_one_based_indexing(d, B)
+  sc.n == length(d) == length(B) ||
+    throw(DimensionMismatch("soc_inv_adjoint!: scratch is sized for $(sc.n), " *
+                            "the block is $(length(d))×$(length(d)) with a " *
+                            "rank-one factor of length $(length(B))"))
   n = length(d)
   ij = sc.ij; iw = sc.iw
   @inbounds for i = 1:n
