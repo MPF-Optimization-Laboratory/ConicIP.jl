@@ -64,6 +64,11 @@ normsafe(x) = isempty(x) ? 0 : norm(x)
 # (broadcasting through it would densify the parent).
 _absmat(M::AbstractMatrix) = abs.(M)
 _absmat(M::Symmetric) = Symmetric(_absmat(parent(M)), Symbol(M.uplo))
+# |M| has M's pattern entry for entry, so copy the structure and map the
+# values; the generic sparse broadcast above would re-derive the pattern.
+_absmat(M::SparseMatrixCSC) =
+  SparseMatrixCSC(size(M,1), size(M,2), copy(M.colptr), copy(M.rowval), abs.(M.nzval))
+_absmat(M::Diagonal) = Diagonal(abs.(M.diag))
 
 # ‖ |M| x ‖ for a nonnegative vector x, formed in `out`; with D a positive
 # diagonal (vector) the product is divided entrywise by D and by σ first,
@@ -674,6 +679,9 @@ function structurally_zero_rows(M::SparseMatrixCSC)
 end
 structurally_zero_rows(M::AbstractMatrix) =
   BitVector(Bool[all(iszero, view(M,i,:)) for i in 1:size(M,1)])
+# The generic method above would scan a full row per index, O(n²) on a
+# structured matrix whose only entries are on the diagonal.
+structurally_zero_rows(M::Diagonal) = iszero.(M.diag)
 
 function structurally_zero_cols(M::SparseMatrixCSC)
   z = trues(size(M,2))
@@ -688,6 +696,7 @@ function structurally_zero_cols(M::SparseMatrixCSC)
 end
 structurally_zero_cols(M::AbstractMatrix) =
   BitVector(Bool[all(iszero, view(M,:,j)) for j in 1:size(M,2)])
+structurally_zero_cols(M::Diagonal) = iszero.(M.diag)
 
 """
   conicIP(Q, c, A, b, cone_dims, G, d;
