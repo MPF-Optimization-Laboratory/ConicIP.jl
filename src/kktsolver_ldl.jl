@@ -162,7 +162,20 @@ reachable through `kkt_diagnostics(solve3x3)` on the object its
 - `refactors` -- shift bumps applied to the current factorization;
   `refactors_total` sums them over the solve
 - `last_residual` -- unregularized residual norm `‖rhs − K₀x‖` of the last
-  `solve3x3` return
+  `solve3x3` return, over the LIFTED system (auxiliary rows included)
+- `last_rtol` -- the tolerance `refine_tol·(1 + ‖rhs‖)` that the internal
+  refinement of that solve aimed at, so a caller can tell a solve that met
+  its own target from one that gave up
+- `last_bound` -- upper bound on the residual norm of the UNLIFTED 3×3
+  system `‖(bx, by, −bz) − K₃ₓ₃ x₃ₓ₃‖` for the same solution. Equal to
+  `last_residual` when no second-order cone was lifted; otherwise
+  `‖r_u‖ + lift_gain·‖r_a‖`, where `r_u`/`r_a` split the lifted residual
+  into its 3×3 rows and its auxiliary rows (eliminating the auxiliaries
+  `a = uᵀz`, `b = vᵀz` from a residual `(r_u, r_a)` leaves
+  `r_u + [u v]·r_a` on the 3×3 rows, and `[u v]` per lifted block has
+  spectral norm at most `√(‖u‖² + ‖v‖²)`)
+- `lift_gain` -- `maxᵦ √(‖uᵦ‖² + ‖vᵦ‖²)` over the lifted second-order-cone
+  blocks of the current factorization; `0` when nothing is lifted
 - `timing` -- the `PhaseTimes` the backend reports into, or `nothing`
   (the default). Set by `kkt_attach_timing!`; while attached, every
   numeric refactorization, triangular solve, and residual evaluation adds
@@ -179,9 +192,13 @@ mutable struct LDLDiagnostics
   refactors_total :: Int
   repaired_total  :: Int
   last_residual   :: Float64
+  last_rtol       :: Float64
+  last_bound      :: Float64
+  lift_gain       :: Float64
   timing          :: Union{Nothing, PhaseTimes}
 end
-LDLDiagnostics(δp, δe, δc) = LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN, nothing)
+LDLDiagnostics(δp, δe, δc) =
+  LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN, NaN, NaN, 0.0, nothing)
 
 # The callable `kktsolver_ldl` hands back from `solve3x3gen`: the solve
 # closure, the regularization bump for tests and diagnosis, and the shared
@@ -350,19 +367,26 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   # timing.jl.
 
   # res = rhs − K₀ x for the unregularized K₀ = K_δ − Diagonal(shift);
-  # returns ‖res‖.
+  # returns (‖res‖, ‖res over the lifted blocks' auxiliary rows‖). The
+  # second entry is what `last_bound` charges the lift for; it is zero
+  # when no second-order cone was lifted (N == oa).
   function residual!(x, pt)
     t0 = pt === nothing ? UInt64(0) : time_ns()
     _symmul!(res, K, x)
     @inbounds for i in 1:N
       res[i] = rhs[i] - (res[i] - shift[i] * x[i])
     end
-    r = norm(res)
+    r  = norm(res)
+    ra = 0.0
+    @inbounds for i in (oa+1):N
+      ra += res[i]^2
+    end
+    ra = sqrt(ra)
     if pt !== nothing
       pt.t_ldl_resid += time_ns() - t0
       pt.n_ldl_resid += 1
     end
-    return r
+    return (r, ra)
   end
 
   # Numeric refactorization, recording what QDLDL did to the pivots
@@ -403,6 +427,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       write_static!()
     end
     diag.refactors = 0
+    diag.lift_gain = 0.0
 
     # Rewrite the scaling entries (in K, for the residual, and in the
     # factorization's internal copy), then refactorize numerically.
@@ -436,6 +461,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
         end
         vbuf[3k + 1] =  1.0
         vbuf[3k + 2] = -1.0
+        # Spectral-norm bound of this block's [u v], for `last_bound`.
+        diag.lift_gain = max(diag.lift_gain, sqrt(dot(u, u) + dot(v, v)))
       end
       K.nzval[idx] .= vbuf
       update_values!(Fact, idx, vbuf)
@@ -460,7 +487,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
         pt.n_ldl_solve += 1
       end
       rtol  = refine_tol * (1 + norm(rhs))
-      rbest = residual!(sol, pt)
+      (rbest, abest) = residual!(sol, pt)
       noncontract = false
       for k in 1:refine_steps
         rbest <= rtol && break
@@ -472,15 +499,16 @@ function kktsolver_ldl(Q, A, G, cone_dims;
           pt.n_ldl_solve += 1
         end
         cand .= sol .+ tmp
-        rcand = residual!(cand, pt)
+        (rcand, acand) = residual!(cand, pt)
         if !(rcand < rbest)
           noncontract = (k == 1)
           break
         end
         sol .= cand
         rbest = rcand
+        abest = acand
       end
-      return (rbest, rtol, noncontract)
+      return (rbest, rtol, noncontract, abest)
     end
 
     function solve3x3(bx, by, bz)
@@ -489,23 +517,28 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       rhs[oz+1:oz+m] .= .-bz
       rhs[oa+1:N] .= 0.0
       pt = diag.timing
-      (rbest, rtol, noncontract) = solve_loaded!(pt)
+      (rbest, rtol, noncontract, abest) = solve_loaded!(pt)
       # Bounded retry: a solve that misses the tolerance on a factorization
       # that repaired pivots (or whose refinement did not contract at all)
       # is repeated with larger static shifts; the better result by
       # unregularized residual is kept.
       while rbest > rtol && (diag.repaired > 0 || noncontract) &&
             diag.refactors < retry_max
-        keep .= sol; rkeep = rbest
+        keep .= sol; rkeep = rbest; akeep = abest
         bump!()
-        (rnew, _, noncontract) = solve_loaded!(pt)
+        (rnew, _, noncontract, anew) = solve_loaded!(pt)
         if rnew < rkeep
-          rbest = rnew
+          rbest = rnew; abest = anew
         else
-          sol .= keep; rbest = rkeep
+          sol .= keep; rbest = rkeep; abest = akeep
         end
       end
       diag.last_residual = rbest
+      diag.last_rtol     = rtol
+      # ‖r_u‖ + gain·‖r_a‖ with ‖r_u‖ = √(‖res‖² − ‖r_a‖²); an exact
+      # unlifted solve (abest == 0) reports the residual itself.
+      diag.last_bound = abest == 0.0 ? rbest :
+        sqrt(max(rbest*rbest - abest*abest, 0.0)) + diag.lift_gain * abest
       # Views, not slices: three copies of the solution per back-solve were
       # the third-largest allocation site in the loop. The documented
       # contract lets a backend hand back views of its own workspace — the
