@@ -454,6 +454,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     # call (assembly, the Hessian check, the result products) is front-end
     # work, charged to `t_frontend`; the solver fills the other phases.
     pt = get(dest.options, "timing", nothing)
+    gc0 = gc_start(pt)
     t_front = time_ns()
 
     model = MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}())
@@ -600,6 +601,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         dest.assembled_only = true
         dest.solve_time = time() - t_start
         pt === nothing || (pt.t_frontend += time_ns() - t_front)
+        gc_stop!(pt, gc0, nothing)
         return index_map, false
     end
 
@@ -642,6 +644,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.ineq_Ay = (size(A, 1) > 0 && finite_y) ? Vector(A * y) : fill(NaN, size(A, 1))
     dest.solve_time = time() - t_start
     pt === nothing || (pt.t_frontend += time_ns() - t_front)
+    gc_stop!(pt, gc0, nothing)
 
     return index_map, false
 end

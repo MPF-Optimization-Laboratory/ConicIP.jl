@@ -13,8 +13,8 @@
 # Contract (frozen 2026-09-14; WP1/WP2/WP3 only read it):
 #
 # * All `t_*` fields are nanoseconds (`UInt64`), all `b_*` fields are bytes
-#   allocated by Julia (`Int64`, process-wide, includes the probe's own Ref),
-#   all `n_*` fields are counts (`Int`).
+#   allocated by Julia (`Int64`, process-wide; the probe itself writes a
+#   shared Ref and allocates nothing), all `n_*` fields are counts (`Int`).
 # * Whole-call phases are ADDITIVE: t_frontend + t_presolve + t_equilibrate +
 #   t_setup + t_init + t_loop + t_final + t_fallback + t_postsolve ≈ wall time
 #   of the outermost call (the remainder is `t_other`, computed by the harness,
@@ -126,9 +126,15 @@ end
 Evaluate `expr`, and when `timing !== nothing` add its wall time to
 `timing.t_field` (and its allocated bytes to `timing.b_field` when given).
 Timestamps are local to the expansion, so nested `@phase` blocks are safe.
-`expr` may `return` from the enclosing function; the off path is then left
-unaccounted, which is the intended cost of an early exit, so wrap the whole
-scope, not a fragment, where early returns occur.
+
+Restrictions. `expr` is expanded twice (once per branch), so it must not
+define a named local function (the timed branch would see the method
+overwritten and throw `UndefVarError`); use an anonymous function or hoist
+the definition. A `return`, `break` or `continue` inside `expr` keeps its
+control flow but leaves the TIMED span unaccounted, because the update runs
+only when `expr` completes normally; where a span can exit early, use
+[`@phase_start`](@ref) / [`@phase_stop`](@ref) and close the span on each
+exit path.
 """
 macro phase(timing, tfield, bfield, expr)
   quote
@@ -161,12 +167,66 @@ macro phase(timing, tfield, expr)
 end
 
 """
+    (t0, b0) = @phase_start timing
+    @phase_stop timing t_field b_field t0 b0
+    @phase_stop timing t_field t0
+
+Manual form of [`@phase`](@ref) for spans that can exit early: open once,
+close on every exit path. The stamps are `(UInt64(0), Int64(0))` when
+`timing === nothing`, and no clock is read.
+"""
+macro phase_start(timing)
+  quote
+    local _pt = $(esc(timing))
+    _pt === nothing ? (UInt64(0), Int64(0)) : (time_ns(), _gc_bytes())
+  end
+end
+
+macro phase_stop(timing, tfield, bfield, t0, b0)
+  quote
+    local _pt = $(esc(timing))
+    if _pt !== nothing
+      setfield!(_pt, $(QuoteNode(tfield)), getfield(_pt, $(QuoteNode(tfield))) + (time_ns() - $(esc(t0))))
+      setfield!(_pt, $(QuoteNode(bfield)), getfield(_pt, $(QuoteNode(bfield))) + (_gc_bytes() - $(esc(b0))))
+    end
+    nothing
+  end
+end
+
+macro phase_stop(timing, tfield, t0)
+  quote
+    local _pt = $(esc(timing))
+    if _pt !== nothing
+      setfield!(_pt, $(QuoteNode(tfield)), getfield(_pt, $(QuoteNode(tfield))) + (time_ns() - $(esc(t0))))
+    end
+    nothing
+  end
+end
+
+"""
+    gc_start(timing) -> UInt64
+    gc_stop!(timing, gc0, x) -> x
+
+`t_gc` bookkeeping for an entry point (`conicIP`, `preprocess_conicIP`,
+`_preprocess_core`, the MOI `optimize!`): read `Base.gc_time_ns()` on entry
+and ASSIGN the delta on every exit. Nested entry points each assign, and the
+outermost assigns last, so the recorded value is the outermost call's.
+"""
+@inline gc_start(timing) = timing === nothing ? UInt64(0) : Base.gc_time_ns()
+@inline function gc_stop!(timing, gc0, x)
+  timing === nothing || (timing.t_gc = Base.gc_time_ns() - gc0)
+  return x
+end
+
+"""
     kkt_attach_timing!(solve3x3, pt::PhaseTimes)
 
 Ask a KKT solver object to report its internal timings and counts into `pt`
 (the `t_ldl_*` / `n_ldl_*` fields). The default does nothing; `kktsolver_ldl`
-implements it. Called once per factorization by the main loop, right after
-`solve3x3gen`, and only when timing is on.
+implements it for both the generator returned by `kktsolver(Q, A, G, cone_dims)`
+and the per-factorization object returned by `solve3x3gen(F, F⁻ᵀ)`. The main
+loop calls it on the generator right after construction (so the initial
+factorization is counted) and on every factorization, only when timing is on.
 """
 kkt_attach_timing!(::Any, ::PhaseTimes) = nothing
 

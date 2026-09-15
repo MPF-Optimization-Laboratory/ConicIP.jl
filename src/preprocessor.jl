@@ -90,6 +90,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   t_start = time()
   time_left() = timeLimit - (time() - t_start)
+  gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
 
   if verbose == true
     println()
@@ -99,9 +100,9 @@ function preprocess_conicIP(Q, c::AbstractVector,
 
   fx = @phase timing t_presolve b_presolve (fix_singletons ? _singleton_fixings(G, d) : nothing)
   if fx === nothing
-    return _preprocess_core(Q, c, A, b, cone_dims, G, d;
+    return gc_stop!(timing, gc0, _preprocess_core(Q, c, A, b, cone_dims, G, d;
                             verbose = verbose, rank_check = rank_check, timeLimit = time_left(),
-                            timing = timing, options...)
+                            timing = timing, options...))
   end
 
   n = length(c); m = size(A, 1); p = size(G, 1)
@@ -117,7 +118,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     # sign with dᵀw < 0 and let the validator normalize and confirm it.
     # (The block evaluates to the Solution so the phase closes before the
     # return.)
-    return @phase timing t_presolve b_presolve begin
+    return gc_stop!(timing, gc0, @phase timing t_presolve b_presolve begin
       (i, k, j) = conflict
       Gs = sparse(G)
       w0 = zeros(p); w0[i] = 1 / Gs[i, j]; w0[k] = -1 / Gs[k, j]
@@ -133,7 +134,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
       chk.valid ?
         Solution(nanv(n), w̄, v̄, nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
         Solution(nanv(n), nanv(p), nanv(m), nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
-    end
+    end)
   end
 
   # Index construction and reduced data (presolve). Reduced data:
@@ -178,7 +179,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # row's stationarity formula exact). Rays: a primal ray has zero fixed
   # components; a Farkas ray needs wᵢ chosen so that column j of Gᵀw − Aᵀv
   # vanishes, which is the same formula with c and Qy dropped.
-  return @phase timing t_postsolve begin
+  return gc_stop!(timing, gc0, @phase timing t_postsolve begin
     y = fill(NaN, n); w = fill(NaN, p)
     if all(isfinite, sol.y)
       y[keepc] = sol.y
@@ -217,7 +218,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
         objective_offset = get(opts0, :objective_offset, 0.0),
         infeasTol = get(opts0, :infeasTol, 1e-7),
         infeasAbsTol = get(opts0, :infeasAbsTol, 1e-9))
-  end
+  end)
 end
 
 # Singleton equality rows: rows of G with exactly one structural nonzero.
@@ -282,6 +283,7 @@ function _preprocess_core(Q, c::AbstractVector,
   # Certificate tolerances: honour whatever is forwarded to conicIP, and
   # otherwise fall back on conicIP's own defaults.
   t_start = time()
+  gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
   opts   = (; options...)
   reltol = get(opts, :infeasTol,    1e-7)
   abstol = get(opts, :infeasAbsTol, 1e-9)
@@ -380,7 +382,7 @@ function _preprocess_core(Q, c::AbstractVector,
       end
     end
   end
-  pre isa Solution && return pre
+  pre isa Solution && return gc_stop!(timing, gc0, pre)
   (IP, ID, do_rank) = pre
 
   # Rank deficiency in [Q Aᵀ G_IPᵀ] used to be patched by adding a 0/1 diagonal
@@ -437,12 +439,12 @@ function _preprocess_core(Q, c::AbstractVector,
     sol.message = string(claim, " claimed on the reduced equality system ",
                          "(dropped rows ", dropped, ") but the ray does not ",
                          "certify the original data")
-    return sol
+    return gc_stop!(timing, gc0, sol)
   end
 
   # Postsolve phase: dual re-expansion, certificate revalidation against the
   # full data, and the KKT check on the original data.
-  return @phase timing t_postsolve begin
+  return gc_stop!(timing, gc0, @phase timing t_postsolve begin
     # Re-expand the equality duals over the original rows, zero on the dropped
     # ones. This is exact for the two quantities the certificate identity uses:
     # Gᵀw_full = Σ_{i∈IP} w_i gᵢ = G[IP,:]ᵀ sol.w and dᵀw_full = d[IP]ᵀ sol.w,
@@ -485,6 +487,6 @@ function _preprocess_core(Q, c::AbstractVector,
         optTol = get(opts, :optTol, 1e-6),
         objective_offset = get(opts, :objective_offset, 0.0),
         infeasTol = reltol, infeasAbsTol = abstol)
-  end
+  end)
 
 end

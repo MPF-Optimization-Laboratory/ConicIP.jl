@@ -195,11 +195,26 @@ end
 (s::LDLSolve3x3)(bx, by, bz) = s.solve(bx, by, bz)
 kkt_diagnostics(s::LDLSolve3x3) = s.diag
 
+# The generator `kktsolver_ldl` returns (what the main loop calls
+# `solve3x3gen`): the factorization closure plus the shared diagnostics
+# record, so timing can be attached BEFORE the first factorization.
+struct LDLGen{G}
+  gen  :: G
+  diag :: LDLDiagnostics
+end
+(g::LDLGen)(F, F⁻ᵀ) = g.gen(F, F⁻ᵀ)
+kkt_diagnostics(g::LDLGen) = g.diag
+
 # The diagnostics record is shared by every factorization of one
-# `kktsolver_ldl` instance, so attaching once keeps reporting until a
-# different (or no) record is attached.
+# `kktsolver_ldl` instance, so attaching once (to the generator or to any
+# factorization) keeps reporting until a different (or no) record is
+# attached.
 function kkt_attach_timing!(s::LDLSolve3x3, pt::PhaseTimes)
   s.diag.timing = pt
+  return nothing
+end
+function kkt_attach_timing!(g::LDLGen, pt::PhaseTimes)
+  g.diag.timing = pt
   return nothing
 end
 
@@ -328,59 +343,42 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   cand = zeros(N); keep = zeros(N)
   vbuf = Float64[]
 
-  # The three timed sites below read `diag.timing` once each and branch on
-  # `=== nothing`; the timestamps are local, so the off path is the
-  # original code plus that comparison (see timing.jl).
+  # The timed sites below branch on `pt === nothing`, where `pt` is
+  # `diag.timing` read once per solve3x3 call and PASSED DOWN as an argument:
+  # capturing `diag` in these closures instead would grow the per-
+  # factorization object (closures are embedded by value), which is the
+  # allocation the timing-off path must not pay. Timestamps are local. See
+  # timing.jl.
 
   # res = rhs − K₀ x for the unregularized K₀ = K_δ − Diagonal(shift);
   # returns ‖res‖.
-  function residual_core!(x)
+  function residual!(x, pt)
+    t0 = pt === nothing ? UInt64(0) : time_ns()
     _symmul!(res, K, x)
     @inbounds for i in 1:N
       res[i] = rhs[i] - (res[i] - shift[i] * x[i])
     end
-    return norm(res)
-  end
-  function residual!(x)
-    pt = diag.timing
-    pt === nothing && return residual_core!(x)
-    t0 = time_ns()
-    r  = residual_core!(x)
-    pt.t_ldl_resid += time_ns() - t0
-    pt.n_ldl_resid += 1
-    return r
-  end
-
-  # Triangular solve x ← K_δ⁻¹ x with the current factorization.
-  function ldl_solve!(x)
-    pt = diag.timing
-    if pt === nothing
-      solve!(Fact, x)
-    else
-      t0 = time_ns()
-      solve!(Fact, x)
-      pt.t_ldl_solve += time_ns() - t0
-      pt.n_ldl_solve += 1
+    r = norm(res)
+    if pt !== nothing
+      pt.t_ldl_resid += time_ns() - t0
+      pt.n_ldl_resid += 1
     end
-    return x
+    return r
   end
 
   # Numeric refactorization, recording what QDLDL did to the pivots
   # (its dynamic regularization is part of refactor! and so of the time).
-  function numeric_factor_core!()
+  function numeric_factor!()
+    pt = diag.timing
+    t0 = pt === nothing ? UInt64(0) : time_ns()
     refactor!(Fact)
     diag.repaired        = regularized_entries(Fact)
     diag.repaired_total += diag.repaired
     diag.pos_inertia     = positive_inertia(Fact)
-    return nothing
-  end
-  function numeric_factor!()
-    pt = diag.timing
-    pt === nothing && return numeric_factor_core!()
-    t0 = time_ns()
-    numeric_factor_core!()
-    pt.t_ldl_factor += time_ns() - t0
-    pt.n_ldl_factor += 1
+    if pt !== nothing
+      pt.t_ldl_factor += time_ns() - t0
+      pt.n_ldl_factor += 1
+    end
     return nothing
   end
 
@@ -413,7 +411,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       Blk = F.Blocks[bi]
       idx = blk_idx[bi]
       if kind == :diag
-        d = Blk isa Diagonal ? Blk.diag : diag(Matrix(Blk))
+        # `diag` is the diagnostics record here; qualify the function.
+        d = Blk isa Diagonal ? Blk.diag : LinearAlgebra.diag(Matrix(Blk))
         resize!(vbuf, length(idx))
         @inbounds for t in eachindex(idx)
           vbuf[t] = -(d[t]^2) - δc
@@ -453,18 +452,28 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     # refine_steps + 1 residual evaluations. Returns the best residual, the
     # tolerance, and whether the *first* correction already failed to
     # contract while the residual was still above the tolerance.
-    function solve_loaded!()
+    function solve_loaded!(pt)
       sol .= rhs
-      ldl_solve!(sol)
+      t0 = pt === nothing ? UInt64(0) : time_ns()
+      solve!(Fact, sol)
+      if pt !== nothing
+        pt.t_ldl_solve += time_ns() - t0
+        pt.n_ldl_solve += 1
+      end
       rtol  = refine_tol * (1 + norm(rhs))
-      rbest = residual!(sol)
+      rbest = residual!(sol, pt)
       noncontract = false
       for k in 1:refine_steps
         rbest <= rtol && break
         tmp .= res
-        ldl_solve!(tmp)
+        t0 = pt === nothing ? UInt64(0) : time_ns()
+        solve!(Fact, tmp)
+        if pt !== nothing
+          pt.t_ldl_solve += time_ns() - t0
+          pt.n_ldl_solve += 1
+        end
         cand .= sol .+ tmp
-        rcand = residual!(cand)
+        rcand = residual!(cand, pt)
         if !(rcand < rbest)
           noncontract = (k == 1)
           break
@@ -480,7 +489,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       rhs[n+1:n+p] .= by
       rhs[oz+1:oz+m] .= .-bz
       rhs[oa+1:N] .= 0.0
-      (rbest, rtol, noncontract) = solve_loaded!()
+      pt = diag.timing
+      (rbest, rtol, noncontract) = solve_loaded!(pt)
       # Bounded retry: a solve that misses the tolerance on a factorization
       # that repaired pivots (or whose refinement did not contract at all)
       # is repeated with larger static shifts; the better result by
@@ -489,7 +499,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
             diag.refactors < retry_max
         keep .= sol; rkeep = rbest
         bump!()
-        (rnew, _, noncontract) = solve_loaded!()
+        (rnew, _, noncontract) = solve_loaded!(pt)
         if rnew < rkeep
           rbest = rnew
         else
@@ -504,7 +514,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
 
   end
 
-  return solve3x3gen
+  return LDLGen(solve3x3gen, diag)
 
 end
 
