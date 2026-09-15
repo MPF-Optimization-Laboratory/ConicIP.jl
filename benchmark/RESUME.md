@@ -35,6 +35,9 @@ benchmark/baselines.jl        Clarabel / ECOS / ConicIP-via-MOI on the same tupl
 benchmark/moi_model.jl        tuple -> MOI model and back (used by baselines and tests)
 benchmark/compare.jl          join CSVs, solved/verified counts, shifted geometric means
 benchmark/sumnorms_diag.jl    attribution script for the sum-of-norms regression
+benchmark/phases.jl           per-phase timing driver (ConicIP and Clarabel through the same MOI route)
+benchmark/compare_phases.jl   joins two phase CSVs: per-instance Δ per phase, shares, counts
+benchmark/alloc_phases.jl     allocation sites per phase (Profile.Allocs)
 benchmark/Project.toml        env for baselines (Clarabel, ECOS); Manifest gitignored
 benchmark/large-scale-roadmap.md
 benchmark/hsd-design.md
@@ -56,6 +59,10 @@ julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate(
 julia --project=benchmark benchmark/baselines.jl --solver clarabel --timeout 120 --out results/clarabel.csv
 julia --project=benchmark benchmark/compare.jl results/x.csv results/clarabel.csv
 julia --project benchmark/sumnorms_diag.jl [--quick]
+julia --project benchmark/phases.jl --solver conicip [--quick] [--only a,b] [--reps 2] [--out results/phase-conicip.csv]
+julia --project=benchmark benchmark/phases.jl --solver clarabel [same flags]
+julia --project=benchmark benchmark/compare_phases.jl results/phase-conicip.csv results/phase-clarabel.csv [--md out.md]
+julia --project benchmark/alloc_phases.jl [--quick] [--top N] [--out out.md]
 ```
 Downloads cache in `benchmark/.cache/` (gitignored); a fresh worktree needs
 `Manifest.toml` copied or `Pkg.instantiate()`, and a symlink to an existing cache saves
