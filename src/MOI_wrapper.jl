@@ -31,6 +31,9 @@ Settable as constructor keywords or through
 - `centralityCorrectors::Int` -- Gondzio centrality correctors tried per
   iteration, each one extra back-solve of the current KKT factorization
   (default: `0`, off)
+- `timing` -- `nothing` (default) or a `ConicIP.PhaseTimes` that
+  `optimize!` adds its per-phase wall times to (model assembly is
+  `t_frontend`; the solver fills the rest); the caller owns and resets it
 - plus `infeasAbsTol`, `DTB`, `maxRefinementSteps`, `refineRelTol`,
   `refineAbsTol`, `staticReg`, `certFallback`, `certFallbackIters`,
   `cache_nestodd` — forwarded to [`conicIP`](@ref)
@@ -96,7 +99,7 @@ const _SUPPORTED_OPTIONS = (
     "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
     "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
     "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
-    "assemble_only", "centralityCorrectors",
+    "assemble_only", "centralityCorrectors", "timing",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the name
@@ -178,6 +181,11 @@ function MOI.set(model::Optimizer, attr::MOI.RawOptimizerAttribute, value)
     end
     if attr.name == "kktsolver"
         _resolve_kktsolver(value)   # validate eagerly
+    elseif attr.name == "timing"
+        # The caller owns the PhaseTimes: optimize! adds to it and never
+        # resets it (one object per measured call).
+        value === nothing || value isa PhaseTimes || throw(ArgumentError(
+            "timing must be nothing or a ConicIP.PhaseTimes (got $(typeof(value)))"))
     end
     model.options[attr.name] = value
     return
@@ -196,7 +204,7 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
         "cache_nestodd" => false, "kktsolver" => "auto",
         "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
         "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false,
-        "centralityCorrectors" => 0)
+        "centralityCorrectors" => 0, "timing" => nothing)
     return get(model.options, attr.name, defaults[attr.name])
 end
 
@@ -442,6 +450,11 @@ end
 function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     MOI.empty!(dest)
     t_start = time()
+    # Opt-in phase timing: everything this wrapper does around the solver
+    # call (assembly, the Hessian check, the result products) is front-end
+    # work, charged to `t_frontend`; the solver fills the other phases.
+    pt = get(dest.options, "timing", nothing)
+    t_front = time_ns()
 
     model = MOI.Utilities.UniversalFallback(MOI.Utilities.Model{Float64}())
     index_map = MOI.copy_to(model, src)
@@ -586,6 +599,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     if get(dest.options, "assemble_only", false)
         dest.assembled_only = true
         dest.solve_time = time() - t_start
+        pt === nothing || (pt.t_frontend += time_ns() - t_front)
         return index_map, false
     end
 
@@ -609,8 +623,14 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         if haskey(kw, :timeLimit) && isfinite(kw.timeLimit)
             kw = merge(kw, (; timeLimit = kw.timeLimit - (time() - t_start)))
         end
+        # `timing` travels in `kw` like every other option; close the
+        # front-end account before the solver opens its own.
+        if pt !== nothing
+            pt.t_frontend += time_ns() - t_front
+        end
         dest.sol = entry(Q, c_int, A, b, cone_dims, G, d;
             verbose = verbose, kktsolver = solver, kw...)
+        t_front = time_ns()
     end
 
     # Products needed by the result getters, formed once. The inequality
@@ -621,6 +641,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     dest.eq_Gy   = (size(G, 1) > 0 && finite_y) ? Vector(G * y) : fill(NaN, size(G, 1))
     dest.ineq_Ay = (size(A, 1) > 0 && finite_y) ? Vector(A * y) : fill(NaN, size(A, 1))
     dest.solve_time = time() - t_start
+    pt === nothing || (pt.t_frontend += time_ns() - t_front)
 
     return index_map, false
 end
