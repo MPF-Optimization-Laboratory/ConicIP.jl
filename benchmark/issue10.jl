@@ -12,7 +12,7 @@
 
 using ConicIP, SparseArrays, LinearAlgebra, Downloads
 
-# Guarded: suite.jl includes this file after loading testdata.jl itself.
+# Guarded so that this file can be included into a scope that already loaded testdata.jl.
 isdefined(@__MODULE__, :mpb_to_conicip) ||
     include(joinpath(@__DIR__, "..", "test", "testdata.jl"))
 

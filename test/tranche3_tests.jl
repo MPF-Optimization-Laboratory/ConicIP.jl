@@ -602,7 +602,7 @@
     @test_throws ArgumentError conicIP(args...; verbose = false, centralityCorrectors = -1)
 
     # ── centralityCorrectors = 2: Optimal, no more iterations, bounded solves ──
-    # Band generators (copies of benchmark/suite.jl's lp_band / qp_band).
+    # Banded LP / QP generators (test-local).
     function t3_lp_band(n; w = 5, seed = 1)
       Random.seed!(seed)
       I_ = Int[]; J_ = Int[]; V_ = Float64[]
