@@ -45,6 +45,7 @@ Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/
 *(W1::VecCongurance, W2::VecCongurance) = VecCongurance(W2.R * W1.R)
 
 include("blockmatrices.jl")
+include("timing.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
 include("correctors.jl")
