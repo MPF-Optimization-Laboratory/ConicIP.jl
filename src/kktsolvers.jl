@@ -172,6 +172,20 @@ over the solve) has the former printed in the verbose `kkt` column as
 `repaired/refactors` and the latter stored in `Solution.kkt_repaired`
 and `Solution.kkt_refactors`. [`kktsolver_ldl`](@ref) implements it with
 `LDLDiagnostics`. Not exported.
+
+Its companion `kkt_attach_timing!(solve3x3, pt::PhaseTimes)` (timing.jl)
+is the hook through which a KKT solver reports per-call timings: when
+`conicIP` runs with `timing = pt` it calls it once per factorization,
+right after `solve3x3gen`, and the solver may from then on add to
+`pt.t_ldl_factor` / `pt.n_ldl_factor` (numeric refactorizations, wall
+nanoseconds and count), `pt.t_ldl_solve` / `pt.n_ldl_solve` (triangular
+solves with the factorization) and `pt.t_ldl_resid` / `pt.n_ldl_resid`
+(residual evaluations of its internal refinement). These are inclusive
+diagnostics, never summed with the loop phases that contain them. Both
+hooks are optional: the defaults answer `nothing` and do nothing, so a
+custom `kktsolver` need not know about either; a solver that implements
+`kkt_attach_timing!` must keep its untimed path free of the timing work
+when nothing is attached.
 """
 kkt_diagnostics(::Any) = nothing
 

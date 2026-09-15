@@ -164,6 +164,11 @@ reachable through `kkt_diagnostics(solve3x3)` on the object its
   `refactors_total` sums them over the solve
 - `last_residual` -- unregularized residual norm `‖rhs − K₀x‖` of the last
   `solve3x3` return
+- `timing` -- the `PhaseTimes` the backend reports into, or `nothing`
+  (the default). Set by `kkt_attach_timing!`; while attached, every
+  numeric refactorization, triangular solve, and residual evaluation adds
+  its wall time and a count to the `t_ldl_*` / `n_ldl_*` fields. With
+  `nothing` each of those sites costs one pointer comparison.
 """
 mutable struct LDLDiagnostics
   repaired        :: Int
@@ -175,8 +180,9 @@ mutable struct LDLDiagnostics
   refactors_total :: Int
   repaired_total  :: Int
   last_residual   :: Float64
+  timing          :: Union{Nothing, PhaseTimes}
 end
-LDLDiagnostics(δp, δe, δc) = LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN)
+LDLDiagnostics(δp, δe, δc) = LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN, nothing)
 
 # The callable `kktsolver_ldl` hands back from `solve3x3gen`: the solve
 # closure, the regularization bump for tests and diagnosis, and the shared
@@ -188,6 +194,14 @@ struct LDLSolve3x3{S, B}
 end
 (s::LDLSolve3x3)(bx, by, bz) = s.solve(bx, by, bz)
 kkt_diagnostics(s::LDLSolve3x3) = s.diag
+
+# The diagnostics record is shared by every factorization of one
+# `kktsolver_ldl` instance, so attaching once keeps reporting until a
+# different (or no) record is attached.
+function kkt_attach_timing!(s::LDLSolve3x3, pt::PhaseTimes)
+  s.diag.timing = pt
+  return nothing
+end
 
 """
     kktsolver_ldl(Q, A, G, cone_dims;
@@ -238,7 +252,13 @@ Diagnostics: the object `solve3x3gen` returns is callable as before and
 carries an `LDLDiagnostics` record, reachable through
 `ConicIP.kkt_diagnostics(solve3x3)`; `conicIP` prints its counts in the
 verbose `kkt` column and sums them into `Solution.kkt_repaired` and
-`Solution.kkt_refactors`.
+`Solution.kkt_refactors`. `ConicIP.kkt_attach_timing!(solve3x3, pt)`
+makes the backend add the time and count of every numeric
+refactorization, triangular solve, and refinement residual to the
+`t_ldl_*` / `n_ldl_*` fields of `pt::PhaseTimes` (`conicIP` does this
+when called with `timing = pt`); the record is shared across the
+factorizations of one `kktsolver_ldl` instance, so the attachment
+persists.
 
 No rank assumption on `G`: dependent equality rows are handled by
 `δ_e` and the refinement. Semidefinite blocks are supported through a
@@ -308,22 +328,59 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   cand = zeros(N); keep = zeros(N)
   vbuf = Float64[]
 
+  # The three timed sites below read `diag.timing` once each and branch on
+  # `=== nothing`; the timestamps are local, so the off path is the
+  # original code plus that comparison (see timing.jl).
+
   # res = rhs − K₀ x for the unregularized K₀ = K_δ − Diagonal(shift);
   # returns ‖res‖.
-  function residual!(x)
+  function residual_core!(x)
     _symmul!(res, K, x)
     @inbounds for i in 1:N
       res[i] = rhs[i] - (res[i] - shift[i] * x[i])
     end
     return norm(res)
   end
+  function residual!(x)
+    pt = diag.timing
+    pt === nothing && return residual_core!(x)
+    t0 = time_ns()
+    r  = residual_core!(x)
+    pt.t_ldl_resid += time_ns() - t0
+    pt.n_ldl_resid += 1
+    return r
+  end
 
-  # Numeric refactorization, recording what QDLDL did to the pivots.
-  function numeric_factor!()
+  # Triangular solve x ← K_δ⁻¹ x with the current factorization.
+  function ldl_solve!(x)
+    pt = diag.timing
+    if pt === nothing
+      solve!(Fact, x)
+    else
+      t0 = time_ns()
+      solve!(Fact, x)
+      pt.t_ldl_solve += time_ns() - t0
+      pt.n_ldl_solve += 1
+    end
+    return x
+  end
+
+  # Numeric refactorization, recording what QDLDL did to the pivots
+  # (its dynamic regularization is part of refactor! and so of the time).
+  function numeric_factor_core!()
     refactor!(Fact)
     diag.repaired        = regularized_entries(Fact)
     diag.repaired_total += diag.repaired
     diag.pos_inertia     = positive_inertia(Fact)
+    return nothing
+  end
+  function numeric_factor!()
+    pt = diag.timing
+    pt === nothing && return numeric_factor_core!()
+    t0 = time_ns()
+    numeric_factor_core!()
+    pt.t_ldl_factor += time_ns() - t0
+    pt.n_ldl_factor += 1
     return nothing
   end
 
@@ -398,14 +455,14 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     # contract while the residual was still above the tolerance.
     function solve_loaded!()
       sol .= rhs
-      solve!(Fact, sol)
+      ldl_solve!(sol)
       rtol  = refine_tol * (1 + norm(rhs))
       rbest = residual!(sol)
       noncontract = false
       for k in 1:refine_steps
         rbest <= rtol && break
         tmp .= res
-        solve!(Fact, tmp)
+        ldl_solve!(tmp)
         cand .= sol .+ tmp
         rcand = residual!(cand)
         if !(rcand < rbest)
