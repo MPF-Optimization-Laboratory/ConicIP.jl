@@ -533,7 +533,8 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
 
   n = size(Q, 1); m = size(A, 1); p = size(G, 1)
   Qs = _csc(Q); As = _csc(A); Gs = _csc(G)
-  qdiag = Vector{Float64}(diag(Qs))     # Q's diagonal before the δp shift
+  qdiag = zeros(n)                # Q's diagonal before the δp shift; read
+                                  # off in the counting pass below
 
   ranges = cum_range([cd[2] for cd in cone_dims])
   kinds  = Symbol[]              # :diag, :dense, :lift per block
@@ -579,8 +580,15 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
   @inbounds for j in 1:n
     cnt = 1                             # the (j,j) entry, always present
     for t in nzrange(Qs, j)
-      Qs.rowval[t] >= j && break
-      cnt += 1
+      i = Qs.rowval[t]
+      if i < j
+        cnt += 1
+      else
+        # This column's own diagonal, on the way past: `diag(Qs)` would
+        # walk the same columns a second time.
+        i == j && (qdiag[j] = Qs.nzval[t])
+        break
+      end
     end
     colptr[j+1] = cnt
   end
