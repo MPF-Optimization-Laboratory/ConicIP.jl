@@ -78,8 +78,8 @@ const PHASE_GUESS = [
     # setup: KKT solver construction, pattern, ordering, routing
     (r"^(kktsolver_ldl|_ldl_pattern|_ldl_flops|_ldl_structure_key|cached_kktsolver_ldl|kktsolver_qr|kktsolver_sparse|kktsolver_2x2|pivotgen|_choose_kktsolver|default_kktsolver|choose_kktsolver|placeholder|count_lift|count_dense|identical_sparse_structure|structurally_zero_rows|structurally_zero_cols|dense_kkt_bytes|dense_kkt_flops|_structural_nnz|_stamp_kkt!)$", "setup"),
     # equilibrate / postsolve (unequilibrate and certificate revalidation)
-    (r"^(equilibrate_conicIP|_col_infnorms|_row_infnorms)$", "equilibrate"),
-    (r"^(unequilibrate!|_refresh_point!|_check_postsolve!|_revalidate_certificate!|retract!|validate_infeasibility_certificate|validate_unboundedness_certificate|claim_infeasible!|claim_dual_infeasible!)$", "postsolve"),
+    (r"^(equilibrate_conicIP|_col_infnorms!|_row_infnorms!|_scale_rows_cols!|_scaled|_mirror_slots|_congruence|_congruence_generic)$", "equilibrate"),
+    (r"^(unequilibrate!|_refresh_point!|_absmul_norm|_absmulT_norm|_check_postsolve!|_revalidate_certificate!|retract!|validate_infeasibility_certificate|validate_unboundedness_certificate|claim_infeasible!|claim_dual_infeasible!)$", "postsolve"),
     # presolve
     (r"^(preprocess_conicIP|_preprocess_core|imcols|_singleton_fixings)$", "presolve"),
     # fallback rays
