@@ -409,18 +409,33 @@ function _variable_columns(model::MOI.ModelLike)
     return (cols, vars)
 end
 
+# Destination index of a constraint of `model`, whose variables were
+# renumbered into columns by `cols`.
+#
+# MOI requires the index value of a `VariableIndex`-in-`S` constraint to be
+# the index value of its variable (see `MOI.ConstraintIndex`), so a bound on
+# a variable that moved to another column has to move with it. Every other
+# constraint index is free to keep the caller's own value. In the copy
+# route `cols` is the identity and both branches return `ci` unchanged.
+@inline _dest_ci(cols::Vector{Int},
+                 ci::MOI.ConstraintIndex{MOI.VariableIndex, S}) where {S} =
+    MOI.ConstraintIndex{MOI.VariableIndex, S}(_col(cols, MOI.VariableIndex(ci.value)))
+@inline _dest_ci(::Vector{Int}, ci::MOI.ConstraintIndex) = ci
+
 # Index map of a `src` read in place: the k-th variable becomes column k
 # (the result vectors are indexed by column, exactly as when a `copy_to`
-# did the renumbering), while constraints keep the caller's own indices,
-# which is what this wrapper's `eq_ci_map` / `ineq_ci_map` are keyed by.
-function _column_index_map(model::MOI.ModelLike, vars::Vector{MOI.VariableIndex})
+# did the renumbering), and each constraint keeps the caller's own index
+# except for a variable bound, which follows its variable. These are the
+# indices this wrapper's `eq_ci_map` / `ineq_ci_map` are keyed by.
+function _column_index_map(model::MOI.ModelLike, cols::Vector{Int},
+                           vars::Vector{MOI.VariableIndex})
     map = MOI.Utilities.IndexMap()
     for (k, v) in enumerate(vars)
         map[v] = MOI.VariableIndex(k)
     end
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
         for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
-            map[ci] = ci
+            map[ci] = _dest_ci(cols, ci)
         end
     end
     return map
@@ -615,16 +630,19 @@ function _assemble_model!(dest::Optimizer, model, cols::Vector{Int}, n::Int)
     tA = _Triplets()          # cone rows,       A y ≥_K b
     cone_dims = Tuple{String, Int}[]
 
+    # Keyed by the index the caller gets back from `optimize!` — for a
+    # variable bound that is the index of the variable's *column*, not of the
+    # variable in `model` (see `_dest_ci`).
     function record_eq!(ci, rows, offset, scalar)
         push!(dest.eq_rows, rows); push!(dest.eq_offset, offset)
         push!(dest.eq_is_scalar, scalar)
-        dest.eq_ci_map[ci] = length(dest.eq_rows)
+        dest.eq_ci_map[_dest_ci(cols, ci)] = length(dest.eq_rows)
     end
     function record_ineq!(ci, rows, sign, offset, scalar, psd)
         push!(dest.ineq_rows, rows); push!(dest.ineq_sign, sign)
         push!(dest.ineq_offset, offset); push!(dest.ineq_is_scalar, scalar)
         push!(dest.ineq_is_psd, psd)
-        dest.ineq_ci_map[ci] = length(dest.ineq_rows)
+        dest.ineq_ci_map[_dest_ci(cols, ci)] = length(dest.ineq_rows)
     end
 
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
@@ -720,7 +738,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     else
         cols, vars = vc
         n = length(vars)
-        index_map = _column_index_map(src, vars)
+        index_map = _column_index_map(src, cols, vars)
         Q, c_int, A, b, cone_dims, G, d = _assemble_model!(dest, src, cols, n)
     end
     dest.assembly_time = time() - t_start
