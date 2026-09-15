@@ -318,6 +318,140 @@ function nestod_soc(z,s)
 
 end
 
+# ──────────────────────────────────────────────────────────────
+#  In-place Nesterov-Todd scaling for the second-order cone
+#
+#  `nestod_soc` above allocates six vectors per cone per iteration
+#  (the two normalized iterates, w, the J diagonal, and the two n-length
+#  temporaries every SymWoodbury carries), and `adjoint(inv(·))` on the
+#  result allocates as many again. The solver instead keeps one
+#  `SOCScratch` per cone for the whole solve and calls `nestod_soc!` /
+#  `soc_inv_adjoint!`, which perform exactly the operations of
+#  `nestod_soc` and `adjoint(inv(·))`, in the same order, on those
+#  buffers. The only per-iteration allocation left is the immutable
+#  `SymWoodbury` wrapper itself.
+# ──────────────────────────────────────────────────────────────
+
+"""
+    SOCScratch(n)
+
+Per-cone buffers for the in-place second-order-cone NT scaling: the
+`SymWoodbury` factors of `F` (`j`, `w`) and of `F⁻ᵀ` (`ij`, `iw`), the
+normalized iterates, and the internal temporaries both wrappers need.
+"""
+struct SOCScratch
+  n    :: Int
+  j    :: Vector{Float64}   # Diagonal part of F
+  w    :: Vector{Float64}   # rank-one factor of F
+  zn   :: Vector{Float64}   # normalized z (scratch)
+  sn   :: Vector{Float64}   # normalized s (scratch)
+  scr  :: Vector{Float64}   # A\B scratch for the Woodbury Dp
+  tN1  :: Vector{Float64}; tN2 :: Vector{Float64}
+  tk1  :: Vector{Float64}; tk2 :: Vector{Float64}
+  ij   :: Vector{Float64}   # Diagonal part of F⁻ᵀ
+  iw   :: Vector{Float64}   # rank-one factor of F⁻ᵀ
+  iscr :: Vector{Float64}
+  itN1 :: Vector{Float64}; itN2 :: Vector{Float64}
+  itk1 :: Vector{Float64}; itk2 :: Vector{Float64}
+end
+
+SOCScratch(n::Integer) = SOCScratch(Int(n),
+  zeros(n), zeros(n), zeros(n), zeros(n), zeros(n),
+  zeros(n), zeros(n), zeros(1), zeros(1),
+  zeros(n), zeros(n), zeros(n),
+  zeros(n), zeros(n), zeros(1), zeros(1))
+
+# The 8-argument default constructor of SymWoodbury, which takes the
+# precomputed Dp and the four temporaries rather than allocating them.
+# Spelled out here so that the one place that bypasses the checked
+# 3-argument constructor is easy to find.
+@inline _symwoodbury(A, B, D, Dp, tN1, tN2, tk1, tk2) =
+  SymWoodbury(A, B, D, Dp, tN1, tN2, tk1, tk2)
+
+# Dp = safeinv(safeinv(D) .+ B'*(A\B)) for A = Diagonal(d), B a vector and
+# D a scalar — what the 3-argument SymWoodbury constructor computes.
+@inline function _woodbury_Dp(d::Vector{Float64}, B::Vector{Float64},
+                              D::Float64, scr::Vector{Float64})
+  @inbounds for i in eachindex(d)
+    iszero(d[i]) && throw(SingularException(i))
+    scr[i] = B[i] / d[i]
+  end
+  return inv(inv(D) + dot(B, scr))
+end
+
+"""
+    nestod_soc!(sc::SOCScratch, z, s)
+
+In-place [`nestod_soc`](@ref): the same scaling matrix, with its factors
+written into `sc` instead of freshly allocated vectors.
+"""
+function nestod_soc!(sc::SOCScratch, z, s)
+
+  n = length(z)
+  qz = QFunit(z); qs = QFunit(s)
+  (qz > 0 && qs > 0) || throw(LinearAlgebra.PosDefException(1))
+  nz = norm(z); ns = norm(s)
+
+  β = (qs/qz)^(1/4) * (sqrt(ns)/sqrt(nz))
+
+  zb = sc.zn; sb = sc.sn
+  rqz = sqrt(qz); rqs = sqrt(qs)
+  @inbounds for i = 1:n
+    zb[i] = (z[i] / nz) / rqz
+    sb[i] = (s[i] / ns) / rqs
+  end
+
+  γ = sqrt((1 + dot(zb, sb))/2)
+
+  # Jz = J*z
+  scal!(n, -1., zb, 1)
+  zb[1] = -zb[1]
+
+  w = sc.w
+  c = 1.0 / (2.0 * γ)
+  @inbounds for i = 1:n
+    w[i] = c * (sb[i] + zb[i])
+  end
+  w[1] = w[1] + 1
+  scal!(n, (sqrt(2*β)/sqrt(2*w[1])), w, 1)
+
+  j = sc.j
+  j[1] = -β
+  @inbounds for i = 2:n; j[i] = β; end
+
+  J  = Diagonal(j)
+  Dp = _woodbury_Dp(j, w, 1.0, sc.scr)
+  return _symwoodbury(J, w, 1.0, Dp, sc.tN1, sc.tN2, sc.tk1, sc.tk2)
+
+end
+
+"""
+    soc_inv_adjoint!(sc::SOCScratch, W)
+
+In-place `adjoint(inv(W))` for the second-order-cone scaling block `W`
+built by [`nestod_soc!`](@ref) (a `SymWoodbury` of real type is its own
+adjoint, so this is `inv(W)` written into `sc`).
+"""
+function soc_inv_adjoint!(sc::SOCScratch, W::SOCBlock)
+
+  # WoodburyMatrices.calc_inv: W′ = inv(A), X = W′B,
+  # Z = safeinv(-safeinv(D) - dot(B, X)), result SymWoodbury(W′, X, Z).
+  d = W.A.diag; B = W.B; D = W.D
+  n = length(d)
+  ij = sc.ij; iw = sc.iw
+  @inbounds for i = 1:n
+    iszero(d[i]) && throw(SingularException(i))
+    ij[i] = inv(d[i])
+  end
+  @inbounds for i = 1:n
+    iw[i] = ij[i] * B[i]      # Diagonal * Vector
+  end
+  Z  = inv(-inv(D) - dot(B, iw))
+  Dp = _woodbury_Dp(ij, iw, Z, sc.iscr)
+  return _symwoodbury(Diagonal(ij), iw, Z, Dp, sc.itN1, sc.itN2, sc.itk1, sc.itk2)
+
+end
+
 function nestod_sdc(z,s)
 
   # Nesterov-Todd Scaling Matrix for the Semidefinite Cone
@@ -999,6 +1133,8 @@ function _conicIP(
   _rhs_buf1  = zeros(m)
   _rhs_buf2  = zeros(m)
   _rhs_s     = zeros(m)
+  # λ = F*z.v, recomputed at the top of every iteration
+  _λ         = zeros(m)
   # Trial iterate for the interiority check of the line search
   _trial_v   = zeros(m)
   _trial_s   = zeros(m)
@@ -1047,8 +1183,22 @@ function _conicIP(
     return sol
   end
 
-  # Pre-allocated Block for inv(F)' — reused each iteration
+  # Pre-allocated Blocks for the NT scaling F and for inv(F)' — the shells
+  # and the per-cone buffers behind them are reused every iteration.
+  # "R" blocks are installed once and only their `.diag` is overwritten;
+  # "Q" blocks get a fresh (immutable) SymWoodbury wrapper per iteration
+  # around the buffers in `_soc_scr`; "S" blocks still allocate.
+  F_cache   = Block(size(block_sizes, 1))
   F⁻ᵀ_cache = Block(size(block_sizes, 1))
+  _soc_scr  = Vector{Union{Nothing,SOCScratch}}(nothing, size(block_sizes, 1))
+  for (btype, I, i) = block_data
+    if btype == "R"
+      F_cache.Blocks[i]   = Diagonal(zeros(length(I)))
+      F⁻ᵀ_cache.Blocks[i] = Diagonal(zeros(length(I)))
+    elseif btype == "Q"
+      _soc_scr[i] = SOCScratch(length(I))
+    end
+  end
 
   normc = norm(c)
   normd = isempty(d) ? -Inf : norm(d)
@@ -1226,27 +1376,58 @@ function _conicIP(
     return true
   end
 
-  function nt_scaling(x, y)
+  function nt_scaling!(B::Block, x, y)
 
     # Compute Nesterov-Todd scaling matrix, F s.t.
     # λ = F*x = inv(F')*y
     # For the self-adjoint R and Q blocks this is λ = F*x = F\y; for
     # an S block F is a congruence and only the adjoint form holds
     # (see nestod_sdc).
-
-    B = Block(size(block_sizes,1));
+    #
+    # In place: the "R" block installed at setup keeps its Diagonal and only
+    # its `.diag` is rewritten, and the "Q" block is rebuilt around the
+    # buffers of its SOCScratch. Only "S" blocks allocate.
 
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I);
       # √y/√x rather than √(y/x): the quotient overflows for jointly
       # extreme magnitudes (y ~ 1e160, x ~ 1e-160), the square roots do not.
-      if btype == "R"; B[i] = Diagonal(sqrt.(yI) ./ sqrt.(xI)); end
-      if btype == "Q"; B[i] = nestod_soc(xI, yI); end
+      if btype == "R"
+        # NB: not named `d` — a plain assignment in this nested function
+        # would rebind _conicIP's equality right-hand side.
+        Blk = B.Blocks[i]
+        dR = (Blk isa DiagBlock) ? Blk.diag : zeros(length(I))
+        for t in eachindex(dR)
+          dR[t] = sqrt(yI[t]) / sqrt(xI[t])
+        end
+        Blk isa DiagBlock || (B.Blocks[i] = Diagonal(dR))
+      end
+      if btype == "Q"
+        sc = _soc_scr[i]
+        B.Blocks[i] = sc === nothing ? nestod_soc(xI, yI) : nestod_soc!(sc, xI, yI)
+      end
       if btype == "S"; B[i] = nestod_sdc(xI, yI); end
     end
 
     return B;
 
+  end
+
+  # adjoint(inv(F)) into F⁻ᵀ_cache, reusing the per-cone buffers for the
+  # "R" and "Q" blocks (blockmatrices.jl's inv_adjoint! handles "R"; the
+  # SOC blocks go through soc_inv_adjoint!, which keeps `inv`'s operations
+  # but writes into the SOCScratch).
+  function nt_inv_adjoint!(dest::Block, src::Block)
+    @inbounds for (btype, I, i) = block_data
+      Blk = src.Blocks[i]
+      sc  = btype == "Q" ? _soc_scr[i] : nothing
+      if sc !== nothing && Blk isa SOCBlock
+        dest.Blocks[i] = soc_inv_adjoint!(sc, Blk)
+      else
+        inv_adjoint_block!(dest, src, i)
+      end
+    end
+    return dest
   end
 
   function cone_div!(o,x,y)
@@ -1495,13 +1676,15 @@ function _conicIP(
 
     # Nesterov-Todd scaling matrix. nestod_sdc factors both cone iterates,
     # so a boundary iterate surfaces here as a PosDefException.
-    Fλ = @phase timing t_scaling b_scaling guarded("NT scaling, iteration $Iter") do
-      Fi = nt_scaling(z.v, z.s)
-      inv_adjoint!(F⁻ᵀ_cache, Fi)
-      (Fi, Fi*z.v)                 # λ = F*z.v is also F⁻ᵀ*z.s
+    Fok = @phase timing t_scaling b_scaling guarded("NT scaling, iteration $Iter") do
+      nt_scaling!(F_cache, z.v, z.s)
+      nt_inv_adjoint!(F⁻ᵀ_cache, F_cache)
+      mul!(_λ, F_cache, z.v)       # λ = F*z.v is also F⁻ᵀ*z.s
+      true
     end
-    Fλ === nothing && return exit_loop(sol)
-    (F, λ) = Fλ
+    Fok === nothing && return exit_loop(sol)
+    F      = F_cache
+    λ      = _λ
     F⁻ᵀ    = F⁻ᵀ_cache
     # A scaling that is non-finite without having thrown would reach
     # inv_adjoint! and the KKT solve as Inf/NaN.
