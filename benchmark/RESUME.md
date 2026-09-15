@@ -20,7 +20,12 @@ private paths removed and prints the remaining references to clean by hand (CLAU
 benchmarking lines, CHANGELOG mentions, test includes); then bump `Project.toml`, add the
 CHANGELOG header, run the suite under the current Julia and 1.10, build the docs, push,
 `gh pr create`, merge, `@JuliaRegistrator register`. After the merge, `git merge master`
-into `dev` (conflicts only in the files the strip touched; keep `dev`'s side).
+into `dev`. **The merge does not conflict: it silently deletes every private path and
+applies the strip's edits to CLAUDE.md, CHANGELOG, .gitignore, test/Project.toml and
+test/runtests.jl** (master's strip commit removed them and `dev` had not touched them
+since). Immediately `git checkout <dev-before-merge> -- <strip list and the five files>`,
+re-apply master's public CHANGELOG hunks (version header, links), check
+`git diff --stat master dev` shows only the private paths, and `--amend` the merge.
 
 ## Private paths (the strip list)
 
