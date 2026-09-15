@@ -117,6 +117,35 @@ function _congruence(M::SparseMatrixCSC, d, σ)
   return SparseMatrixCSC(size(M, 1), size(M, 2), copy(colptr), copy(rows), out)
 end
 
+# ‖ |M| x ‖₂ and ‖ |M|ᵀ x ‖₂ without materializing |M|. The accumulation
+# order matches `SparseArrays`' own `mul!`, so the norms are bitwise equal
+# to the ones the allocating form produced.
+_absmul_norm(M, x) = norm(_absmat(M) * x)
+_absmulT_norm(M, x) = norm(_absmat(M)' * x)
+function _absmul_norm(M::SparseMatrixCSC, x)
+  colptr = M.colptr; rows = M.rowval; vals = M.nzval
+  out = zeros(size(M, 1))
+  @inbounds for j in 1:size(M, 2)
+    xj = x[j]
+    for t in colptr[j]:colptr[j+1]-1
+      out[rows[t]] += abs(vals[t]) * xj
+    end
+  end
+  return norm(out)
+end
+function _absmulT_norm(M::SparseMatrixCSC, x)
+  colptr = M.colptr; rows = M.rowval; vals = M.nzval
+  out = Vector{Float64}(undef, size(M, 2))
+  @inbounds for j in 1:size(M, 2)
+    acc = 0.0
+    for t in colptr[j]:colptr[j+1]-1
+      acc += abs(vals[t]) * x[rows[t]]
+    end
+    out[j] = acc
+  end
+  return norm(out)
+end
+
 """
     equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
                         iters = 10, tol = 1e-2, bound = 1e6,
@@ -316,16 +345,18 @@ function _refresh_point!(sol::Solution, Q, c, A, b, G, d; objective_offset = 0.0
     # Same backward-error normalization as the termination test in
     # _conicIP: the residual is relative to the right-hand side or to the
     # componentwise products |Q||y|, |Gᵀ||w|, |Aᵀ||v|, |A||y|, |G||y|.
-    absQ = _absmat(Q); absA = _absmat(A); absG = _absmat(G)
+    # The |Q|, |A|, |G| products are taken a value at a time rather than
+    # through a materialized copy of each matrix: postsolve is otherwise
+    # three full sparse allocations for three norms.
     ay = abs.(y); aw = abs.(w); av = abs.(v)
-    nQy = norm(absQ * ay)
-    nGw = isempty(w) ? 0.0 : norm(absG' * aw)
-    nAv = isempty(v) ? 0.0 : norm(absA' * av)
+    nQy = _absmul_norm(Q, ay)
+    nGw = isempty(w) ? 0.0 : _absmulT_norm(G, aw)
+    nAv = isempty(v) ? 0.0 : _absmulT_norm(A, av)
     rDu  = norm(Qy + (G' * w - A' * v) - c) / (1 + max(norm(c), nQy, nGw, nAv))
     rPr  = isempty(b) ? 0.0 :
-           norm(A * y - s - b) / (1 + max(norm(b), norm(absA * ay), norm(s)))
+           norm(A * y - s - b) / (1 + max(norm(b), _absmul_norm(A, ay), norm(s)))
     rEq  = isempty(d) ? 0.0 :
-           norm(G * y - d) / (1 + max(norm(d), norm(absG * ay)))
+           norm(G * y - d) / (1 + max(norm(d), _absmul_norm(G, ay)))
     pobj = 0.5 * dot(y, Qy) - cᵀy
     dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, v)
     sol.duFeas = rDu
