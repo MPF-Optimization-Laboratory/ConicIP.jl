@@ -47,15 +47,19 @@ function diagnose(name, prob)
             name, n, m, p, _structural_nnz(Qe), _structural_nnz(Ae),
             string(typeof(Qe)))
 
-    # ── whole phase, for reference ──
-    pt = ConicIP.PhaseTimes()
-    ConicIP._conicIP(Qe, ce, Ae, be, cone_dims, Ge, de;
-                     verbose = false, timing = pt, maxIters = 1)
-    pt = ConicIP.PhaseTimes()
-    ConicIP._conicIP(Qe, ce, Ae, be, cone_dims, Ge, de;
-                     verbose = false, timing = pt, maxIters = 1)
-    @printf("  %-42s %9.4f s  %12.0f B   (whole phase)\n",
-            "t_setup", pt.t_setup / 1e9, pt.b_setup)
+    # ── whole phase: fastest of REPS+2 measured calls, since a GC pause
+    #    landing inside the phase is charged to it ──
+    tphase = Inf; bphase = 0.0
+    for r in 1:(REPS + 2)
+        pt = ConicIP.PhaseTimes()
+        ConicIP._conicIP(Qe, ce, Ae, be, cone_dims, Ge, de;
+                         verbose = false, timing = pt, maxIters = 1)
+        r == 1 && continue                     # warm-up / compilation
+        tphase = min(tphase, pt.t_setup / 1e9)
+        bphase = pt.b_setup
+    end
+    @printf("  %-42s %9.4f s  %12.0f B   (whole phase, best of %d)\n",
+            "t_setup", tphase, bphase, REPS + 1)
 
     # ── components ──
     row("_absmat(Q)",  best(() -> _absmat(Qe))...)
