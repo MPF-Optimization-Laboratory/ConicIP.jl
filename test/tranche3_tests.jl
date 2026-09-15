@@ -65,6 +65,28 @@
     @test t3_contract_residual(s3, cs) < 1e-10
     @test isfinite(dg.last_residual)
 
+    # `last_bound` bounds the residual of the UNLIFTED 3×3 system: the
+    # lifted auxiliary rows are eliminated and charged back through
+    # `lift_gain`, which is zero exactly when nothing was lifted (a "Q"
+    # block below kktsolver_ldl's lift_min = 6 stays dense). `last_rtol`
+    # is the target the internal refinement aimed at.
+    for mix in t3_mixes
+      csb = t3_contract_case(mix)
+      sb = ConicIP.kktsolver_ldl(csb.Q, csb.A, csb.G, mix)(csb.F, csb.F⁻ᵀ)
+      (x, y, z) = sb(csb.bx, csb.by, csb.bz)
+      db = ConicIP.kkt_diagnostics(sb)
+      nrhs = norm([csb.bx; csb.by; csb.bz])
+      @test db.last_rtol ≈ 1e-13 * (1 + nrhs)
+      lifted = any(t == "Q" && k >= 6 for (t, k) in mix)
+      @test (db.lift_gain > 0) == lifted
+      lifted || @test db.last_bound == db.last_residual
+      true3 = norm([csb.Q*x + csb.G'*y - csb.A'*z - csb.bx;
+                    csb.G*x - csb.by;
+                    csb.A*x + csb.F'*(csb.F*z) - csb.bz])
+      # The slack is this test's own evaluation error, not the bound's.
+      @test true3 <= db.last_bound + 1e-12 * (1 + nrhs)
+    end
+
     # The contract holds after a manual bump too, on every cone mix, and
     # the bump multiplies the base shift by retry_factor.
     for mix in t3_mixes
@@ -168,6 +190,52 @@
         @test sol.kkt_repaired == sol0.kkt_repaired
       end
     end
+  end
+
+  @testset "Outer refinement screens" begin
+    # `refine!` skips an outer 4×4 residual evaluation when the KKT
+    # backend's own report already puts the step a factor
+    # REFINE_SKIP_MARGIN inside the target: the 4×4 residual of a step from
+    # `solve4x4!` is, in exact arithmetic, the 3×3 residual of the
+    # back-solve underneath it (see `_step_estimate`). Hiding the report
+    # behind a plain closure makes `kkt_diagnostics` fall back to `nothing`
+    # and turns both screens off without changing a single arithmetic
+    # operation, so the two runs must agree BITWISE: a screen may remove a
+    # residual evaluation, never change a step.
+    hidden = (Q, A, G, cd) -> begin
+      gen = ConicIP.kktsolver_ldl(Q, A, G, cd)
+      (F, F⁻ᵀ) -> begin
+        s3 = gen(F, F⁻ᵀ)
+        (bx, by, bz) -> s3(bx, by, bz)
+      end
+    end
+    Random.seed!(20260915)
+    saved = 0
+    for mix in t3_mixes
+      cs = t3_contract_case(mix)
+      pt_on  = ConicIP.PhaseTimes()
+      pt_off = ConicIP.PhaseTimes()
+      son  = conicIP(cs.Q, cs.c, cs.A, cs.b, mix, cs.G, cs.d; verbose = false,
+                     kktsolver = ConicIP.kktsolver_ldl, timing = pt_on)
+      soff = conicIP(cs.Q, cs.c, cs.A, cs.b, mix, cs.G, cs.d; verbose = false,
+                     kktsolver = hidden, timing = pt_off)
+      @test son.status == soff.status == :Optimal
+      @test son.Iter == soff.Iter
+      @test son.kkt_solves == soff.kkt_solves
+      @test son.y == soff.y
+      @test son.s == soff.s
+      @test pt_on.n_refine_attempt == pt_off.n_refine_attempt
+      @test pt_on.n_refine_resid <= pt_off.n_refine_resid
+      saved += pt_off.n_refine_resid - pt_on.n_refine_resid
+    end
+    @test saved > 0                       # the screens do fire
+
+    # A backend that reports nothing opts out, and no positive estimate
+    # meets a zero tolerance, so the screens are inert for the exact-count
+    # tests in runtests.jl (custom solvers, refineAbsTol = refineRelTol = 0).
+    @test ConicIP._kkt_step_bound(nothing) === nothing
+    @test ConicIP._kkt_step_bound(ConicIP.kkt_diagnostics(x -> x)) === nothing
+    @test ConicIP._step_estimate(x -> x, 0.0, Float64[], 0.0, 0.0) === nothing
   end
 
   @testset "Solution fields" begin

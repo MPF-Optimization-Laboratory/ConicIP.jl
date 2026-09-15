@@ -15,6 +15,27 @@ using Printf
 # the iterative-refinement loop. It flags an ill-conditioned KKT system.
 const REFINE_WARN_NORM = 1e-3
 
+# Safety factor of the refinement screens (see `_step_estimate` and the
+# `refine!` closure in `_conicIP`): the estimate of ‖r − KΔz‖ built from
+# what the KKT backend reports has to be this many times UNDER the outer
+# target before the outer 4×4 residual evaluation is skipped. The estimate
+# and the evaluation are two formulas for the same mathematical quantity,
+# so they agree only to the rounding of each; the factor covers that.
+# Measured over the harness (every instance, the residual evaluated anyway
+# at each screen and compared): 291 of 766 outer residual evaluations were
+# screened away, and the residual a screen skipped never reached a sixth of
+# the target it was tested against.
+const REFINE_SKIP_MARGIN = 8.0
+
+# The exit screen of `refine!` accepts a correction on the backend's report
+# for the CORRECTION solve, but the corrected step's residual is that report
+# only up to the rounding of the residual evaluation the correction was
+# built from. That rounding is not observable; it is charged as this
+# fraction of the residual it contaminated — the same assumption the
+# contraction test has always made, since a residual known only to itself is
+# no basis for accepting or rejecting anything.
+const REFINE_EVAL_FLOOR = 1/64
+
 """
     Id(n)
 
@@ -49,6 +70,59 @@ include("timing.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
 include("correctors.jl")
+
+# Upper bound on ‖r − KΔz‖ for the step the KKT backend's LAST solve
+# produced, read off its diagnostics record, or `nothing` when the backend
+# reports none.
+#
+# In exact arithmetic the 4×4 residual of a step built by `solve4x4!` IS the
+# residual of the 3×3 back-solve underneath it. With `t1 = Fᵀ(λ ∘\ r.s)`, the
+# 3×3 right-hand side `r.v + t1`, and `Δs = t1 − FᵀFΔv`:
+#
+#   y-row, w-row:  the 3×3 rows unchanged;
+#   v-row:         r.v − (AΔy − Δs) = (r.v + t1) − AΔy − FᵀFΔv,
+#                  the 3×3 v-row residual for the shifted right-hand side;
+#   s-row:         r.s − λ∘FΔv − λ∘F⁻ᵀ(t1 − FᵀFΔv) = r.s − λ∘(λ ∘\ r.s) = 0,
+#
+# because F⁻ᵀFᵀ = I. The same identity applies to a refinement correction:
+# `Δzr` solves `KΔzr = _rIr`, so the corrected step's residual
+# `_rIr − KΔzr` is that correction solve's own residual. A backend that
+# bounds its 3×3 residual therefore bounds the outer one, up to the rounding
+# of two different formulas for the same quantity — which is what
+# `REFINE_SKIP_MARGIN` pays for. `kktsolver_ldl` reports the bound in
+# `LDLDiagnostics.last_bound` (the lifted auxiliary rows charged back into
+# the 3×3 rows); every other backend opts out.
+_kkt_step_bound(::Any) = nothing
+_kkt_step_bound(dg::LDLDiagnostics) =
+  isfinite(dg.last_bound) ? dg.last_bound : nothing
+
+# Estimate of ‖r − KΔz‖ for the step the backend's last solve produced,
+# from what the backend reports plus the two terms it cannot see, or
+# `nothing` when it reports nothing:
+#
+#   bound   its bound on its own 3×3 residual, which IS the 4×4 residual in
+#           exact arithmetic (above);
+#   δ‖Δy‖   the y row. `staticReg` puts `Qᵣ = Q + δI` into the
+#           factorization while every other use of Q — `step_residual!`
+#           included — keeps the original Q, so the backend's y row misses
+#           `δΔy`. `Δy` is the y block of the step that solve produced (the
+#           correction's own Δy at the exit screen);
+#   slack   a caller-supplied allowance for what the caller knows it cannot
+#           see (the exit screen's `REFINE_EVAL_FLOOR·rres`; zero at entry);
+#   ε‖r‖    the s row. It cancels exactly only if `F⁻ᵀFᵀ = I`; computed,
+#           `λ∘FΔv + λ∘F⁻ᵀΔs` reproduces `r.s` to about `ε‖r.s‖`, and on an
+#           ill-conditioned scaling that term is the whole 4×4 residual
+#           while the 3×3 residual stays small (on cvxqp1_s it is 60× the
+#           backend's bound).
+#
+# `REFINE_SKIP_MARGIN` multiplies the sum, and covers what is left: the two
+# residuals are different formulas for the same quantity, so they agree only
+# to the rounding of their own evaluations.
+function _step_estimate(s3, δ, Δy, nr, slack)
+  b = _kkt_step_bound(kkt_diagnostics(s3))
+  b === nothing && return nothing
+  return b + (δ == 0 ? 0.0 : δ * norm(Δy)) + eps(Float64) * nr + slack
+end
 
 ViewTypes   = Union{SubArray}
 VectorTypes = Union{Vector, ViewTypes}
@@ -922,6 +996,12 @@ Selected keyword arguments:
 - `maxRefinementSteps`, `refineRelTol`, `refineAbsTol` — the predictor and
   corrector steps are refined against the 4×4 KKT system until
   `‖r − KΔz‖ ≤ refineAbsTol + refineRelTol·‖r‖` or the step budget is spent.
+  The 4×4 residual of such a step is, in exact arithmetic, the residual of
+  the 3×3 back-solve underneath it, so when the KKT solver reports a bound
+  on that residual and the bound is a factor `ConicIP.REFINE_SKIP_MARGIN`
+  under the target, the step (or a correction to it) is accepted on the
+  report and the 4×4 residual is not formed; the tolerances themselves are
+  unchanged in meaning.
 - `timeLimit` — wall-clock budget in seconds, checked once per iteration
   (a single factorization can overrun it). On expiry the status is
   `:TimeLimit` and the solution holds the best iterate so far; the
@@ -2058,17 +2138,42 @@ function _conicIP(
     # The tolerance is a target, not a guarantee: a step that still misses
     # it is used as is. Returns false after stamping sol when a correction
     # solve fails.
+    #
+    # Two screens skip an evaluation the KKT backend has already paid for
+    # (see `_kkt_step_bound`: the outer 4×4 residual is the inner 3×3
+    # residual in exact arithmetic, so the backend's bound bounds it).
+    #
+    #   entry — the backend's bound for the base solve is a factor
+    #           REFINE_SKIP_MARGIN under rtol, so the step already meets
+    #           the target and no residual is formed;
+    #   exit  — the backend's bound for a correction solve is that factor
+    #           under both rtol and the residual it has to beat, so the
+    #           correction is accepted and the loop left without forming
+    #           the residual either.
+    #
+    # Both leave the STEP exactly as the unscreened code would: the margin
+    # is what makes "the bound is under the target" imply "the residual is
+    # under the target" and "the correction contracts". When a screen
+    # fires, `rnorm` reports the backend's bound instead of a measured
+    # residual; the red-row warning keeps its meaning because the bound is
+    # an upper bound on what would have been measured.
+    #
     # Timing: the whole call is t_dir_refine (inclusive diagnostic inside
     # t_direction, which the call sites wrap); the residual evaluations
     # are t_dir_refine_resid. A failed correction leaves the span early
     # and unaccounted.
     function refine!(Δz, r, stage)
       @phase timing t_dir_refine begin
-      nr   = norm(r)
-      rtol = refineAbsTol + refineRelTol * nr
-      timing === nothing || (timing.n_refine_resid += 1)
-      rres = @phase timing t_dir_refine_resid step_residual!(Δz, r)
-      k    = 0                          # this call's own budget
+      nr    = norm(r)
+      rtol  = refineAbsTol + refineRelTol * nr
+      bound = _step_estimate(_s3_cur[], δ, Δz.y, nr, 0.0)
+      rres  = if bound !== nothing && REFINE_SKIP_MARGIN * bound <= rtol
+        bound                           # entry screen
+      else
+        timing === nothing || (timing.n_refine_resid += 1)
+        @phase timing t_dir_refine_resid step_residual!(Δz, r)
+      end
+      k     = 0                         # this call's own budget
       while k < maxRefinementSteps && rres > rtol
         timing === nothing || (timing.n_refine_attempt += 1)
         Δzr = guarded("refinement, $stage") do
@@ -2082,6 +2187,11 @@ function _conicIP(
         copy4!(_Δz_keep, Δz)
         axpy4!(1.0, Δzr, Δz)
         k += 1
+        cbound = _step_estimate(_s3_cur[], δ, Δzr.y, nr, REFINE_EVAL_FLOOR * rres)
+        if cbound !== nothing && REFINE_SKIP_MARGIN * cbound <= min(rtol, rres)
+          rres = cbound                 # exit screen
+          break
+        end
         timing === nothing || (timing.n_refine_resid += 1)
         rnew = @phase timing t_dir_refine_resid step_residual!(Δz, r)
         if !(rnew < rres)               # also catches a NaN residual
