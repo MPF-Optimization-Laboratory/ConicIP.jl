@@ -782,3 +782,112 @@ no iteration-count change).**
 
 The homogeneous embedding (hsd-design.md) does not address any line above;
 it stays behind items 1–4.
+
+### Outcome of the ranked next steps (2026-09-15, dev 3881ac2)
+
+All six items landed on `dev` (commits `20e3801`…`3881ac2`), each as a
+default change verified by the harness rule: 23/23 verified, statuses,
+iteration counts and `kkt_solves` identical to 482d797 on every instance,
+and the residual columns (rDu, rPr, rEq, gap) bit-identical on every
+instance. Test suite 5849/5849 (67 new assertions for the refinement
+screens). Same measurement setup as the study above (phases.jl, best of
+two, idle machine): `results/{phase-conicip,phase-clarabel,compare-phases}-3881ac2.*`.
+
+**Totals.** ConicIP 8.94 s, Clarabel 8.78 s over the 23 instances (was
+11.23 s vs 8.82 s): ratio of totals 1.27 → 1.02, sgm wall ratio 1.46 →
+1.16. ConicIP is now faster on the three band LPs/QPs at n ≥ 20 000
+(lp-band-200000 0.90, lp-band-20000 0.94, qp-band-20000 0.95), at parity
+on qp-band-200000 and the sum-of-norms SOCPs, and 1.5–2.2× on the CBLIB
+SOCPs (nb 1.64, qssp30 1.52, nql30 2.20, issue10 1.68, sched 1.68,
+chainsing 1.89; sambal 4.2 at 1.3 ms).
+
+**Per item.**
+
+1. Direction solve (`d9aeeea`): in-place `mul!` for `Block` and its adjoint
+   (kernels reproduce the allocating products operation for operation),
+   `solve4x4!` into loop-owned direction buffers (`_d_aff`, `_Δz`, `_Δzr`,
+   `_Δz_c`), `kktsolver_ldl` returns views of its workspace (the interface
+   now allows views; the loop copies). `b_direction` per pass 16 MB → 5 KB on
+   lp-band-20000, 0.4 % of before everywhere on the LDL path; `t_gc` on
+   lp-band-20000 0.205 s → 0.004 s.
+2. Refinement policy (`a5fb48f`, `81aaa60`). Diagnosis first: the "20–42
+   attempts per solve" was `n_refine_attempt` summed over the whole solve,
+   ≈ 1 attempt per `refine!` call and zero roll-backs anywhere, so there was
+   nothing to cap; the waste was the *entry residual* evaluated and thrown
+   away (27–51 % of `direction` on chainsing, qp-band and sum-of-norms with
+   zero attempts). The backend now reports `last_bound` = unlifted 3×3
+   residual bound (lifted auxiliary rows charged back through `lift_gain`;
+   raw `last_residual` understated the 4×4 residual by 1775× on
+   sched_50_50_scaled and 59× under `staticReg`), and `refine!` skips the
+   entry evaluation when `8·(last_bound + δ‖Δy‖ + ε‖r‖) ≤ rtol`, and the
+   post-correction evaluation when the same estimate of the correction
+   solve is below `min(rtol, rres)`. Sound in the sense that a screen only
+   removes an evaluation whose verdict is known: 766 evaluations over 21
+   instances, 291 screened, 0 wrong, 6× headroom at margin 8 (the knee of
+   the sweep 4/8/16). `n_refine_resid` 470 → 302 over eight instances,
+   `t_dir_refine_resid` −50 %; solves and attempts unchanged to the unit.
+3. NT scaling in place (`c2e5b60`): `nt_scaling!` writes into a cached
+   `Block` (R blocks in place, Q blocks as fresh 160-byte wrappers around
+   `SOCScratch` vectors, S blocks still allocate); `b_scaling` 2 MB → 288 B
+   per pass on the band instances, 9 % of before on nb/nql30.
+4. Residual span (`5600645`): allocation-free (`b_residuals` 3.6 MB → 197 B
+   per pass on lp-band-20000, 35 MB → 195 B on lp-band-200000). The
+   refresh-on-candidate scheme for the five `|M||x|` products was measured
+   and rejected: the products are 30–46 % of `t_residuals`, but every pass is
+   a new stored best iterate on 7 of 9 instances (all but one on the other
+   two) and `sol` records exact `duFeas/prFeas/rEq` there, so the skip
+   predicate never fires. Saving that share means changing what `Solution`
+   stores (raw norms, normalized at exit), a semantics decision, not a perf
+   change.
+5. Setup (`20e3801`, `6fdbc66`, `394c359`, `6a167bc`): the 10× on
+   lp-band-20000 did not reproduce in isolation (0.026 s at 482d797,
+   best of 4); the phase was 113 MB of allocation on a 4 MB KKT matrix and
+   the reported time was GC charged to the window. The pattern is now
+   assembled directly in CSC in O(nnz) (no COO, no `findnz`, no 80 000
+   `_nzindex` binary searches; bit-identical `K`, `perm`, index maps on 12
+   structural cases), `_absmat` copies structure for sparse and stays
+   `Diagonal` for `Diagonal`, `structurally_zero_*` have `Diagonal`
+   methods, and `_conicIP` routes once instead of once for the verbose line
+   and again in `default_kktsolver`. `b_setup` 0.62–0.68× of before; what
+   remains is QDLDL's symbolic analysis (41.6 MB of the 69 MB on
+   lp-band-20000) plus AMD. The "second AMD" exists only on sub-budget
+   instances, in `_preprocess_core`'s rank-check routing, charged to
+   presolve (ConicIP's presolve is still 0.29× Clarabel's).
+6. QP front end (`fc99c4f`, `ae09176`, `74f5d6f`, `d181ad4`): the MOI
+   wrapper assembles from `src` instead of copying it into a
+   `UniversalFallback` first (230 MB on qp-band-200000); the convexity guard
+   settles diagonal Hessians and zero-diagonal violations structurally and
+   only then runs the shifted CHOLMOD attempt, built directly as the upper
+   triangle; Ruiz sweeps rescale one private `nzval` copy per matrix in place
+   with the norms read off the CSC arrays (661 MB → 111 MB, factors
+   bit-identical on 19 instances); postsolve norms no longer materialize
+   `|Q|, |A|, |G|`. `t_frontend` 0.35 → 0.09 s on qp-band-200000, of which
+   the convexity Cholesky is now the whole remaining excess over Clarabel
+   (which checks nothing).
+
+**Where the remaining +0.16 s sits (aggregate, `compare-phases-3881ac2.md`).**
+Whole-call: setup +0.42 s (setup 0.78 vs 0.36 s: the in-process phase is
+3–15 ms on the SOC and mid-size instances, equal or below 482d797; the
+per-run excess on nql30/nb/sumnorms-1500 equals that run's `t_gc` to the
+millisecond, a pause from the front-end's allocations landing in the
+window), equilibrate +0.11, postsolve +0.02, other +0.05; against that,
+presolve −0.42, frontend −0.07, init −0.07, loop +0.11. Inside the loop:
+`kktupdate + direction` is now *below* Clarabel's (6.32 vs 6.56 s) — the
+factorization is cheaper and the back-solves (`ldl_solve` 40–55 % of
+`direction`) are the remaining per-solve cost; `direction` alone is
++1.06 s because Clarabel's `kkt update` includes its constant-RHS solve;
+`loop_rest` (residuals + rhs + line search) +0.28 s, sgm 1.67, is the
+largest genuinely open loop item. Per-pass loop allocation is ≤ 0.01
+MiB on every LDL-path instance; the SOCP instances still allocate 1–8 MiB
+per pass in `kktupdate` (`soc_uv`'s QR per lifted cone, `_dense_FtF`) and
+`linesearch` (`maxstep_soc`'s `d[2:end]`, `x/sqrt(γ)` temporaries), and
+that is where the 1.5–2.2× on the CBLIB SOCPs lives.
+
+**Next, in order.** (a) `maxstep_soc` and `soc_uv` allocation-free (the
+CBLIB SOCP gap: `linesearch` 1.4–5.0 MiB/pass, `kktupdate` 0.6–2.8
+MiB/pass); (b) the residual-span products under a `Solution` contract
+decision (store raw norms, normalize at exit) if the 30–46 % of
+`t_residuals` is wanted; (c) presolve's throw-away pattern + AMD on
+sub-budget instances (`_preprocess_core:307`), plumb the pattern through;
+(d) QDLDL symbolic-analysis memory (the setup floor) is upstream. The
+homogeneous embedding stays behind (a).

@@ -38,6 +38,7 @@ benchmark/sumnorms_diag.jl    attribution script for the sum-of-norms regression
 benchmark/phases.jl           per-phase timing driver (ConicIP and Clarabel through the same MOI route)
 benchmark/compare_phases.jl   joins two phase CSVs: per-instance Δ per phase, shares, counts
 benchmark/alloc_phases.jl     allocation sites per phase (Profile.Allocs)
+benchmark/setup_diag.jl       attribution of t_setup on the direct instances
 benchmark/Project.toml        env for baselines (Clarabel, ECOS); Manifest gitignored
 benchmark/large-scale-roadmap.md
 benchmark/hsd-design.md
@@ -62,6 +63,7 @@ julia --project benchmark/sumnorms_diag.jl [--quick]
 julia --project benchmark/phases.jl --solver conicip [--quick] [--only a,b] [--reps 2] [--out results/phase-conicip.csv]
 julia --project=benchmark benchmark/phases.jl --solver clarabel [same flags]
 julia --project=benchmark benchmark/compare_phases.jl results/phase-conicip.csv results/phase-clarabel.csv [--md out.md]
+julia --project benchmark/setup_diag.jl [instance ...]
 julia --project benchmark/alloc_phases.jl [--quick] [--top N] [--out out.md]
 ```
 Downloads cache in `benchmark/.cache/` (gitignored); a fresh worktree needs
@@ -70,20 +72,30 @@ the downloads. For timing runs use a detached worktree at a fixed commit and kee
 machine otherwise idle; the subprocess mode restarts Julia per instance (RSS is real,
 wall time includes nothing of that).
 
-## Where things stand (2026-09-08)
+## Where things stand (2026-09-15)
 
-- Solver: LDLᵀ default for large non-SDP problems, Ruiz equilibration, termination in
-  original coordinates with componentwise normalization plus a row-wise feasibility test,
-  singleton presolve, native QP through MOI, diagnostics hook, optional shift retry and
-  Gondzio correctors (both off by default after harness sweeps).
-- Numbers: 23/23 harness instances verified; Clarabel 1.6× faster in shifted geometric
-  mean at about one fewer iteration; v0.4.0 comparison and the sweep tables are in the
-  roadmap's Tranche 2/3 status paragraphs.
-- Open decisions: `hsd-design.md` §7 (ten items; go/no-go on the homogeneous embedding
-  first). Candidate next steps, in the order I would take them: per-phase timing to
-  locate the 1.6× per-iteration gap (assembly, scaling, back-solves, cone operations)
-  since the embedding will not close it; then the embedding behind `method = :hsd`; then
-  Tranche 4 (SDP Schur complement) or 5 (operator inputs) by demand.
+- Solver: LDLᵀ default for large non-SDP problems, Ruiz equilibration (in place),
+  termination in original coordinates with componentwise normalization plus a row-wise
+  feasibility test, singleton presolve, native QP through MOI (assembled from `src`,
+  structural convexity guard before CHOLMOD), diagnostics hook, optional shift retry and
+  Gondzio correctors (both off by default after harness sweeps). The main loop is
+  allocation-free on the LDLᵀ path (in-place `Block` products, buffer-owned directions,
+  NT scaling and residual span in place); the outer refinement skips residual
+  evaluations the backend's `last_bound` already settles.
+- Numbers (dev 3881ac2, per-phase study outcome in the roadmap): 23/23 verified; totals
+  8.94 s vs Clarabel 8.78 s, sgm wall ratio 1.16 (was 1.46 at 482d797), iteration
+  and solve counts unchanged and residuals bit-identical across all six changes. Faster
+  than Clarabel on the large band LP/QPs; 1.5–2.2× slower on the CBLIB SOCPs, where the
+  remaining per-pass allocation is `maxstep_soc` and `soc_uv`.
+- Open decisions: `hsd-design.md` §7 (go/no-go on the homogeneous embedding; it stays
+  behind the SOCP allocation work); whether `Solution` may store raw residual norms and
+  normalize at exit (would free 30–46 % of `t_residuals`, see roadmap item 4 outcome).
+  Next steps in order are listed at the end of the roadmap's outcome section.
+- Not yet done on this stretch: an adversarial review of the merged result (each WP was
+  reviewed only by its own harness/test evidence), and a release cut (`release-0.6.0`)
+  with a CHANGELOG entry for the public changes (solve3x3 view contract, MOI front-end
+  assembly, `LDLDiagnostics.last_bound`/`lift_gain`/`last_rtol`, `mul!` for `Block`).
+- `benchmark/setup_diag.jl` (private) attributes `t_setup` on the direct instances.
 - Process that worked: plan → adversarial review of the plan → parallel subagents with
   exclusive file ownership → coordinator commits at phase boundaries → adversarial review
   of the result → harness sweeps for every default change. Skipping the last two is
