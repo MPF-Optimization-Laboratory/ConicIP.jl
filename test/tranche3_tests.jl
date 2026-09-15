@@ -986,5 +986,27 @@
     @test blk_mul_alloc(mul!, Bq, yq, xq) == 0
     @test blk_mul_alloc(ConicIP.mul_adjoint!, Bq, yq, xq) == 0
     @test blk_mul_alloc(mul!, Block([Diagonal(rand(nq))]), yq, xq) == 0
+
+    # ── a noncanonical CSC is canonicalized before the KKT assembly ──
+    # Duplicate row indices in a column reached K's rowval, which AMD and
+    # QDLDL require to be strictly increasing; the old COO assembly summed
+    # them. Only a hand-built matrix can be in this state.
+    Gdup = SparseMatrixCSC(2, 1, [1, 3], [1, 1], [2.0, 3.0])
+    Gcan = sparse([1, 1], [1, 1], [2.0, 3.0], 2, 1)
+    @test ConicIP._csc(Gdup).rowval == Gcan.rowval
+    @test ConicIP._csc(Gdup).nzval == Gcan.nzval
+    @test ConicIP._csc(Gcan) === Gcan            # canonical: no copy
+    Qz = spzeros(1, 1); Az = sparse(reshape([1.0], 1, 1)); cdz = [("R", 1)]
+    pdup = ConicIP._ldl_pattern(Qz, Az, Gdup, cdz)
+    pcan = ConicIP._ldl_pattern(Qz, Az, Gcan, cdz)
+    @test pdup.K.colptr == pcan.K.colptr
+    @test pdup.K.rowval == pcan.K.rowval
+    @test pdup.K.nzval == pcan.K.nzval
+    for j in 1:size(pdup.K, 2)
+      r = nzrange(pdup.K, j)
+      @test all(pdup.K.rowval[t] > pdup.K.rowval[t-1] for t in (first(r)+1):last(r))
+    end
+    @test ConicIP._ldl_structure_key(Qz, Az, Gdup, cdz) ==
+          ConicIP._ldl_structure_key(Qz, Az, Gcan, cdz)
   end
 end

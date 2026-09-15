@@ -122,11 +122,30 @@ end
 _dense_FtF(Blk::AbstractMatrix) = Blk'Blk
 
 # `sparse(M)` without the copy when M already is one. The pattern assembly
-# and the structure key below only read these matrices, and a
-# SparseMatrixCSC always stores each column's row indices in ascending
-# order, which is exactly what the CSC assembly needs.
-_csc(M::SparseMatrixCSC) = M
-_csc(M::AbstractMatrix)  = sparse(M)
+# and the structure key below only read these matrices, and they copy each
+# column's row indices straight into K, so those indices have to be strictly
+# increasing — which is what a canonical SparseMatrixCSC stores, and what the
+# old COO route (`sparse(I, J, V)`) produced whatever it was handed. A
+# hand-built noncanonical matrix (duplicate or unsorted row indices in a
+# column) is canonicalized here instead: `sparse(findnz(M)...)` sums the
+# duplicates, exactly as the COO assembly did. The canonical case, which is
+# every matrix the solver builds itself, passes through untouched.
+function _csc(M::SparseMatrixCSC)
+  _rows_strictly_increasing(M) && return M
+  return sparse(findnz(M)..., size(M, 1), size(M, 2))
+end
+_csc(M::AbstractMatrix) = sparse(M)
+
+function _rows_strictly_increasing(M::SparseMatrixCSC)
+  rows = rowvals(M)
+  @inbounds for j in 1:size(M, 2)
+    r = nzrange(M, j)
+    for t in (first(r) + 1):last(r)
+      rows[t] > rows[t-1] || return false
+    end
+  end
+  return true
+end
 
 # y = K x for K stored as its upper triangle.
 function _symmul!(y, K::SparseMatrixCSC, x)
