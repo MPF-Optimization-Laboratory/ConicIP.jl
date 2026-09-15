@@ -87,6 +87,36 @@
       @test true3 <= db.last_bound + 1e-12 * (1 + nrhs)
     end
 
+    # F4. `last_bound` is ‖r_u‖ + lift_gain·‖r_a‖ with both norms taken on
+    # their own rows. Recovering ‖r_u‖ as √(‖res‖² − ‖r_a‖²) — which is
+    # what it used to do — cancels away whenever the auxiliary rows carry
+    # the residual: at ‖r_u‖ = 1e-9 against ‖r_a‖ = 1 the subtraction
+    # returns 0 and the bound is out by nine orders. The sweep below drives
+    # the two parts apart by scaling the right-hand side over 24 orders of
+    # magnitude, on lifted mixes and with the internal refinement off (so
+    # the residual is whatever the factorization leaves), and the contract
+    # `last_bound ≥ ‖unlifted 3×3 residual‖` has to survive every one.
+    Random.seed!(6182)
+    for mix in ([("Q", 30)], [("Q", 12), ("Q", 7), ("R", 5)], [("Q", 8), ("S", 6)])
+      csl = t3_contract_case(mix)
+      for steps in (0, 2), σ in (1e-12, 1e-6, 1.0, 1e6, 1e12)
+        (bx, by, bz) = (σ .* csl.bx, σ .* csl.by, σ .* csl.bz)
+        sl = ConicIP.kktsolver_ldl(csl.Q, csl.A, csl.G, mix;
+                                   refine_steps = steps)(csl.F, csl.F⁻ᵀ)
+        (x, y, z) = sl(bx, by, bz)
+        dl = ConicIP.kkt_diagnostics(sl)
+        @test dl.lift_gain > 0                    # the mix does lift
+        @test dl.last_bound >= 0
+        r3 = norm([csl.Q*x + csl.G'*y - csl.A'*z - bx;
+                   csl.G*x - by;
+                   csl.A*x + csl.F'*(csl.F*z) - bz])
+        @test r3 <= dl.last_bound + 1e-12 * (1 + norm([bx; by; bz]))
+        # A nonzero lifted residual cannot leave the unlifted part looking
+        # exactly zero unless it really is: the two norms are independent.
+        @test (dl.last_bound == 0.0) == (dl.last_residual == 0.0)
+      end
+    end
+
     # The contract holds after a manual bump too, on every cone mix, and
     # the bump multiplies the base shift by retry_factor.
     for mix in t3_mixes
