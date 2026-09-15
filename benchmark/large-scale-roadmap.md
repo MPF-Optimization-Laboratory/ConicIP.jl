@@ -677,3 +677,108 @@ dual-infeasible instances, and repeated solves with unchanged structure.
   identifies a kernel that would benefit. Not a ban; a sequencing decision.
 - Dropping the "moderate-size" phrase before the numbers above exist.
 - A hand-written sparse LDLᵀ.
+
+## Per-phase timing study (2026-09-14, dev 482d797)
+
+Instrumentation: `src/timing.jl` (`PhaseTimes`, opt-in `timing =` keyword and
+MOI option; off path is the original code plus one pointer compare per site,
+verified by unchanged warmed allocations and bit-identical iterates).
+Driver: `benchmark/phases.jl` (both solvers through the baselines MOI route,
+subprocess per instance, best of two), report: `benchmark/compare_phases.jl`.
+Clarabel 0.11.1 timers read through its TimerOutputs tree; its `kkt update`
+includes a constant-RHS solve with refinement, so only `kktupdate + direction`
+is comparable. Full report: `results/phase-{conicip,clarabel}-482d797.csv`
+(regenerate with the commands in RESUME.md). Machine: Apple M3 Pro, 1 Julia
+thread, 6 BLAS threads, otherwise idle. All 23 instances Optimal and verified
+for both solvers.
+
+**Totals.** ConicIP 11.23 s, Clarabel 8.82 s over the 23 instances (ratio of
+totals 1.27; shifted-geometric-mean wall ratio 1.46 at shift 0.1 s). The
+ratio is 1.0–1.6 on the band and sum-of-norms instances and 2.3–5.5 on the
+CBLIB SOCPs (qssp30 3.2, issue10 3.5, chainsing 3.7, sumnorms-150 4.9,
+sambal 5.5).
+
+**Where the 2.40 s gap is (absolute sums, shares add up).**
+
+| phase | ΣΔ (s) | share | note |
+|---|---|---|---|
+| loop | +1.69 | 70 % | see below |
+| setup | +0.48 | 20 % | lp-band-20000 alone +0.16 (0.17 s vs 0.016 s): absolute-data copies, structural checks, AMD |
+| equilibrate | +0.23 | 10 % | qp-band-200000 +0.18: the sparse copies per Ruiz sweep |
+| frontend | +0.22 | 9 % | qp-band-200000 +0.23: MOI assembly + Hessian convexity check |
+| postsolve, other | +0.12 | 5 % | |
+| presolve | −0.28 | −12 % | Clarabel's presolve costs more than ours |
+| init | −0.05 | −2 % | |
+
+**Inside the loop (ΣΔloop = 1.69 s).**
+
+| child | Σ ConicIP | Σ Clarabel | ΣΔ | share of ΣΔloop | sgm ratio |
+|---|---|---|---|---|---|
+| kktupdate (factorization) | 3.02 | 4.30 | −1.28 | −75 % | 0.86 |
+| direction (solves + refinement) | 4.28 | 2.33 | +1.95 | 115 % | 1.85 |
+| kktupdate + direction | 7.30 | 6.63 | +0.68 | 40 % | 1.30 |
+| scaling (NT) | 0.36 | 0.05 | +0.31 | 18 % | 4.75 |
+| residuals + rhs + line search | 1.14 | 0.48 | +0.66 | 39 % | 2.08 |
+
+Reading: the factorization itself is not the problem (QDLDL is on par with
+Clarabel's, and cheaper once its embedded solve is discounted). The gap is
+(a) the back-solves and outer refinement, (b) everything per-cone and
+per-iteration around them, and (c) allocation and GC. Evidence:
+
+- Outer refinement is 40–66 % of `direction` on the instances where we lose
+  most (nb 59 %, issue10 66 %, nql30 65 %, chainsing 51 %, qssp30 51 %),
+  with 20–42 refinement attempts per solve on those; on the band LPs it is
+  27–42 %. The LDL backend's own internal refinement runs underneath it
+  (ldl_resid 20–30 % of direction on the band instances).
+- Bytes per pass: `direction` allocates 160 MiB/pass on lp-band-200000,
+  68 MiB on qp-band-200000, 4–9 MiB on the CBLIB SOCPs; `residuals` 34 MiB,
+  `scaling` 18 MiB, `rhs` 22 MiB per pass on lp-band-200000. GC is 18 % of
+  wall on lp-band-200000, 39 % on qp-band-200000, 29 % on lp-band-20000,
+  23 % on chainsing, 55 % on sumnorms-150. Allocation sites
+  (`benchmark/alloc_phases.jl`, lp-band-2000): the top four are all
+  `broadcastf` in blockmatrices.jl (Block products and the eager
+  `adjoint(::Block)` that `F'` performs twice per `solve4x4`), then the LDL
+  setup, equilibration, and the three returned slices of `solve3x3`.
+- NT scaling is 4.75× Clarabel's `scale cones` and 18 % of the loop gap:
+  `nt_scaling` builds a fresh `Block`, `nestod_soc` and `inv_adjoint!`
+  allocate per cone.
+- Residual/termination work is 2× Clarabel's remainder: the componentwise
+  normalization products (`|A||y|`, `|Q||y|`, `|Gᵀ||w|`, `|Aᵀ||v|`) are five
+  extra sparse products per pass.
+
+**Iteration counts.** No systematic "one fewer" for Clarabel. ConicIP passes
+minus Clarabel iterations ranges −2 … +3 with one outlier (sched_50_50_scaled
++10, algorithmic). ConicIP's `passes = kktupdate = BarrierIterations`, and
+`steps = passes − 1`; Clarabel counts only passes that reach a KKT update. The
+"~1 iteration" difference recorded earlier was this counting convention.
+
+**Instrumentation quality.** Whole-call remainder 0–4 % of wall on every
+instance above 1 ms (11–15 % on the three sub-millisecond HS problems, where
+the remainder is MOI bridge overhead); loop remainder 0–2 %. No negative
+remainders. Instrumentation-on overhead is not separately measured yet: all
+numbers above are timing-on; the harness's timing-off walls from the same day
+agree within noise (suite.jl vs phases.jl on --quick).
+
+**Ranked next steps (each is a default change: harness sweep, 23/23 verified,
+no iteration-count change).**
+
+1. Allocation-free direction solve: lazy `adjoint(::Block)` (or an explicit
+   `mul!(y, F', x)` path), in-place Block products with preallocated buffers,
+   `solve3x3` returning views or writing into caller buffers. Targets the
+   115 % share and most of the GC.
+2. Refinement policy: skip the outer `refine!` when the backend's internal
+   refinement already met `refineRelTol`/`refineAbsTol` (it reports
+   `last_residual`), and cap outer attempts per solve; measure with
+   `n_refine_attempt` and the harness's verified column.
+3. NT scaling in place: reuse the `Block` shell and per-cone buffers across
+   iterations (`nt_scaling`, `nestod_soc`, `inv_adjoint!`).
+4. Residual normalization: compute the four absolute products once per pass
+   into preallocated vectors (or every other pass with a refresh on the
+   termination candidate).
+5. Setup on band problems: find the 10× on lp-band-20000 (candidates:
+   `_absmat` copies, `structurally_zero_*`, a second AMD).
+6. QP front end: the Hessian convexity check and equilibration copies on
+   qp-band-200000.
+
+The homogeneous embedding (hsd-design.md) does not address any line above;
+it stays behind items 1–4.
