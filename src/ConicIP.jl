@@ -131,6 +131,29 @@ mutable struct StepMagnitudes
   ns   :: Float64   # ‖Δs‖
 end
 StepMagnitudes() = StepMagnitudes(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+# `dst .= src`, returning ‖dst‖₂; and `a .-= b`, returning (‖a‖₂ before,
+# ‖b‖₂, ‖a‖₂ after). The subtraction is the one `axpy!(-1, b, a)` performs,
+# so the step is bit-identical to the BLAS form; the norms are plain sums
+# of squares (no scaling, `@simd` reassociation), which is fine for a
+# rounding-floor estimate: an overflow to Inf only refuses a screen, and an
+# entry that underflows when squared contributes nothing a floor needs.
+function _copy_norm!(dst, src)
+  s = 0.0
+  @inbounds @simd for i in eachindex(dst, src)
+    v = src[i]; dst[i] = v; s += v * v
+  end
+  return sqrt(s)
+end
+function _sub_norms!(a, b)
+  sa = 0.0; sb = 0.0; sd = 0.0
+  @inbounds @simd for i in eachindex(a, b)
+    x = a[i]; y = b[i]; d = x - y
+    a[i] = d
+    sa += x * x; sb += y * y; sd += d * d
+  end
+  return (sqrt(sa), sqrt(sb), sqrt(sd))
+end
 function _mag_copy!(dst::StepMagnitudes, src::StepMagnitudes)
   dst.elim = src.elim; dst.fdv = src.fdv; dst.ny = src.ny
   dst.nw   = src.nw;   dst.nv  = src.nv;  dst.ns = src.ns
@@ -1796,18 +1819,22 @@ function _conicIP(
       mul_adjoint!(out.s, F, _div_buf)    # t1 = F'*(r.s ○\ λ)
       _s3_rhs .= r.v .+ out.s
       (Δy, Δw, Δv)  = solve3x3(r.y, r.w, _s3_rhs)
-      copyto!(out.y, Δy); copyto!(out.w, Δw); copyto!(out.v, Δv)
+      # The step magnitudes `_step_estimate` needs are taken inside the
+      # copies and the elimination, not as separate passes: seven extra
+      # norms of n- and m-vectors per solve were a measurable share of a
+      # back-solve on the large banded instances.
+      mag = _screen.mag
+      mag.ny = _copy_norm!(out.y, Δy)
+      mag.nw = _copy_norm!(out.w, Δw)
+      mag.nv = _copy_norm!(out.v, Δv)
       mul!(_dir_buf1, F, out.v)
       mul_adjoint!(_dir_buf2, F, _dir_buf1)
-      # The two magnitudes of the elimination below, taken while out.s is
-      # still t1: their rounding is the part of the outer residual that no
-      # backend can see (`_step_estimate`).
-      mag = _screen.mag
-      mag.elim = norm(out.s) + norm(_dir_buf2)
       mag.fdv  = norm(_dir_buf1)
-      axpy!(-1, _dir_buf2, out.s)         # > Δs = t1 - F'*(F*Δv)
-      mag.ny = norm(out.y); mag.nw = norm(out.w)
-      mag.nv = norm(out.v); mag.ns = norm(out.s)
+      # Δs = t1 − Fᵀ(FΔv), with ‖t1‖ and ‖Fᵀ(FΔv)‖ taken on the way: their
+      # rounding is the part of the outer residual no backend can see.
+      (nt1, nffv, ns) = _sub_norms!(out.s, _dir_buf2)
+      mag.elim = nt1 + nffv
+      mag.ns   = ns
       return out
 
     end

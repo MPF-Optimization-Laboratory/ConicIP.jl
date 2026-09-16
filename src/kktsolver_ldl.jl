@@ -403,7 +403,10 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       res[i] = rhs[i] - (res[i] - shift[i] * x[i])
     end
     r  = norm(res)
-    ru = norm(view(res, 1:oa))
+    # Nothing lifted: the unlifted rows are all of them, and the norm is
+    # already paid for (one norm of N entries is ~0.2 ms at N = 80 000,
+    # once per back-solve).
+    ru = oa == N ? r   : norm(view(res, 1:oa))
     ra = oa == N ? 0.0 : norm(view(res, (oa+1):N))
     if pt !== nothing
       pt.t_ldl_resid += time_ns() - t0
