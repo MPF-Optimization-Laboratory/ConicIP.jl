@@ -20,7 +20,7 @@ function compare(s1, s2::Dict)
             abs(s1.duFeas - s2[:duFeas]) < tol)
 end
 
-@testset "ConicIP" begin
+@testset verbose = true "ConicIP" begin
 
     Random.seed!(0)
 

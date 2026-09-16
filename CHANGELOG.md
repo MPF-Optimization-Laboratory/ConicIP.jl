@@ -19,14 +19,11 @@ uses [Semantic Versioning](https://semver.org/).
   unlifted 3×3 residual of the last solve), `lift_gain` (the factor the
   lifted second-order-cone rows are charged back with), and `last_rtol`;
   the positional constructor changed accordingly.
-- The outer iterative refinement evaluates the 4×4 residual of the base
-  predictor and corrector solves only when the KKT solver's own residual
-  bound, plus the rounding floor of the outer evaluation, does not already
-  settle the tolerance (`ConicIP.REFINE_SKIP_MARGIN`). Solves, iterates, and
-  iteration counts are unchanged; only residual evaluations are saved.
-- `mul!(y, B::Block, x)`, `mul!(y, B', x)` and `ConicIP.mul_adjoint!` give
-  in-place block-diagonal products (allocation-free for `Diagonal`,
-  `SymWoodbury` and dense blocks). The allocating `*` methods are unchanged.
+- `mul!(y, B::Block, x)` and `ConicIP.mul_adjoint!(y, B, x)` give in-place
+  block-diagonal products whose kernels allocate nothing for `Diagonal`,
+  `SymWoodbury` and dense blocks; `mul!(y, B', x)` is also defined, though
+  forming `B'` itself allocates the wrapper. The allocating `*` methods are
+  unchanged.
 - The MOI wrapper assembles its matrices directly from the model handed to
   `copy_to`/`optimize!` instead of copying it into a cache first; the index
   map still renumbers variables to columns, and `VariableIndex` constraint
@@ -36,9 +33,10 @@ uses [Semantic Versioning](https://semver.org/).
   shifted sparse Cholesky; the verdict and the error message are unchanged.
 
 ### Performance
-- The main loop is allocation-free on the LDLᵀ path: in-place Nesterov–Todd
-  scaling, buffer-owned search directions, in-place residual and
-  right-hand-side formation. On the benchmark set (23 LP/QP/SOCP instances)
+- The main loop allocates nothing per pass on the LDLᵀ path with linear and
+  second-order cones (semidefinite blocks still allocate in the scaling and
+  the products): in-place Nesterov–Todd scaling, buffer-owned search
+  directions, in-place residual and right-hand-side formation. On the benchmark set (23 LP/QP/SOCP instances)
   the total wall time fell from 1.27× to 1.02× Clarabel's, the shifted
   geometric mean from 1.46× to 1.16×; GC time on the large banded instances
   fell from 18–39 % of wall to under 10 %.
@@ -62,11 +60,9 @@ uses [Semantic Versioning](https://semver.org/).
   (duplicate or unsorted row indices in a column, reachable only from a
   hand-built matrix) instead of carrying duplicate rows into the KKT
   pattern; canonical matrices pass through without a copy.
-- The refinement screen's estimate bounds the rounding of the outer residual
-  evaluation (the `Δs = t1 − FᵀFΔv` elimination and the residual products
-  themselves), not only the backend's bound on its 3×3 residual: an exact
-  3×3 back-solve with `Q = 2⁻¹²⁰`, `A = 2⁻⁶⁰` produced a step with a 4×4
-  residual of 2 that the estimate put at 7e-16.
+- The LDLᵀ pattern assembly also canonicalizes a noncanonical matrix that
+  arrives wrapped (`D'`, `transpose(D)`, a view): `sparse` of the wrapper
+  keeps the duplicate rows, so the conversion alone was not enough.
 - `LDLDiagnostics.last_bound` measures the unlifted and auxiliary residual
   norms on their own rows instead of recovering one from the other by
   subtraction, which cancelled to zero when the auxiliary rows carried the

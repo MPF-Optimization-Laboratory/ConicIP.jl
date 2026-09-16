@@ -129,12 +129,16 @@ _dense_FtF(Blk::AbstractMatrix) = Blk'Blk
 # hand-built noncanonical matrix (duplicate or unsorted row indices in a
 # column) is canonicalized here instead: `sparse(findnz(M)...)` sums the
 # duplicates, exactly as the COO assembly did. The canonical case, which is
-# every matrix the solver builds itself, passes through untouched.
+# every matrix the solver builds itself, passes through untouched. Any other
+# matrix type (a transpose or adjoint wrapper, a view, a dense matrix) is
+# converted first and then goes through the same check: `sparse(D')` of a
+# noncanonical `D` keeps its duplicate rows, so the conversion alone is
+# not enough.
 function _csc(M::SparseMatrixCSC)
   _rows_strictly_increasing(M) && return M
   return sparse(findnz(M)..., size(M, 1), size(M, 2))
 end
-_csc(M::AbstractMatrix) = sparse(M)
+_csc(M::AbstractMatrix) = _csc(sparse(M))
 
 function _rows_strictly_increasing(M::SparseMatrixCSC)
   rows = rowvals(M)

@@ -72,34 +72,43 @@ the downloads. For timing runs use a detached worktree at a fixed commit and kee
 machine otherwise idle; the subprocess mode restarts Julia per instance (RSS is real,
 wall time includes nothing of that).
 
-## Where things stand (2026-09-15)
+## Where things stand (2026-09-16)
 
 - Solver: LDLᵀ default for large non-SDP problems, Ruiz equilibration (in place),
   termination in original coordinates with componentwise normalization plus a row-wise
   feasibility test, singleton presolve, native QP through MOI (assembled from `src`,
   structural convexity guard before CHOLMOD), diagnostics hook, optional shift retry and
   Gondzio correctors (both off by default after harness sweeps). The main loop is
-  allocation-free on the LDLᵀ path (in-place `Block` products, buffer-owned directions,
-  NT scaling and residual span in place); the outer refinement skips residual
-  evaluations the backend's `last_bound` already settles.
-- Numbers (dev 3881ac2, per-phase study outcome in the roadmap): 23/23 verified; totals
-  8.94 s vs Clarabel 8.78 s, sgm wall ratio 1.16 (was 1.46 at 482d797), iteration
-  and solve counts unchanged and residuals bit-identical across all six changes. Faster
-  than Clarabel on the large band LP/QPs; 1.5–2.2× slower on the CBLIB SOCPs, where the
-  remaining per-pass allocation is `maxstep_soc` and `soc_uv`.
+  allocation-free on the LDLᵀ path with R/Q cones (in-place `Block` products,
+  buffer-owned directions, NT scaling and residual span in place). The outer refinement
+  evaluates the 4×4 residual of every base solve; the backend's `last_bound` is a
+  report, not a screen (the screen was removed after the second adversarial pass, see
+  the roadmap's "Adversarial review" section for the counterexample and the numbers).
+- Numbers (dev 3881ac2 study, still the reference: `results/*-3881ac2.*`): 23/23
+  verified; totals 8.94 s vs Clarabel 8.78 s, sgm wall ratio 1.16 (was 1.46 at 482d797).
+  The seven review fixes and the screen removal leave statuses, iteration and solve
+  counts and residual columns identical to 3881ac2 on every instance; the removal
+  gives back the screen's saving (band instances +2–9 % wall vs 3881ac2, same
+  session, best of two). Day-to-day drift of this machine is of the same size
+  (lp-band-200000 4.28 s on 09-15, 4.78 s on 09-16 for the same commit), so compare
+  only within a session.
 - Open decisions: `hsd-design.md` §7 (go/no-go on the homogeneous embedding; it stays
   behind the SOCP allocation work); whether `Solution` may store raw residual norms and
-  normalize at exit (would free 30–46 % of `t_residuals`, see roadmap item 4 outcome).
-  Next steps in order are listed at the end of the roadmap's outcome section.
-- Not yet done on this stretch: an adversarial review of the merged result (each WP was
-  reviewed only by its own harness/test evidence), and a release cut (`release-0.6.0`)
-  with a CHANGELOG entry for the public changes (solve3x3 view contract, MOI front-end
-  assembly, `LDLDiagnostics.last_bound`/`lift_gain`/`last_rtol`, `mul!` for `Block`).
+  normalize at exit (would free 30–46 % of `t_residuals`, see roadmap item 4 outcome);
+  a cheaper 4×4 residual evaluation now that the screen is gone (roadmap (b')).
+- Not yet done on this stretch: a release cut (`release-0.6.0`) with the CHANGELOG's
+  Unreleased section (solve3x3 view contract, MOI front-end assembly,
+  `LDLDiagnostics.last_bound`/`lift_gain`/`last_rtol`, `mul!` for `Block`, the fixes).
+- Test suite: 5945 tests, 15 min wall on an idle M3 Pro (9.5 min in tests, of which
+  `MOI.Test` 4.3 min; the rest is instantiate/precompile). The runner is
+  `verbose = true`, so the summary lists per-testset times; `results/test-times-*.txt`
+  keeps one. Runs that took an hour were sharing the machine with timing jobs. Wrap
+  every run in `timeout`.
 - `benchmark/setup_diag.jl` (private) attributes `t_setup` on the direct instances.
 - Process that worked: plan → adversarial review of the plan → parallel subagents with
   exclusive file ownership → coordinator commits at phase boundaries → adversarial review
-  of the result → harness sweeps for every default change. Skipping the last two is
-  where earlier mistakes came from.
+  of the result → a SECOND adversarial pass on the fixes (that is what caught the
+  screen) → harness sweeps for every default change.
 
 Session notes for the agent side live in `~/.claude/plans/conicip-is-currently-described-buzzing-flurry.md`
 and the memory files under `~/.claude/projects/-Users-mpf-projects-Software-ConicIP-jl/memory/`.

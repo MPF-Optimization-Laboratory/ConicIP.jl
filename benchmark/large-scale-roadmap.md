@@ -891,3 +891,48 @@ decision (store raw norms, normalize at exit) if the 30–46 % of
 sub-budget instances (`_preprocess_core:307`), plumb the pattern through;
 (d) QDLDL symbolic-analysis memory (the setup floor) is upstream. The
 homogeneous embedding stays behind (a).
+
+### Adversarial review of the 3881ac2 result (2026-09-15/16, dev 332df25 → HEAD)
+
+Two Astra passes over the merged diff. The first found seven defects, all
+fixed on `dev` (`16eee3e`…`332df25`, CHANGELOG "Fixed"): `Block` `mul!`
+wrote past a short destination before its check; the MOI wrapper's
+`VariableIndex` constraint indices did not follow the variable map; a
+noncanonical CSC reached the KKT pattern; SOC block dimensions went through
+a dynamic `size`; `last_bound` recovered the unlifted residual norm by a
+cancelling subtraction; the refinement screen's estimate did not carry the
+rounding floor of the outer evaluation (an exact 3×3 back-solve with
+`Q = 2⁻¹²⁰`, `A = 2⁻⁶⁰` gives a step with 4×4 residual 2 that the estimate
+put at 7e-16); and the exit screen after a correction was dead (0 of 210).
+
+The second pass, on the fixes, showed the repaired screen still unsound:
+the floor of the s row was bounded through the *result* of the cone
+product `λ∘F⁻ᵀΔs` (`‖r.s‖ + ‖λ∘FΔv‖`), but the rounding of that product
+scales with its *operands*, which cancellation makes arbitrarily larger.
+Reproduced with the real kernels: one Q3 cone, `F = I`,
+`λ = (1e8, 1e8−1, 0)`, `r.s = e₁`: backend bound 0, estimate 1e-15,
+measured 4×4 residual 8e-9 against a 1e-12 target at default tolerances.
+Bounding the operands needs `F⁻ᵀΔs`, a product of the size of the
+evaluation the screen replaces, so the screen cannot pay for itself in
+principle. It was also barely paying in practice: screen vs no screen
+(both with the fused magnitude recording), 23 instances, best of two, same
+session: total wall 0.98, sgm 0.94; and on the band instances the
+recording alone cost +7–10 % wall before the fusion.
+
+**Decision: the outer refinement screen is removed** (`StepMagnitudes`,
+`RefineScreen`, `_step_estimate`, the norm proxies, the two constants).
+`refine!` evaluates the 4×4 residual of every base solve, as at 482d797.
+Kept: `LDLDiagnostics.last_bound` / `lift_gain` / `last_rtol` (a correct
+backend report, tested), all other fixes, and `n_refine_resid` in the
+timing record. Numbers vs 3881ac2 on the same session (best of two):
+lp-band-200000 4.88 s vs 4.78 s, lp-band-20000 0.409 vs 0.399,
+qp-band-200000 1.19 vs 1.09 — the screen's saving, which item 2 above
+reported as `t_dir_refine_resid` −50 %, is given back. The residual
+evaluation returns to the ranked list as (b'), behind (a): the honest way
+to save it is a cheaper evaluation (the `|M||x|`-free path, or reusing the
+backend's `res` for the three 3×3 rows and forming only the s row), not a
+screen. Second-pass items also applied: `_csc` canonicalizes through
+wrappers (`sparse(D')` keeps duplicate rows); the F4 regression for
+`last_bound` now separates the unlifted and auxiliary residuals so that
+the 3881ac2 backend fails it; CHANGELOG wording on "allocation-free" and
+`mul!(y, B', x)` qualified.
