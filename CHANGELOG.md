@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-16
+
 ### Changed
 - **KKT solver interface:** the `(a, b, c)` a `solve3x3` returns may now be
   views into the backend's own workspace, valid until that backend's next
@@ -36,37 +38,18 @@ uses [Semantic Versioning](https://semver.org/).
 - The main loop allocates nothing per pass on the LDLᵀ path with linear and
   second-order cones (semidefinite blocks still allocate in the scaling and
   the products): in-place Nesterov–Todd scaling, buffer-owned search
-  directions, in-place residual and right-hand-side formation. On the benchmark set (23 LP/QP/SOCP instances)
-  the total wall time fell from 1.27× to 1.02× Clarabel's, the shifted
-  geometric mean from 1.46× to 1.16×; GC time on the large banded instances
-  fell from 18–39 % of wall to under 10 %.
+  directions, in-place residual and right-hand-side formation. GC time on
+  large banded LP/QP instances fell from 18–39 % of wall to under 10 %.
 - The LDLᵀ KKT pattern is assembled directly in CSC form in O(nnz)
   (previously a COO list, `sparse()`, and one binary search per scaling
-  entry); the KKT solver is routed once per solve.
+  entry); a hand-built noncanonical `SparseMatrixCSC` (duplicate or
+  unsorted row indices, wrapped or not) is canonicalized first, as the COO
+  route did implicitly. The KKT solver is routed once per solve.
 - Ruiz equilibration rescales one private copy of each matrix in place
   (previously a fresh sparse product per sweep); the scaling factors are
   bit-identical.
 - Block-diagonal products read each SOC block's dimension from its concrete
   type instead of a dynamic `size` call.
-
-### Fixed
-- `mul!(y, ::Block, x)` checks `length(y) == length(x) == size(B, 1)` and
-  one-based indexing before its unchecked loop; a destination shorter than
-  the blocks span threw only after writing past its end.
-- The MOI wrapper remaps `VariableIndex` constraint indices through the
-  variable map, as MOI requires; a model whose variables had been deleted
-  got an index map whose bound indices no longer matched their variables.
-- The LDLᵀ pattern assembly canonicalizes a noncanonical `SparseMatrixCSC`
-  (duplicate or unsorted row indices in a column, reachable only from a
-  hand-built matrix) instead of carrying duplicate rows into the KKT
-  pattern; canonical matrices pass through without a copy.
-- The LDLᵀ pattern assembly also canonicalizes a noncanonical matrix that
-  arrives wrapped (`D'`, `transpose(D)`, a view): `sparse` of the wrapper
-  keeps the duplicate rows, so the conversion alone was not enough.
-- `LDLDiagnostics.last_bound` measures the unlifted and auxiliary residual
-  norms on their own rows instead of recovering one from the other by
-  subtraction, which cancelled to zero when the auxiliary rows carried the
-  residual.
 
 ## [0.5.0] - 2026-09-08
 
@@ -387,7 +370,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.1...v0.3.2

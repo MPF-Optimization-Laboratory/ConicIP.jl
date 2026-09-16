@@ -45,6 +45,17 @@
 # * One `PhaseTimes` per measured call: the harness constructs a fresh one
 #   per repetition and keeps the whole record of the fastest repetition.
 
+"""
+    PhaseTimes()
+
+Accumulator for the opt-in per-phase instrumentation of [`conicIP`](@ref):
+pass one as `timing = pt` (or the MOI option `"timing"`) and the solver adds
+wall time in nanoseconds (`t_*` fields), allocation bytes (`b_*`) and counts
+(`n_*`) for each phase; see the header of `src/timing.jl` for the field
+contract. Use one object per measured call, [`reset!`](@ref) to reuse it,
+and [`phase_table`](@ref) to print it. `nothing` (the default) leaves the
+solver uninstrumented.
+"""
 mutable struct PhaseTimes
   # whole-call phases (additive)
   t_frontend::UInt64
@@ -133,7 +144,7 @@ overwritten and throw `UndefVarError`); use an anonymous function or hoist
 the definition. A `return`, `break` or `continue` inside `expr` keeps its
 control flow but leaves the TIMED span unaccounted, because the update runs
 only when `expr` completes normally; where a span can exit early, use
-[`@phase_start`](@ref) / [`@phase_stop`](@ref) and close the span on each
+[`@phase_start`](@ref) / `@phase_stop` and close the span on each
 exit path.
 """
 macro phase(timing, tfield, bfield, expr)

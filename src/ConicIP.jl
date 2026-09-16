@@ -397,7 +397,7 @@ end
 """
     nestod_soc!(sc::SOCScratch, z, s)
 
-In-place [`nestod_soc`](@ref): the same scaling matrix, with its factors
+In-place `nestod_soc`: the same scaling matrix, with its factors
 written into `sc` instead of freshly allocated vectors.
 """
 function nestod_soc!(sc::SOCScratch, z, s)

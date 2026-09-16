@@ -19,13 +19,19 @@ release: `benchmark/strip-release.sh <ver>` creates `release-<ver>` from `dev` w
 private paths removed and prints the remaining references to clean by hand (CLAUDE.md
 benchmarking lines, CHANGELOG mentions, test includes); then bump `Project.toml`, add the
 CHANGELOG header, run the suite under the current Julia and 1.10, build the docs, push,
-`gh pr create`, merge, `@JuliaRegistrator register`. After the merge, `git merge master`
-into `dev`. **The merge does not conflict: it silently deletes every private path and
-applies the strip's edits to CLAUDE.md, CHANGELOG, .gitignore, test/Project.toml and
-test/runtests.jl** (master's strip commit removed them and `dev` had not touched them
-since). Immediately `git checkout <dev-before-merge> -- <strip list and the five files>`,
-re-apply master's public CHANGELOG hunks (version header, links), check
-`git diff --stat master dev` shows only the private paths, and `--amend` the merge.
+`gh pr create`, **squash-merge** (`gh pr merge --squash --delete-branch` with a curated
+subject and body: the individual commit messages on `dev` cite private artifacts and
+other solvers by name, and a squash keeps them out of `master`'s history; 0.6.0 was the
+first release done this way, 0.5.0 was a merge commit), then comment
+`@JuliaRegistrator register` on the squash commit. After the merge, `git merge master`
+into `dev`: with a squash it conflicts only where `dev` and the release edited the same
+lines (CHANGELOG, and any file the release tree touched after the strip, e.g. docstrings
+added for the docs build); take `master`'s side for public files and `dev`'s CHANGELOG,
+then re-apply master's version header and links. Keep `dev`'s CHANGELOG equal to
+master's plus the private-artifact bullets, nothing else, so the next strip is only the
+grep the script prints. Check `git diff --stat master dev` shows only the private paths
+and the five strip-edited files. (Before 0.6.0, with a merge commit, the merge silently
+deleted every private path instead; that no longer applies.)
 
 ## Private paths (the strip list)
 
