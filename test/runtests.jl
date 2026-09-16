@@ -20,7 +20,7 @@ function compare(s1, s2::Dict)
             abs(s1.duFeas - s2[:duFeas]) < tol)
 end
 
-@testset "ConicIP" begin
+@testset verbose = true "ConicIP" begin
 
     Random.seed!(0)
 
@@ -3658,6 +3658,63 @@ end
             @test isempty(opt.c_int)
             @test opt.ineq_A === nothing
             @test isempty(opt.ineq_b)
+        end
+    end
+
+    @testset "Variable-bound indices follow the variable map" begin
+        # MOI requires the index value of a `VariableIndex`-in-`S`
+        # constraint to be the index value of its variable, so a bound on a
+        # variable that a deletion renumbered into another column has to be
+        # renumbered with it. Both routes of `optimize!` — direct assembly
+        # from `src`, and the cache copy `_variable_columns` falls back to —
+        # must return the same map and answer result queries through it.
+        function bound_src(pad::Int)
+            src = MOI.Utilities.Model{Float64}()
+            extra = MOI.add_variables(src, pad)
+            x = MOI.add_variables(src, 3)
+            for v in extra
+                MOI.delete(src, v)
+            end
+            MOI.delete(src, x[1])      # x[2], x[3] become columns 1, 2
+            c3 = MOI.add_constraint(src, x[3], MOI.GreaterThan(1.0))
+            c2 = MOI.add_constraint(src, x[2], MOI.GreaterThan(2.0))
+            # A non-VariableIndex constraint keeps the caller's own index.
+            ca = MOI.add_constraint(src, MOI.ScalarAffineFunction(
+                     [MOI.ScalarAffineTerm(1.0, x[2]),
+                      MOI.ScalarAffineTerm(1.0, x[3])], 0.0),
+                 MOI.GreaterThan(0.0))
+            MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, x[2]),
+                                          MOI.ScalarAffineTerm(1.0, x[3])], 0.0))
+            return src, x, c2, c3, ca
+        end
+        # pad = 0 keeps the index values small, so assembly reads `src` in
+        # place; pad = 10_301 pushes the largest value past the
+        # `maxv > 100n + 10_000` guard and forces the copy route.
+        for pad in (0, 10_301)
+            src, x, c2, c3, ca = bound_src(pad)
+            @test (ConicIP._variable_columns(src) === nothing) == (pad > 0)
+            opt = ConicIP.Optimizer()
+            MOI.set(opt, MOI.Silent(), true)
+            index_map, _ = MOI.optimize!(opt, src)
+            @test index_map[x[2]] == MOI.VariableIndex(1)
+            @test index_map[x[3]] == MOI.VariableIndex(2)
+            for (ci, v) in ((c2, x[2]), (c3, x[3]))
+                mapped = index_map[ci]
+                @test mapped isa
+                      MOI.ConstraintIndex{MOI.VariableIndex, MOI.GreaterThan{Float64}}
+                @test mapped.value == index_map[v].value
+            end
+            pad == 0 && @test index_map[ca] == ca
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test MOI.get(opt, MOI.VariablePrimal(), index_map[x[2]]) ≈ 2.0 atol=1e-5
+            @test MOI.get(opt, MOI.VariablePrimal(), index_map[x[3]]) ≈ 1.0 atol=1e-5
+            @test MOI.get(opt, MOI.ConstraintPrimal(), index_map[c2]) ≈ 2.0 atol=1e-5
+            @test MOI.get(opt, MOI.ConstraintPrimal(), index_map[c3]) ≈ 1.0 atol=1e-5
+            @test MOI.get(opt, MOI.ConstraintDual(), index_map[c2]) ≈ 1.0 atol=1e-5
+            @test MOI.get(opt, MOI.ConstraintDual(), index_map[c3]) ≈ 1.0 atol=1e-5
+            @test MOI.get(opt, MOI.ConstraintPrimal(), index_map[ca]) ≈ 3.0 atol=1e-5
         end
     end
 

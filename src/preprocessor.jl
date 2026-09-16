@@ -73,6 +73,10 @@ Before either, singleton equality rows (`gᵢⱼ yⱼ = dᵢ`) fix their variabl
 and are removed together with the column; the fixed values, their
 equality duals, and the objective values are restored on the way out
 (`fix_singletons = false` disables this step).
+
+`timing = pt` with a [`PhaseTimes`](@ref) charges the singleton and rank
+work to `t_presolve`, the restoration to `t_postsolve`, and forwards `pt`
+to the nested solve, which fills the remaining phases.
 """
 function preprocess_conicIP(Q, c::AbstractVector,
   A, b::AbstractVector, cone_dims,
@@ -81,10 +85,12 @@ function preprocess_conicIP(Q, c::AbstractVector,
   rank_check = :auto,
   fix_singletons = true,
   timeLimit = Inf,
+  timing = nothing,
   options...)
 
   t_start = time()
   time_left() = timeLimit - (time() - t_start)
+  gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
 
   if verbose == true
     println()
@@ -92,13 +98,15 @@ function preprocess_conicIP(Q, c::AbstractVector,
     println()
   end
 
-  fx = fix_singletons ? _singleton_fixings(G, d) : nothing
+  fx = @phase timing t_presolve b_presolve (fix_singletons ? _singleton_fixings(G, d) : nothing)
   if fx === nothing
-    return _preprocess_core(Q, c, A, b, cone_dims, G, d;
-                            verbose = verbose, rank_check = rank_check, timeLimit = time_left(), options...)
+    return gc_stop!(timing, gc0, _preprocess_core(Q, c, A, b, cone_dims, G, d;
+                            verbose = verbose, rank_check = rank_check, timeLimit = time_left(),
+                            timing = timing, options...))
   end
 
   n = length(c); m = size(A, 1); p = size(G, 1)
+  nanv(k) = fill(NaN, k)
   # rows: every singleton row dropped (rowcols: its column; primary: the
   # first row on that column, or a consistent duplicate); cols/vals: the
   # distinct fixed columns and their values.
@@ -108,48 +116,59 @@ function preprocess_conicIP(Q, c::AbstractVector,
     # Two singleton rows i, k on column j with dᵢ/gᵢⱼ ≠ dₖ/gₖⱼ. The Farkas
     # ray w = ±(eᵢ/gᵢⱼ − eₖ/gₖⱼ), v = 0 has Gᵀw = 0 and dᵀw ≠ 0; pick the
     # sign with dᵀw < 0 and let the validator normalize and confirm it.
-    (i, k, j) = conflict
-    Gs = sparse(G)
-    w0 = zeros(p); w0[i] = 1 / Gs[i, j]; w0[k] = -1 / Gs[k, j]
-    dot(d, w0) > 0 && (w0 .= .-w0)
-    opts = (; options...)
-    (chk, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims, G, d,
-        w0, zeros(m); abstol = get(opts, :infeasAbsTol, 1e-9),
-                      reltol = get(opts, :infeasTol, 1e-7))
-    if verbose
-      println("   - Conflicting singleton equality rows $i and $k on variable $j",
-              chk.valid ? " (certified infeasible)" : " (no valid certificate)")
-    end
-    nanv(k) = fill(NaN, k)
-    return chk.valid ?
-      Solution(nanv(n), w̄, v̄, nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
-      Solution(nanv(n), nanv(p), nanv(m), nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+    # (The block evaluates to the Solution so the phase closes before the
+    # return.)
+    return gc_stop!(timing, gc0, @phase timing t_presolve b_presolve begin
+      (i, k, j) = conflict
+      Gs = sparse(G)
+      w0 = zeros(p); w0[i] = 1 / Gs[i, j]; w0[k] = -1 / Gs[k, j]
+      dot(d, w0) > 0 && (w0 .= .-w0)
+      opts = (; options...)
+      (chk, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims, G, d,
+          w0, zeros(m); abstol = get(opts, :infeasAbsTol, 1e-9),
+                        reltol = get(opts, :infeasTol, 1e-7))
+      if verbose
+        println("   - Conflicting singleton equality rows $i and $k on variable $j",
+                chk.valid ? " (certified infeasible)" : " (no valid certificate)")
+      end
+      chk.valid ?
+        Solution(nanv(n), w̄, v̄, nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
+        Solution(nanv(n), nanv(p), nanv(m), nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+    end)
   end
 
-  keepc = setdiff(1:n, cols)
-  keepr = setdiff(1:p, rows)
-  yfix  = zeros(n); yfix[cols] = vals
-  if verbose
-    println("   - Fixing $(length(cols)) variable(s) from singleton equality rows")
-  end
-
-  # Reduced data: ½ȳᵀQ̄ȳ − c̄ᵀȳ with c̄ = c − Q[:,F] y_F on the kept columns,
+  # Index construction and reduced data (presolve). Reduced data:
+  # ½ȳᵀQ̄ȳ − c̄ᵀȳ with c̄ = c − Q[:,F] y_F on the kept columns,
   # Ā ȳ ≥ b − A[:,F] y_F, Ḡ ȳ = d − G[:,F] y_F on the kept rows.
-  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
-  cr = (c - Qs * yfix)[keepc]
-  br = b - As * yfix
-  dr = (d - Gs * yfix)[keepr]
   # The reduced objective omits the constant ½y_FᵀQ_FF y_F − c_Fᵀy_F of the
   # fixed variables. It is passed through as `objective_offset` so that the
   # reduced solve's relative gap test ⟨v,s⟩/(1 + |pobj|) is the full
   # problem's, not one scaled by a possibly much smaller reduced objective.
   # A caller-supplied offset (nested presolves) is added to it.
-  opts0  = (; options...)
-  offset = 0.5 * dot(yfix, Qs * yfix) - dot(c, yfix) + get(opts0, :objective_offset, 0.0)
-  sol = _preprocess_core(Qs[keepc, keepc], cr, As[:, keepc], br, cone_dims,
-                         Gs[keepr, keepc], dr;
+  opts0 = (; options...)
+  (keepc, keepr, Qs, As, Gs, Qr, cr, Ar, br, Gr, dr, offset) =
+    @phase timing t_presolve b_presolve begin
+      keepc = setdiff(1:n, cols)
+      keepr = setdiff(1:p, rows)
+      yfix  = zeros(n); yfix[cols] = vals
+      if verbose
+        println("   - Fixing $(length(cols)) variable(s) from singleton equality rows")
+      end
+      Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+      cr = (c - Qs * yfix)[keepc]
+      br = b - As * yfix
+      dr = (d - Gs * yfix)[keepr]
+      offset = 0.5 * dot(yfix, Qs * yfix) - dot(c, yfix) + get(opts0, :objective_offset, 0.0)
+      (keepc, keepr, Qs, As, Gs, Qs[keepc, keepc], cr, As[:, keepc], br,
+       Gs[keepr, keepc], dr, offset)
+    end
+
+  # The nested solve is timed by the solver itself (never inside the
+  # presolve phase).
+  sol = _preprocess_core(Qr, cr, Ar, br, cone_dims, Gr, dr;
                          verbose = verbose, rank_check = rank_check,
                          objective_offset = offset, timeLimit = time_left(),
+                         timing = timing,
                          Base.structdiff(opts0, NamedTuple{(:objective_offset,)})...)
 
   # Postsolve. The primal is the fixed value on F. The dual of the primary
@@ -160,44 +179,46 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # row's stationarity formula exact). Rays: a primal ray has zero fixed
   # components; a Farkas ray needs wᵢ chosen so that column j of Gᵀw − Aᵀv
   # vanishes, which is the same formula with c and Qy dropped.
-  y = fill(NaN, n); w = fill(NaN, p)
-  if all(isfinite, sol.y)
-    y[keepc] = sol.y
-    if sol.status == :DualInfeasible && sol.has_certificate
-      y[cols] .= 0.0
-    else
-      y[cols] = vals
+  return gc_stop!(timing, gc0, @phase timing t_postsolve begin
+    y = fill(NaN, n); w = fill(NaN, p)
+    if all(isfinite, sol.y)
+      y[keepc] = sol.y
+      if sol.status == :DualInfeasible && sol.has_certificate
+        y[cols] .= 0.0
+      else
+        y[cols] = vals
+      end
     end
-  end
-  if all(isfinite, sol.w) && all(isfinite, sol.v)
-    w[keepr] = sol.w
-    ray = sol.status == :Infeasible && sol.has_certificate
-    wk = zeros(p); wk[keepr] = sol.w
-    rhs = ray ? (As' * sol.v) : (c - Qs * y + As' * sol.v)
-    w[rows[.!primary]] .= 0.0                     # duplicates first: they enter `other` as 0
-    for (i, j, isprimary) in zip(rows, rowcols, primary)
-      isprimary || continue
-      gij = Gs[i, j]
-      other = dot(Gs[:, j], wk) - gij * wk[i]     # Σ_{k≠i} gₖⱼ wₖ (wk[i] = 0)
-      w[i] = (rhs[j] - other) / gij
-      wk[i] = w[i]
+    if all(isfinite, sol.w) && all(isfinite, sol.v)
+      w[keepr] = sol.w
+      ray = sol.status == :Infeasible && sol.has_certificate
+      wk = zeros(p); wk[keepr] = sol.w
+      rhs = ray ? (As' * sol.v) : (c - Qs * y + As' * sol.v)
+      w[rows[.!primary]] .= 0.0                     # duplicates first: they enter `other` as 0
+      for (i, j, isprimary) in zip(rows, rowcols, primary)
+        isprimary || continue
+        gij = Gs[i, j]
+        other = dot(Gs[:, j], wk) - gij * wk[i]     # Σ_{k≠i} gₖⱼ wₖ (wk[i] = 0)
+        w[i] = (rhs[j] - other) / gij
+        wk[i] = w[i]
+      end
     end
-  end
-  sol.y = y; sol.w = w
-  if sol.status == :DualInfeasible && sol.has_certificate && all(isfinite, y)
-    sol.s = As * y
-  elseif all(isfinite, y) && all(isfinite, w) && all(isfinite, sol.v) && all(isfinite, sol.s)
-    # Objective values of the full problem: the reduced solve dropped the
-    # constant ½y_FᵀQ_FF y_F − c_Fᵀy_F carried by the fixed variables.
-    Qy = Qs * y
-    sol.pobj = 0.5 * dot(y, Qy) - dot(c, y)
-    sol.dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, sol.v)
-  end
-  return _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
-      optTol = get(opts0, :optTol, 1e-6),
-      objective_offset = get(opts0, :objective_offset, 0.0),
-      infeasTol = get(opts0, :infeasTol, 1e-7),
-      infeasAbsTol = get(opts0, :infeasAbsTol, 1e-9))
+    sol.y = y; sol.w = w
+    if sol.status == :DualInfeasible && sol.has_certificate && all(isfinite, y)
+      sol.s = As * y
+    elseif all(isfinite, y) && all(isfinite, w) && all(isfinite, sol.v) && all(isfinite, sol.s)
+      # Objective values of the full problem: the reduced solve dropped the
+      # constant ½y_FᵀQ_FF y_F − c_Fᵀy_F carried by the fixed variables.
+      Qy = Qs * y
+      sol.pobj = 0.5 * dot(y, Qy) - dot(c, y)
+      sol.dobj = -0.5 * dot(y, Qy) - dot(d, w) + dot(b, sol.v)
+    end
+    _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
+        optTol = get(opts0, :optTol, 1e-6),
+        objective_offset = get(opts0, :objective_offset, 0.0),
+        infeasTol = get(opts0, :infeasTol, 1e-7),
+        infeasAbsTol = get(opts0, :infeasAbsTol, 1e-9))
+  end)
 end
 
 # Singleton equality rows: rows of G with exactly one structural nonzero.
@@ -252,6 +273,7 @@ function _preprocess_core(Q, c::AbstractVector,
   G = spzeros(0,length(c)), d = zeros(0);
   verbose = false,
   rank_check = :auto,
+  timing = nothing,
   options...)
 
   n = length(c) # Number of variables
@@ -261,6 +283,7 @@ function _preprocess_core(Q, c::AbstractVector,
   # Certificate tolerances: honour whatever is forwarded to conicIP, and
   # otherwise fall back on conicIP's own defaults.
   t_start = time()
+  gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
   opts   = (; options...)
   reltol = get(opts, :infeasTol,    1e-7)
   abstol = get(opts, :infeasAbsTol, 1e-9)
@@ -273,81 +296,94 @@ function _preprocess_core(Q, c::AbstractVector,
   rc in (:auto, :always, :never) ||
     throw(ArgumentError("rank_check must be :auto, :always or :never (got $rank_check)"))
   ks = get(opts, :kktsolver, default_kktsolver)
-  do_rank = rc == :always ? true :
-            rc == :never  ? false :
-            (ks === default_kktsolver ? choose_kktsolver(Q, A, G, cone_dims) !== kktsolver_ldl :
-                                        !(ks === kktsolver_ldl || ks isa cached_kktsolver_ldl))
 
-  if !do_rank
-    if verbose; println("   - Rank detection skipped (KKT solver regularizes)"); end
-    IP = collect(1:p); pconsistent = true
-    ID = collect(1:n); dconsistent = true
-  else
-    (IP, pconsistent) = imcols(G, d)
-  end
+  # Presolve phase: solver routing, both rank detections and the
+  # consistency certificates. The block evaluates to a terminal `Solution`
+  # when the data is inconsistent (returned below, after the phase closes)
+  # and to the kept index sets otherwise.
+  pre = @phase timing t_presolve b_presolve begin
+    do_rank = rc == :always ? true :
+              rc == :never  ? false :
+              (ks === default_kktsolver ? choose_kktsolver(Q, A, G, cone_dims) !== kktsolver_ldl :
+                                          !(ks === kktsolver_ldl || ks isa cached_kktsolver_ldl))
 
-  if !pconsistent
-
-    # Gy = d has no solution. The least-squares residual r = d - G(G\d) is
-    # orthogonal to range(G), so Gᵀ(-r) = 0 and dᵀ(-r) = -‖r‖² < 0: the pair
-    # (w,v) = (-r, 0) is a Farkas ray (v = 0 ∈ K trivially). Solve through
-    # sparse QR, which is rank-revealing — plain \ throws SingularException
-    # for a square rank-deficient G. A failed solve just means no certificate.
-    r = try d - G*(qr(sparse(G)) \ d) catch; fill(NaN, p) end
-    (check, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims,
-      G, d, -r, zeros(m); abstol = abstol, reltol = reltol)
-
-    if verbose == true
-      println("   - Primal equality constraints inconsistent",
-              check.valid ? " (certified)" : " (no valid certificate)")
+    if !do_rank
+      if verbose; println("   - Rank detection skipped (KKT solver regularizes)"); end
+      IP = collect(1:p); pconsistent = true
+      ID = collect(1:n); dconsistent = true
+    else
+      (IP, pconsistent) = imcols(G, d)
     end
 
-    return check.valid ?
-      ConicIP.Solution(nanvec(n), w̄, v̄, nanvec(m),
-        :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
-      ConicIP.Solution(nanvec(n), nanvec(p), nanvec(m), nanvec(m),
-        :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+    if !pconsistent
 
-  end
+      # Gy = d has no solution. The least-squares residual r = d - G(G\d) is
+      # orthogonal to range(G), so Gᵀ(-r) = 0 and dᵀ(-r) = -‖r‖² < 0: the pair
+      # (w,v) = (-r, 0) is a Farkas ray (v = 0 ∈ K trivially). Solve through
+      # sparse QR, which is rank-revealing — plain \ throws SingularException
+      # for a square rank-deficient G. A failed solve just means no certificate.
+      r = try d - G*(qr(sparse(G)) \ d) catch; fill(NaN, p) end
+      (check, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims,
+        G, d, -r, zeros(m); abstol = abstol, reltol = reltol)
 
-  if do_rank
-    (ID, dconsistent) = imcols([Q A' G[IP,:]'], c)
-  end
+      if verbose == true
+        println("   - Primal equality constraints inconsistent",
+                check.valid ? " (certified)" : " (no valid certificate)")
+      end
 
-  if !dconsistent
+      check.valid ?
+        ConicIP.Solution(nanvec(n), w̄, v̄, nanvec(m),
+          :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
+        ConicIP.Solution(nanvec(n), nanvec(p), nanvec(m), nanvec(m),
+          :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
 
-    # c ∉ range(M), M = [Q Aᵀ G_IPᵀ]: the dual is inconsistent, which is
-    # primal unboundedness. The residual y = c - M(M\c) lies in null(Mᵀ), so
-    # Qy = 0, Ay = 0 ∈ K (on the boundary), Gy = 0, and cᵀy = ‖y‖² > 0.
-    M = [Q A' G[IP,:]']
-    y_res = try c - M*(qr(sparse(M)) \ c) catch; fill(NaN, n) end
-    (check, ȳ) = validate_unboundedness_certificate(Q, c, A, b, cone_dims,
-      G, d, y_res; abstol = abstol, reltol = reltol)
+    else
 
-    if verbose == true
-      println("   - Dual equality constraints inconsistent (primal unbounded)",
-              check.valid ? " (certified)" : " (no valid certificate)")
+      if do_rank
+        (ID, dconsistent) = imcols([Q A' G[IP,:]'], c)
+      end
+
+      if !dconsistent
+
+        # c ∉ range(M), M = [Q Aᵀ G_IPᵀ]: the dual is inconsistent, which is
+        # primal unboundedness. The residual y = c - M(M\c) lies in null(Mᵀ), so
+        # Qy = 0, Ay = 0 ∈ K (on the boundary), Gy = 0, and cᵀy = ‖y‖² > 0.
+        M = [Q A' G[IP,:]']
+        y_res = try c - M*(qr(sparse(M)) \ c) catch; fill(NaN, n) end
+        (check, ȳ) = validate_unboundedness_certificate(Q, c, A, b, cone_dims,
+          G, d, y_res; abstol = abstol, reltol = reltol)
+
+        if verbose == true
+          println("   - Dual equality constraints inconsistent (primal unbounded)",
+                  check.valid ? " (certified)" : " (no valid certificate)")
+        end
+
+        check.valid ?
+          ConicIP.Solution(ȳ, nanvec(p), nanvec(m), A*ȳ,
+            :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
+          ConicIP.Solution(nanvec(n), nanvec(p), nanvec(m), nanvec(m),
+            :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
+
+      else
+
+        if (verbose == true) && (length(IP) != p)
+          println("   - Removing $(p - length(IP)) redundant primal constraints ");
+        end
+
+        if (verbose == true) && (length(ID) != n)
+          println("   - Rank deficient dual constraints: enabling static regularization");
+        end
+
+        if (verbose == true) && do_rank && (length(ID) == n) && (length(IP) == p)
+          println("   - No changes made")
+        end
+
+        (IP, ID, do_rank)
+      end
     end
-
-    return check.valid ?
-      ConicIP.Solution(ȳ, nanvec(p), nanvec(m), A*ȳ,
-        :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
-      ConicIP.Solution(nanvec(n), nanvec(p), nanvec(m), nanvec(m),
-        :DualInfeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
-
   end
-
-  if (verbose == true) && (length(IP) != p)
-    println("   - Removing $(p - length(IP)) redundant primal constraints ");
-  end
-
-  if (verbose == true) && (length(ID) != n)
-    println("   - Rank deficient dual constraints: enabling static regularization");
-  end
-
-  if (verbose == true) && do_rank && (length(ID) == n) && (length(IP) == p)
-    println("   - No changes made")
-  end
+  pre isa Solution && return gc_stop!(timing, gc0, pre)
+  (IP, ID, do_rank) = pre
 
   # Rank deficiency in [Q Aᵀ G_IPᵀ] used to be patched by adding a 0/1 diagonal
   # to Q, which silently changes the objective. Instead opt into conicIP's static
@@ -363,10 +399,15 @@ function _preprocess_core(Q, c::AbstractVector,
   timeLimit = get(opts, :timeLimit, Inf)
   time_left() = timeLimit - (time() - t_start)
 
-  sol = conicIP(Q, c, A, b, cone_dims, G[IP,:], d[IP];
+  # The row selection G[IP,:] is presolve materialization; the solve itself
+  # keeps its own phase accounts through `timing`.
+  (GIP, dIP) = @phase timing t_presolve b_presolve (G[IP,:], d[IP])
+
+  sol = conicIP(Q, c, A, b, cone_dims, GIP, dIP;
     verbose = verbose,       #                   |
     staticReg = reg,         # Removed redundant linear constraints
     timeLimit = time_left(),
+    timing = timing,
     rest...)                 # TODO : (use view?)
 
   # One retry with static regularization on a numerical (:Error) failure,
@@ -377,22 +418,9 @@ function _preprocess_core(Q, c::AbstractVector,
   if sol.status == :Error && do_rank && reg == 0.0 && !haskey(opts, :staticReg) &&
      time_left() > 0
     if verbose; println("   - KKT failure; retrying once with staticReg = 1e-8"); end
-    sol = conicIP(Q, c, A, b, cone_dims, G[IP,:], d[IP];
-      verbose = verbose, staticReg = 1e-8, timeLimit = time_left(), rest...)
-  end
-
-  # Re-expand the equality duals over the original rows, zero on the dropped
-  # ones. This is exact for the two quantities the certificate identity uses:
-  # Gᵀw_full = Σ_{i∈IP} w_i gᵢ = G[IP,:]ᵀ sol.w and dᵀw_full = d[IP]ᵀ sol.w,
-  # since the dropped entries are zero. What the dropped rows being (numerical)
-  # combinations of the kept ones buys us is that the reduced feasible set is
-  # the original one -- imcols only checked that to tolerance ϵ, so a ray for
-  # the reduced data need not certify the original data to the certificate
-  # tolerance. Hence the re-validation below rather than a bare re-expansion.
-  if all(isfinite, sol.w)
-    w = zeros(p); w[IP] = sol.w; sol.w = w
-  else
-    sol.w = nanvec(p)   # keep a non-certificate ray NaN rather than part-zero
+    sol = conicIP(Q, c, A, b, cone_dims, GIP, dIP;
+      verbose = verbose, staticReg = 1e-8, timeLimit = time_left(),
+      timing = timing, rest...)
   end
 
   # A ray that certifies the reduced data but not the original one means the
@@ -401,7 +429,8 @@ function _preprocess_core(Q, c::AbstractVector,
   # nothing about the caller's problem, so it must not survive as a terminal
   # status: downgrade to :Error rather than report an uncertified claim.
   # The iterate belongs to a different problem, so it is NaN'd rather than
-  # returned as a "best iterate".
+  # returned as a "best iterate". (Defined outside the postsolve phase
+  # because `@phase` expands its body twice; it is only called inside it.)
   function retract!(sol, claim)
     dropped = setdiff(1:p, IP)
     sol.y = nanvec(n); sol.w = nanvec(p); sol.v = nanvec(m); sol.s = nanvec(m)
@@ -410,35 +439,54 @@ function _preprocess_core(Q, c::AbstractVector,
     sol.message = string(claim, " claimed on the reduced equality system ",
                          "(dropped rows ", dropped, ") but the ray does not ",
                          "certify the original data")
-    return sol
+    return gc_stop!(timing, gc0, sol)
   end
 
-  if sol.status == :Infeasible && sol.has_certificate
-    (check, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims,
-      G, d, sol.w, sol.v; abstol = abstol, reltol = reltol)
-    if check.valid
-      sol.w = w̄; sol.v = v̄
+  # Postsolve phase: dual re-expansion, certificate revalidation against the
+  # full data, and the KKT check on the original data.
+  return gc_stop!(timing, gc0, @phase timing t_postsolve begin
+    # Re-expand the equality duals over the original rows, zero on the dropped
+    # ones. This is exact for the two quantities the certificate identity uses:
+    # Gᵀw_full = Σ_{i∈IP} w_i gᵢ = G[IP,:]ᵀ sol.w and dᵀw_full = d[IP]ᵀ sol.w,
+    # since the dropped entries are zero. What the dropped rows being (numerical)
+    # combinations of the kept ones buys us is that the reduced feasible set is
+    # the original one -- imcols only checked that to tolerance ϵ, so a ray for
+    # the reduced data need not certify the original data to the certificate
+    # tolerance. Hence the re-validation below rather than a bare re-expansion.
+    if all(isfinite, sol.w)
+      w = zeros(p); w[IP] = sol.w; sol.w = w
     else
-      return retract!(sol, :Infeasible)
+      sol.w = nanvec(p)   # keep a non-certificate ray NaN rather than part-zero
     end
-  end
 
-  # Same for an unbounded ray: it satisfies Gȳ ≈ 0 on the reduced rows only,
-  # so re-validate against the full G before letting the certificate stand.
-  if sol.status == :DualInfeasible && sol.has_certificate
-    (check, ȳ) = validate_unboundedness_certificate(Q, c, A, b, cone_dims,
-      G, d, sol.y; abstol = abstol, reltol = reltol)
-    if check.valid
-      sol.y = ȳ; sol.s = A*ȳ
-    else
-      return retract!(sol, :DualInfeasible)
+    retracted = false
+    if sol.status == :Infeasible && sol.has_certificate
+      (check, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims,
+        G, d, sol.w, sol.v; abstol = abstol, reltol = reltol)
+      if check.valid
+        sol.w = w̄; sol.v = v̄
+      else
+        retract!(sol, :Infeasible); retracted = true
+      end
     end
-  end
 
-  length(IP) == p && return sol
-  return _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
-      optTol = get(opts, :optTol, 1e-6),
-      objective_offset = get(opts, :objective_offset, 0.0),
-      infeasTol = reltol, infeasAbsTol = abstol)
+    # Same for an unbounded ray: it satisfies Gȳ ≈ 0 on the reduced rows only,
+    # so re-validate against the full G before letting the certificate stand.
+    if !retracted && sol.status == :DualInfeasible && sol.has_certificate
+      (check, ȳ) = validate_unboundedness_certificate(Q, c, A, b, cone_dims,
+        G, d, sol.y; abstol = abstol, reltol = reltol)
+      if check.valid
+        sol.y = ȳ; sol.s = A*ȳ
+      else
+        retract!(sol, :DualInfeasible); retracted = true
+      end
+    end
+
+    (retracted || length(IP) == p) ? sol :
+      _check_postsolve!(sol, Q, c, A, b, cone_dims, G, d;
+        optTol = get(opts, :optTol, 1e-6),
+        objective_offset = get(opts, :objective_offset, 0.0),
+        infeasTol = reltol, infeasAbsTol = abstol)
+  end)
 
 end

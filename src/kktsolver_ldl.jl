@@ -121,12 +121,34 @@ function _dense_FtF(Blk::VecCongurance)
 end
 _dense_FtF(Blk::AbstractMatrix) = Blk'Blk
 
-# Position of the structural entry (i, j) in K.nzval (K upper triangular).
-function _nzindex(K::SparseMatrixCSC, i::Int, j::Int)
-  r = @view K.rowval[K.colptr[j]:K.colptr[j+1]-1]
-  t = searchsortedfirst(r, i)
-  (t <= length(r) && r[t] == i) || error("structural entry ($i,$j) missing")
-  return K.colptr[j] - 1 + t
+# `sparse(M)` without the copy when M already is one. The pattern assembly
+# and the structure key below only read these matrices, and they copy each
+# column's row indices straight into K, so those indices have to be strictly
+# increasing — which is what a canonical SparseMatrixCSC stores, and what the
+# old COO route (`sparse(I, J, V)`) produced whatever it was handed. A
+# hand-built noncanonical matrix (duplicate or unsorted row indices in a
+# column) is canonicalized here instead: `sparse(findnz(M)...)` sums the
+# duplicates, exactly as the COO assembly did. The canonical case, which is
+# every matrix the solver builds itself, passes through untouched. Any other
+# matrix type (a transpose or adjoint wrapper, a view, a dense matrix) is
+# converted first and then goes through the same check: `sparse(D')` of a
+# noncanonical `D` keeps its duplicate rows, so the conversion alone is
+# not enough.
+function _csc(M::SparseMatrixCSC)
+  _rows_strictly_increasing(M) && return M
+  return sparse(findnz(M)..., size(M, 1), size(M, 2))
+end
+_csc(M::AbstractMatrix) = _csc(sparse(M))
+
+function _rows_strictly_increasing(M::SparseMatrixCSC)
+  rows = rowvals(M)
+  @inbounds for j in 1:size(M, 2)
+    r = nzrange(M, j)
+    for t in (first(r) + 1):last(r)
+      rows[t] > rows[t-1] || return false
+    end
+  end
+  return true
 end
 
 # y = K x for K stored as its upper triangle.
@@ -163,7 +185,26 @@ reachable through `kkt_diagnostics(solve3x3)` on the object its
 - `refactors` -- shift bumps applied to the current factorization;
   `refactors_total` sums them over the solve
 - `last_residual` -- unregularized residual norm `‖rhs − K₀x‖` of the last
-  `solve3x3` return
+  `solve3x3` return, over the LIFTED system (auxiliary rows included)
+- `last_rtol` -- the tolerance `refine_tol·(1 + ‖rhs‖)` that the internal
+  refinement of that solve aimed at, so a caller can tell a solve that met
+  its own target from one that gave up
+- `last_bound` -- upper bound on the residual norm of the UNLIFTED 3×3
+  system `‖(bx, by, −bz) − K₃ₓ₃ x₃ₓ₃‖` for the same solution. It is
+  `‖r_u‖ + lift_gain·‖r_a‖`, where `r_u`/`r_a` split the lifted residual
+  into its 3×3 rows and its auxiliary rows (eliminating the auxiliaries
+  `a = uᵀz`, `b = vᵀz` from a residual `(r_u, r_a)` leaves
+  `r_u + [u v]·r_a` on the 3×3 rows, and `[u v]` per lifted block has
+  spectral norm at most `√(‖u‖² + ‖v‖²)`). Each norm is measured on its
+  own rows, so `last_bound` equals `last_residual` when nothing was lifted
+  and stays faithful when one part is orders of magnitude below the other
+- `lift_gain` -- `maxᵦ √(‖uᵦ‖² + ‖vᵦ‖²)` over the lifted second-order-cone
+  blocks of the current factorization; `0` when nothing is lifted
+- `timing` -- the `PhaseTimes` the backend reports into, or `nothing`
+  (the default). Set by `kkt_attach_timing!`; while attached, every
+  numeric refactorization, triangular solve, and residual evaluation adds
+  its wall time and a count to the `t_ldl_*` / `n_ldl_*` fields. With
+  `nothing` each of those sites costs one pointer comparison.
 """
 mutable struct LDLDiagnostics
   repaired        :: Int
@@ -175,8 +216,13 @@ mutable struct LDLDiagnostics
   refactors_total :: Int
   repaired_total  :: Int
   last_residual   :: Float64
+  last_rtol       :: Float64
+  last_bound      :: Float64
+  lift_gain       :: Float64
+  timing          :: Union{Nothing, PhaseTimes}
 end
-LDLDiagnostics(δp, δe, δc) = LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN)
+LDLDiagnostics(δp, δe, δc) =
+  LDLDiagnostics(0, 0, δp, δe, δc, 0, 0, 0, NaN, NaN, NaN, 0.0, nothing)
 
 # The callable `kktsolver_ldl` hands back from `solve3x3gen`: the solve
 # closure, the regularization bump for tests and diagnosis, and the shared
@@ -188,6 +234,29 @@ struct LDLSolve3x3{S, B}
 end
 (s::LDLSolve3x3)(bx, by, bz) = s.solve(bx, by, bz)
 kkt_diagnostics(s::LDLSolve3x3) = s.diag
+
+# The generator `kktsolver_ldl` returns (what the main loop calls
+# `solve3x3gen`): the factorization closure plus the shared diagnostics
+# record, so timing can be attached BEFORE the first factorization.
+struct LDLGen{G}
+  gen  :: G
+  diag :: LDLDiagnostics
+end
+(g::LDLGen)(F, F⁻ᵀ) = g.gen(F, F⁻ᵀ)
+kkt_diagnostics(g::LDLGen) = g.diag
+
+# The diagnostics record is shared by every factorization of one
+# `kktsolver_ldl` instance, so attaching once (to the generator or to any
+# factorization) keeps reporting until a different (or no) record is
+# attached.
+function kkt_attach_timing!(s::LDLSolve3x3, pt::PhaseTimes)
+  s.diag.timing = pt
+  return nothing
+end
+function kkt_attach_timing!(g::LDLGen, pt::PhaseTimes)
+  g.diag.timing = pt
+  return nothing
+end
 
 """
     kktsolver_ldl(Q, A, G, cone_dims;
@@ -238,7 +307,13 @@ Diagnostics: the object `solve3x3gen` returns is callable as before and
 carries an `LDLDiagnostics` record, reachable through
 `ConicIP.kkt_diagnostics(solve3x3)`; `conicIP` prints its counts in the
 verbose `kkt` column and sums them into `Solution.kkt_repaired` and
-`Solution.kkt_refactors`.
+`Solution.kkt_refactors`. `ConicIP.kkt_attach_timing!(solve3x3, pt)`
+makes the backend add the time and count of every numeric
+refactorization, triangular solve, and refinement residual to the
+`t_ldl_*` / `n_ldl_*` fields of `pt::PhaseTimes` (`conicIP` does this
+when called with `timing = pt`); the record is shared across the
+factorizations of one `kktsolver_ldl` instance, so the attachment
+persists.
 
 No rank assumption on `G`: dependent equality rows are handled by
 `δ_e` and the refinement. Semidefinite blocks are supported through a
@@ -308,22 +383,55 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   cand = zeros(N); keep = zeros(N)
   vbuf = Float64[]
 
+  # The timed sites below branch on `pt === nothing`, where `pt` is
+  # `diag.timing` read once per solve3x3 call and PASSED DOWN as an argument:
+  # capturing `diag` in these closures instead would grow the per-
+  # factorization object (closures are embedded by value), which is the
+  # allocation the timing-off path must not pay. Timestamps are local. See
+  # timing.jl.
+
   # res = rhs − K₀ x for the unregularized K₀ = K_δ − Diagonal(shift);
-  # returns ‖res‖.
-  function residual!(x)
+  # returns (‖res‖, ‖res over the 3×3 rows‖, ‖res over the lifted blocks'
+  # auxiliary rows‖). The last two are what `last_bound` is built from, and
+  # each is formed DIRECTLY by `norm` over its own rows: recovering the
+  # 3×3 part as √(‖res‖² − ‖r_a‖²) cancels catastrophically the moment the
+  # auxiliary rows dominate (an unlifted 1e-9 against an auxiliary 1 comes
+  # back as 0), and an explicit sum of squares can under/overflow where
+  # `norm` rescales. The views are contiguous, so each call is one BLAS
+  # nrm2 and allocates nothing. `ra` is zero when no second-order cone was
+  # lifted (N == oa), and `ru` is then ‖res‖ itself.
+  function residual!(x, pt)
+    t0 = pt === nothing ? UInt64(0) : time_ns()
     _symmul!(res, K, x)
     @inbounds for i in 1:N
       res[i] = rhs[i] - (res[i] - shift[i] * x[i])
     end
-    return norm(res)
+    r  = norm(res)
+    # Nothing lifted: the unlifted rows are all of them, and the norm is
+    # already paid for (one norm of N entries is ~0.2 ms at N = 80 000,
+    # once per back-solve).
+    ru = oa == N ? r   : norm(view(res, 1:oa))
+    ra = oa == N ? 0.0 : norm(view(res, (oa+1):N))
+    if pt !== nothing
+      pt.t_ldl_resid += time_ns() - t0
+      pt.n_ldl_resid += 1
+    end
+    return (r, ru, ra)
   end
 
-  # Numeric refactorization, recording what QDLDL did to the pivots.
+  # Numeric refactorization, recording what QDLDL did to the pivots
+  # (its dynamic regularization is part of refactor! and so of the time).
   function numeric_factor!()
+    pt = diag.timing
+    t0 = pt === nothing ? UInt64(0) : time_ns()
     refactor!(Fact)
     diag.repaired        = regularized_entries(Fact)
     diag.repaired_total += diag.repaired
     diag.pos_inertia     = positive_inertia(Fact)
+    if pt !== nothing
+      pt.t_ldl_factor += time_ns() - t0
+      pt.n_ldl_factor += 1
+    end
     return nothing
   end
 
@@ -349,6 +457,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       write_static!()
     end
     diag.refactors = 0
+    diag.lift_gain = 0.0
 
     # Rewrite the scaling entries (in K, for the residual, and in the
     # factorization's internal copy), then refactorize numerically.
@@ -356,7 +465,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       Blk = F.Blocks[bi]
       idx = blk_idx[bi]
       if kind == :diag
-        d = Blk isa Diagonal ? Blk.diag : diag(Matrix(Blk))
+        # `diag` is the diagnostics record here; qualify the function.
+        d = Blk isa Diagonal ? Blk.diag : LinearAlgebra.diag(Matrix(Blk))
         resize!(vbuf, length(idx))
         @inbounds for t in eachindex(idx)
           vbuf[t] = -(d[t]^2) - δc
@@ -381,6 +491,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
         end
         vbuf[3k + 1] =  1.0
         vbuf[3k + 2] = -1.0
+        # Spectral-norm bound of this block's [u v], for `last_bound`.
+        diag.lift_gain = max(diag.lift_gain, sqrt(dot(u, u) + dot(v, v)))
       end
       K.nzval[idx] .= vbuf
       update_values!(Fact, idx, vbuf)
@@ -396,26 +508,38 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     # refine_steps + 1 residual evaluations. Returns the best residual, the
     # tolerance, and whether the *first* correction already failed to
     # contract while the residual was still above the tolerance.
-    function solve_loaded!()
+    function solve_loaded!(pt)
       sol .= rhs
+      t0 = pt === nothing ? UInt64(0) : time_ns()
       solve!(Fact, sol)
+      if pt !== nothing
+        pt.t_ldl_solve += time_ns() - t0
+        pt.n_ldl_solve += 1
+      end
       rtol  = refine_tol * (1 + norm(rhs))
-      rbest = residual!(sol)
+      (rbest, ubest, abest) = residual!(sol, pt)
       noncontract = false
       for k in 1:refine_steps
         rbest <= rtol && break
         tmp .= res
+        t0 = pt === nothing ? UInt64(0) : time_ns()
         solve!(Fact, tmp)
+        if pt !== nothing
+          pt.t_ldl_solve += time_ns() - t0
+          pt.n_ldl_solve += 1
+        end
         cand .= sol .+ tmp
-        rcand = residual!(cand)
+        (rcand, ucand, acand) = residual!(cand, pt)
         if !(rcand < rbest)
           noncontract = (k == 1)
           break
         end
         sol .= cand
         rbest = rcand
+        ubest = ucand
+        abest = acand
       end
-      return (rbest, rtol, noncontract)
+      return (rbest, rtol, noncontract, ubest, abest)
     end
 
     function solve3x3(bx, by, bz)
@@ -423,31 +547,43 @@ function kktsolver_ldl(Q, A, G, cone_dims;
       rhs[n+1:n+p] .= by
       rhs[oz+1:oz+m] .= .-bz
       rhs[oa+1:N] .= 0.0
-      (rbest, rtol, noncontract) = solve_loaded!()
+      pt = diag.timing
+      (rbest, rtol, noncontract, ubest, abest) = solve_loaded!(pt)
       # Bounded retry: a solve that misses the tolerance on a factorization
       # that repaired pivots (or whose refinement did not contract at all)
       # is repeated with larger static shifts; the better result by
       # unregularized residual is kept.
       while rbest > rtol && (diag.repaired > 0 || noncontract) &&
             diag.refactors < retry_max
-        keep .= sol; rkeep = rbest
+        keep .= sol; rkeep = rbest; ukeep = ubest; akeep = abest
         bump!()
-        (rnew, _, noncontract) = solve_loaded!()
+        (rnew, _, noncontract, unew, anew) = solve_loaded!(pt)
         if rnew < rkeep
-          rbest = rnew
+          rbest = rnew; ubest = unew; abest = anew
         else
-          sol .= keep; rbest = rkeep
+          sol .= keep; rbest = rkeep; ubest = ukeep; abest = akeep
         end
       end
       diag.last_residual = rbest
-      return (sol[1:n], sol[n+1:n+p], sol[oz+1:oz+m])
+      diag.last_rtol     = rtol
+      # ‖r_u‖ + gain·‖r_a‖, both norms measured on their own rows by
+      # `residual!`. Nothing is recovered by subtraction here: with no lift
+      # (abest == 0) ubest IS rbest, and with one the two norms stay
+      # independent however far apart their scales are.
+      diag.last_bound = ubest + diag.lift_gain * abest
+      # Views, not slices: three copies of the solution per back-solve were
+      # the third-largest allocation site in the loop. The documented
+      # contract lets a backend hand back views of its own workspace — the
+      # main loop copies what it needs out before calling again — but a
+      # caller that keeps a result across two solves must copy it itself.
+      return (view(sol, 1:n), view(sol, (n+1):(n+p)), view(sol, (oz+1):(oz+m)))
     end
 
     return LDLSolve3x3(solve3x3, bump!, diag)
 
   end
 
-  return solve3x3gen
+  return LDLGen(solve3x3gen, diag)
 
 end
 
@@ -466,8 +602,9 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
                       perm_hint = nothing)
 
   n = size(Q, 1); m = size(A, 1); p = size(G, 1)
-  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
-  qdiag = Vector{Float64}(diag(Qs))     # Q's diagonal before the δp shift
+  Qs = _csc(Q); As = _csc(A); Gs = _csc(G)
+  qdiag = zeros(n)                # Q's diagonal before the δp shift; read
+                                  # off in the counting pass below
 
   ranges = cum_range([cd[2] for cd in cone_dims])
   kinds  = Symbol[]              # :diag, :dense, :lift per block
@@ -482,78 +619,159 @@ function _ldl_pattern(Q, A, G, cone_dims; lift_min::Int = 6,
   oz = n + p                      # offset of the z block
   oa = n + p + m                  # offset of the auxiliary block
 
-  # ── Upper-triangular pattern with placeholder values ──
-  Ii = Int[]; Jj = Int[]; Vv = Float64[]
-  function put!(i, j, v)
-    push!(Ii, i); push!(Jj, j); push!(Vv, v)
+  # The assembly below indexes K's columns straight from the source
+  # patterns, so a shape that does not fit the KKT block structure has to
+  # be rejected before the first @inbounds loop rather than inside it.
+  mcone = isempty(ranges) ? 0 : last(last(ranges))
+  (size(Qs, 2) == n && size(As, 2) == n && size(Gs, 2) == n && mcone == m) ||
+    throw(DimensionMismatch(
+      "_ldl_pattern: Q, A and G must have $n columns and cone_dims must " *
+      "cover all $m rows of A (got $(size(Qs, 2)), $(size(As, 2)), " *
+      "$(size(Gs, 2)) columns and $mcone cone rows)"))
+
+  # ── Upper triangle of K, assembled straight into CSC in O(nnz) ──
+  #
+  # Column layout (every column's rows come out ascending, because each
+  # source loop below runs over the source matrix column by column and the
+  # block entries of a column all sit below its data entries):
+  #
+  #   j ≤ n      strict upper triangle of Q's column j, then (j,j) = Qⱼⱼ + δp
+  #              (always present, whatever Q's pattern);
+  #   n + r      row r of G (as column r of Gᵀ), then (n+r, n+r) = −δe;
+  #   oz + i     column i of −Aᵀ, then the scaling entries of i's cone block;
+  #   oa + 2k∓1  a lifted block's two spike columns, then their pivots.
+  #
+  # Building the column counts first and filling through a per-column write
+  # cursor replaces the COO triplet list, its `sparse()` assembly, and the
+  # binary search that used to locate every scaling entry afterwards: the
+  # cursor *is* the index, so `blk_idx`, `qdiag_idx` and `ediag_idx` fall
+  # out of the same pass.
+  colptr = zeros(Int, N + 1)            # counts in colptr[c+1], cumsum below
+  @inbounds for j in 1:n
+    cnt = 1                             # the (j,j) entry, always present
+    for t in nzrange(Qs, j)
+      i = Qs.rowval[t]
+      if i < j
+        cnt += 1
+      else
+        # This column's own diagonal, on the way past: `diag(Qs)` would
+        # walk the same columns a second time.
+        i == j && (qdiag[j] = Qs.nzval[t])
+        break
+      end
+    end
+    colptr[j+1] = cnt
   end
-  rows, cols, vals = findnz(Qs)
-  for t in eachindex(rows)
-    rows[t] <= cols[t] && put!(rows[t], cols[t], vals[t])
+  @inbounds for j in 1:size(Gs, 2), t in nzrange(Gs, j)
+    colptr[n + Gs.rowval[t] + 1] += 1
   end
-  for i in 1:n
-    put!(i, i, δp)                # summed onto Qᵢᵢ by sparse()
+  @inbounds for r in 1:p
+    colptr[n + r + 1] += 1              # the −δe pivot
   end
-  rows, cols, vals = findnz(Gs)
-  for t in eachindex(rows)
-    put!(cols[t], n + rows[t], vals[t])
-  end
-  for r in 1:p
-    put!(n + r, n + r, -δe)
-  end
-  rows, cols, vals = findnz(As)
-  for t in eachindex(rows)
-    put!(cols[t], oz + rows[t], -vals[t])
+  @inbounds for j in 1:size(As, 2), t in nzrange(As, j)
+    colptr[oz + As.rowval[t] + 1] += 1
   end
   ilift = 0
-  for (kind, I) in zip(kinds, ranges)
-    if kind == :diag
-      for i in I; put!(oz + i, oz + i, -1.0); end
-    elseif kind == :dense
-      for b in I, a in first(I):b
-        put!(oz + a, oz + b, a == b ? -1.0 : 1.0)
-      end
+  @inbounds for (kind, I) in zip(kinds, ranges)
+    if kind == :dense
+      f = first(I)
+      for b in I; colptr[oz + b + 1] += b - f + 1; end
     else
-      ilift += 1
-      ca = oa + 2ilift - 1; cb = oa + 2ilift
-      for i in I
-        put!(oz + i, oz + i, -1.0)
-        put!(oz + i, ca, -1.0)
-        put!(oz + i, cb,  1.0)
+      for i in I; colptr[oz + i + 1] += 1; end
+      if kind == :lift
+        ilift += 1
+        colptr[oa + 2ilift] += length(I) + 1        # column oa + 2ilift − 1
+        colptr[oa + 2ilift + 1] += length(I) + 1    # column oa + 2ilift
       end
-      put!(ca, ca,  1.0)
-      put!(cb, cb, -1.0)
     end
   end
-  K = sparse(Ii, Jj, Vv, N, N)
+  colptr[1] = 1
+  @inbounds for c in 1:N; colptr[c+1] += colptr[c]; end
+  rowval = Vector{Int}(undef, colptr[N+1] - 1)
+  nzval  = Vector{Float64}(undef, colptr[N+1] - 1)
+  w = colptr[1:N]                       # per-column write cursor
 
-  # ── Index maps from each block's entries into K.nzval ──
+  qdiag_idx = Vector{Int}(undef, n)
+  @inbounds for j in 1:n
+    k = w[j]
+    for t in nzrange(Qs, j)
+      i = Qs.rowval[t]
+      i >= j && break
+      rowval[k] = i; nzval[k] = Qs.nzval[t]; k += 1
+    end
+    rowval[k] = j; nzval[k] = qdiag[j] + δp
+    qdiag_idx[j] = k
+    w[j] = k + 1
+  end
+  @inbounds for j in 1:size(Gs, 2), t in nzrange(Gs, j)
+    c = n + Gs.rowval[t]; k = w[c]
+    rowval[k] = j; nzval[k] = Gs.nzval[t]; w[c] = k + 1
+  end
+  ediag_idx = Vector{Int}(undef, p)
+  @inbounds for r in 1:p
+    c = n + r; k = w[c]
+    rowval[k] = c; nzval[k] = -δe; w[c] = k + 1
+    ediag_idx[r] = k
+  end
+  @inbounds for j in 1:size(As, 2), t in nzrange(As, j)
+    c = oz + As.rowval[t]; k = w[c]
+    rowval[k] = j; nzval[k] = -As.nzval[t]; w[c] = k + 1
+  end
+
+  # ── Scaling blocks, recording each entry's index into K.nzval as it is
+  #    written (same order as the block updates in kktsolver_ldl) ──
   blk_idx = Vector{Vector{Int}}(undef, length(kinds))
   ilift = 0
-  for (bi, (kind, I)) in enumerate(zip(kinds, ranges))
+  @inbounds for (bi, (kind, I)) in enumerate(zip(kinds, ranges))
+    nI = length(I)
     if kind == :diag
-      blk_idx[bi] = [_nzindex(K, oz + i, oz + i) for i in I]
+      idx = Vector{Int}(undef, nI)
+      for (q, i) in enumerate(I)
+        c = oz + i; k = w[c]
+        rowval[k] = c; nzval[k] = -1.0; w[c] = k + 1
+        idx[q] = k
+      end
+      blk_idx[bi] = idx
     elseif kind == :dense
-      idx = Int[]
-      for b in I, a in first(I):b
-        push!(idx, _nzindex(K, oz + a, oz + b))
+      f = first(I)
+      idx = Vector{Int}(undef, (nI * (nI + 1)) >> 1)
+      q = 0
+      for b in I
+        c = oz + b
+        for a in f:b
+          k = w[c]
+          rowval[k] = oz + a; nzval[k] = (a == b ? -1.0 : 1.0); w[c] = k + 1
+          idx[q += 1] = k
+        end
       end
       blk_idx[bi] = idx
     else
       ilift += 1
       ca = oa + 2ilift - 1; cb = oa + 2ilift
-      idx = Int[]
-      for i in I; push!(idx, _nzindex(K, oz + i, oz + i)); end
-      for i in I; push!(idx, _nzindex(K, oz + i, ca)); end
-      for i in I; push!(idx, _nzindex(K, oz + i, cb)); end
-      push!(idx, _nzindex(K, ca, ca)); push!(idx, _nzindex(K, cb, cb))
+      idx = Vector{Int}(undef, 3nI + 2)
+      for (q, i) in enumerate(I)
+        c = oz + i; k = w[c]
+        rowval[k] = c; nzval[k] = -1.0; w[c] = k + 1
+        idx[q] = k
+      end
+      for (q, i) in enumerate(I)
+        k = w[ca]
+        rowval[k] = oz + i; nzval[k] = -1.0; w[ca] = k + 1
+        idx[nI + q] = k
+      end
+      for (q, i) in enumerate(I)
+        k = w[cb]
+        rowval[k] = oz + i; nzval[k] = 1.0; w[cb] = k + 1
+        idx[2nI + q] = k
+      end
+      k = w[ca]; rowval[k] = ca; nzval[k] =  1.0; w[ca] = k + 1
+      idx[3nI + 1] = k
+      k = w[cb]; rowval[k] = cb; nzval[k] = -1.0; w[cb] = k + 1
+      idx[3nI + 2] = k
       blk_idx[bi] = idx
     end
   end
-  # Static-shift diagonals; every (i,i) and (n+r,n+r) exists structurally
-  # because of the put! calls above.
-  qdiag_idx = [_nzindex(K, i, i) for i in 1:n]
-  ediag_idx = [_nzindex(K, n + r, n + r) for r in 1:p]
+  K = SparseMatrixCSC(N, N, colptr, rowval, nzval)
 
   # Expected pivot signs of the quasi-definite pattern
   Dsigns = Vector{Int}(undef, N)
@@ -575,7 +793,7 @@ end
 
 # Structure key of a problem, for reusing an ordering across solves.
 _ldl_structure_key(Q, A, G, cone_dims) = begin
-  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  Qs = _csc(Q); As = _csc(A); Gs = _csc(G)
   (size(Qs), size(As), size(Gs), copy(cone_dims),
    copy(Qs.colptr), copy(Qs.rowval), copy(As.colptr), copy(As.rowval),
    copy(Gs.colptr), copy(Gs.rowval))

@@ -65,6 +65,77 @@
     @test t3_contract_residual(s3, cs) < 1e-10
     @test isfinite(dg.last_residual)
 
+    # `last_bound` bounds the residual of the UNLIFTED 3×3 system: the
+    # lifted auxiliary rows are eliminated and charged back through
+    # `lift_gain`, which is zero exactly when nothing was lifted (a "Q"
+    # block below kktsolver_ldl's lift_min = 6 stays dense). `last_rtol`
+    # is the target the internal refinement aimed at.
+    for mix in t3_mixes
+      csb = t3_contract_case(mix)
+      sb = ConicIP.kktsolver_ldl(csb.Q, csb.A, csb.G, mix)(csb.F, csb.F⁻ᵀ)
+      (x, y, z) = sb(csb.bx, csb.by, csb.bz)
+      db = ConicIP.kkt_diagnostics(sb)
+      nrhs = norm([csb.bx; csb.by; csb.bz])
+      @test db.last_rtol ≈ 1e-13 * (1 + nrhs)
+      lifted = any(t == "Q" && k >= 6 for (t, k) in mix)
+      @test (db.lift_gain > 0) == lifted
+      lifted || @test db.last_bound == db.last_residual
+      true3 = norm([csb.Q*x + csb.G'*y - csb.A'*z - csb.bx;
+                    csb.G*x - csb.by;
+                    csb.A*x + csb.F'*(csb.F*z) - csb.bz])
+      # The slack is this test's own evaluation error, not the bound's.
+      @test true3 <= db.last_bound + 1e-12 * (1 + nrhs)
+    end
+
+    # F4. `last_bound` is ‖r_u‖ + lift_gain·‖r_a‖ with both norms taken on
+    # their own rows. Recovering ‖r_u‖ as √(‖res‖² − ‖r_a‖²) — which is
+    # what it used to do — cancels away whenever the auxiliary rows carry
+    # the residual: below ‖r_u‖ = 1e-8·‖r_a‖ the subtraction returns 0 and
+    # the bound collapses to lift_gain·‖r_a‖. Scaling one right-hand side
+    # cannot expose that, because it moves both parts together; the case
+    # below drives them apart instead.
+    #
+    #   * the lifted cone's scaling is near singular — λ_min(FᵀF) = β²,
+    #     ‖u‖ ≈ w² ≫ β — so ‖z‖ reaches 1/β² and the auxiliary row
+    #     a = uᵀz is a cancelling dot product whose rounding alone leaves
+    #     ‖r_a‖ nine to twelve orders above ‖r_u‖;
+    #   * that cone's rows of A are zero, so the huge z never reaches the
+    #     x rows, which keep exactly the static shift's own residual
+    #     (δp·x, −δe·y) — the refinement is off, so nothing removes it,
+    #     and it stays 1e-8 of the data however the data is scaled;
+    #   * the dynamic regularization is off with the refinement: it would
+    #     repair the β² pivots and take the near singularity away.
+    #
+    # The old bound is then lift_gain·‖r_a‖, four to five orders under the
+    # residual it has to bound.
+    Random.seed!(6182)
+    for (β, σ) in ((1e-16, 1.0), (1e-18, 1.0), (1e-20, 1.0),
+                   (1e-18, 1e-3), (1e-18, 1e6))
+      w  = 10*sqrt(β)                      # ‖u‖ ≈ w²: lifted, but tiny gain
+      Fl = Block(2)
+      Fl[1] = Diagonal([1.0, 1.0])
+      Fl[2] = ConicIP.SymWoodbury(Diagonal([-β; fill(β, 5)]), [w; zeros(5)], 1.0)
+      Ql = sparse(Matrix(1.0I, 3, 3))
+      Gl = sparse([1.0 0.5 0.25])
+      Al = sparse([1.0 0.0 0.0; 0.0 1.0 0.0; zeros(6, 3)])   # lifted rows: no x
+      (bx, by, bz) = (σ .* randn(3), σ .* randn(1), σ .* randn(8))
+      sl = ConicIP.kktsolver_ldl(Ql, Al, Gl, [("R", 2), ("Q", 6)];
+                                 refine_steps = 0, dynamic_eps = 0.0)(
+             Fl, ConicIP.inv_adjoint!(Block(2), Fl))
+      (x, y, z) = sl(bx, by, bz)
+      dl = ConicIP.kkt_diagnostics(sl)
+      @test dl.lift_gain > 0                      # the mix does lift
+      @test dl.last_residual > 1e6 * dl.last_bound   # and carries ‖res‖
+      # Whatever the auxiliary rows do, ‖r_u‖ is at least the static
+      # shift's own residual δp·x on the x rows.
+      @test dl.last_bound >= 0.99 * dl.δp * norm(x)
+      r3 = norm([Ql*x + Gl'*y - Al'*z - bx;
+                 Gl*x - by;
+                 Al*x + Fl'*(Fl*z) - bz])
+      # The slack is this test's own evaluation error, not the bound's.
+      @test r3 <= dl.last_bound + 1e-14 * (1 + norm([bx; by; bz]))
+    end
+
     # The contract holds after a manual bump too, on every cone mix, and
     # the bump multiplies the base shift by retry_factor.
     for mix in t3_mixes
@@ -168,6 +239,76 @@
         @test sol.kkt_repaired == sol0.kkt_repaired
       end
     end
+  end
+
+  @testset "Outer refinement evaluates every residual" begin
+    # The outer 4×4 residual of every base solve is measured, never
+    # estimated: a screen that took the KKT backend's own bound in its
+    # place was withdrawn (the rounding of the s row scales with the
+    # operands of `λ∘F⁻ᵀΔs`, not with its result; see `refine!`). Hiding
+    # the backend's diagnostics behind a plain closure therefore changes
+    # nothing: the two runs agree bitwise AND in the number of residual
+    # evaluations.
+    hidden = (Q, A, G, cd) -> begin
+      gen = ConicIP.kktsolver_ldl(Q, A, G, cd)
+      (F, F⁻ᵀ) -> begin
+        s3 = gen(F, F⁻ᵀ)
+        (bx, by, bz) -> s3(bx, by, bz)
+      end
+    end
+    Random.seed!(20260915)
+    for mix in t3_mixes
+      cs = t3_contract_case(mix)
+      pt_on  = ConicIP.PhaseTimes()
+      pt_off = ConicIP.PhaseTimes()
+      son  = conicIP(cs.Q, cs.c, cs.A, cs.b, mix, cs.G, cs.d; verbose = false,
+                     kktsolver = ConicIP.kktsolver_ldl, timing = pt_on)
+      soff = conicIP(cs.Q, cs.c, cs.A, cs.b, mix, cs.G, cs.d; verbose = false,
+                     kktsolver = hidden, timing = pt_off)
+      @test son.status == soff.status == :Optimal
+      @test son.Iter == soff.Iter
+      @test son.kkt_solves == soff.kkt_solves
+      @test son.y == soff.y
+      @test son.s == soff.s
+      @test pt_on.n_refine_attempt == pt_off.n_refine_attempt
+      @test pt_on.n_refine_resid == pt_off.n_refine_resid
+      @test pt_on.n_refine_resid > pt_on.n_refine_attempt   # every base solve
+    end
+
+    # Why the backend's bound cannot stand in for the evaluation. The 3×3
+    # back-solve can be EXACT while the step `solve4x4!` builds from it is
+    # not: `Δs = t1 − FᵀFΔv` is one subtraction, and when the two terms are
+    # 2⁵⁹ apart the smaller one is lost entirely. With
+    #
+    #   Q = 2⁻¹²⁰,  A = 2⁻⁶⁰,  no equalities,  F = F⁻ᵀ = I,  λ = 1,
+    #   r.y = −1,   r.v = −1,  r.s = 1
+    #
+    # the 3×3 system is (q + a²)Δy = r.y with q = a² = 2⁻¹²⁰, so Δy = −2¹¹⁹
+    # and Δv = 2⁵⁹ come out exactly and the backend reports bound 0 — while
+    # the 4×4 residual of the step is 2.
+    Q = sparse(reshape([2.0^-120], 1, 1))
+    A = sparse(reshape([2.0^-60],  1, 1))
+    G = spzeros(0, 1)
+    cd = [("R", 1)]
+    Fi  = Block([Diagonal([1.0])])
+    Fi⁻ᵀ = Block([Diagonal([1.0])])
+    λ  = [1.0]
+    ry = [-1.0]; rw = Float64[]; rv = [-1.0]; rs = [1.0]
+    s3 = ConicIP.kktsolver_ldl(Q, A, G, cd; static_reg = 0.0,
+                               dynamic_eps = 0.0)(Fi, Fi⁻ᵀ)
+    t1 = copy(rs)                        # Fᵀ(r.s ∘\ λ) with F = I, λ = 1
+    (Δy, Δw, Δv) = s3(ry, rw, rv .+ t1)
+    Δy = collect(Δy); Δw = collect(Δw); Δv = collect(Δv)
+    FΔv   = copy(Δv)                     # F*Δv
+    FᵀFΔv = copy(FΔv)                    # Fᵀ*(F*Δv)
+    Δs    = t1 .- FᵀFΔv                  # the lossy subtraction
+    @test Δy == [-2.0^119] && Δv == [2.0^59]
+    @test Δs == [-2.0^59]                # fl(1 − 2⁵⁹): the 1 is gone
+    @test ConicIP.kkt_diagnostics(s3).last_bound == 0.0   # the 3×3 IS exact
+    true4 = abs(ry[1] - (Q[1,1]*Δy[1] - A[1,1]*Δv[1])) +
+            abs(rv[1] - (A[1,1]*Δy[1] - Δs[1])) +
+            abs(rs[1] - (λ[1]*FΔv[1] + λ[1]*Δs[1]))
+    @test true4 ≈ 2.0
   end
 
   @testset "Solution fields" begin
@@ -870,5 +1011,91 @@
       @test s.status == :Optimal
       @test s.y .* cs ≈ ones(nb) atol = 1e-3
     end
+  end
+
+  @testset "Interface review fixes" begin
+    # ── Block mul! checks every dimension before its unchecked loop ──
+    # The destination matched the source but not the blocks: the loop wrote
+    # past the end of `y` under @inbounds and only then compared the spans.
+    storage = [7.0, 11.0, 13.0]
+    yv = view(storage, 1:1)
+    xv = view([1.0, 2.0], 1:1)
+    Bd = Block([Diagonal([2.0, 3.0])])
+    @test_throws DimensionMismatch mul!(yv, Bd, xv)
+    @test storage == [7.0, 11.0, 13.0]          # nothing was written
+    @test_throws DimensionMismatch ConicIP.mul_adjoint!(yv, Bd, xv)
+    @test storage == [7.0, 11.0, 13.0]
+    # Destination and source of equal, wrong length, and mismatched pairs.
+    @test_throws DimensionMismatch mul!(zeros(3), Bd, zeros(3))
+    @test_throws DimensionMismatch mul!(zeros(2), Bd, zeros(3))
+    # The correctly sized product is untouched.
+    @test mul!(zeros(2), Bd, [1.0, -2.0]) == Bd * [1.0, -2.0]
+
+    # ── the in-place SOC scaling routines check their scratch first ──
+    zs = [2.0, 0.1, 0.1]; ss = [3.0, 0.2, -0.1]
+    sc = ConicIP.SOCScratch(3)
+    W = ConicIP.nestod_soc!(sc, zs, ss)
+    @test W * zs ≈ ConicIP.nestod_soc(zs, ss) * zs
+    small = ConicIP.SOCScratch(2)
+    @test_throws DimensionMismatch ConicIP.nestod_soc!(small, zs, ss)
+    @test_throws DimensionMismatch ConicIP.nestod_soc!(sc, zs, ss[1:2])
+    @test_throws DimensionMismatch ConicIP.soc_inv_adjoint!(small, W)
+    @test all(iszero, small.zn) && all(iszero, small.sn)
+    @test all(iszero, small.ij) && all(iszero, small.iw)
+
+    # ── SOC block sizing is static: a warmed product allocates nothing ──
+    # `size(Blk, 1)` on the non-concrete union member was a dynamic call,
+    # 16 B per product at block dimension 1024.
+    function blk_mul_alloc(f!, B, y, x)
+      f!(y, B, x); f!(y, B, x)
+      return @allocated f!(y, B, x)
+    end
+    nq = 1024
+    zq = [10.0; fill(0.001, nq - 1)]; sq = [12.0; fill(0.002, nq - 1)]
+    Bq = Block([ConicIP.nestod_soc(zq, sq)])
+    @test Bq.Blocks[1] isa ConicIP.SOCBlock
+    @test size(Bq) == (nq, nq)
+    yq = zeros(nq); xq = randn(nq)
+    @test blk_mul_alloc(mul!, Bq, yq, xq) == 0
+    @test blk_mul_alloc(ConicIP.mul_adjoint!, Bq, yq, xq) == 0
+    @test blk_mul_alloc(mul!, Block([Diagonal(rand(nq))]), yq, xq) == 0
+
+    # ── a noncanonical CSC is canonicalized before the KKT assembly ──
+    # Duplicate row indices in a column reached K's rowval, which AMD and
+    # QDLDL require to be strictly increasing; the old COO assembly summed
+    # them. Only a hand-built matrix can be in this state.
+    Gdup = SparseMatrixCSC(2, 1, [1, 3], [1, 1], [2.0, 3.0])
+    Gcan = sparse([1, 1], [1, 1], [2.0, 3.0], 2, 1)
+    @test ConicIP._csc(Gdup).rowval == Gcan.rowval
+    @test ConicIP._csc(Gdup).nzval == Gcan.nzval
+    @test ConicIP._csc(Gcan) === Gcan            # canonical: no copy
+    # Wrappers and views take the generic route, and `sparse(D')` of a
+    # noncanonical D keeps its duplicate rows: the conversion has to be
+    # followed by the same check.
+    for W in (Gdup', transpose(Gdup), view(Gdup, :, :))
+      C = ConicIP._csc(W)
+      @test C isa SparseMatrixCSC
+      @test C.rowval == Gcan.rowval && C.nzval == Gcan.nzval
+    end
+    # Unsorted rows within a column, no duplicates.
+    Guns = SparseMatrixCSC(3, 1, [1, 3], [3, 1], [5.0, 7.0])
+    @test !ConicIP._rows_strictly_increasing(Guns)
+    @test ConicIP._csc(Guns).rowval == [1, 3]
+    @test ConicIP._csc(Guns).nzval  == [7.0, 5.0]
+    # An explicitly stored zero is canonical and stays put.
+    Gz = SparseMatrixCSC(2, 1, [1, 3], [1, 2], [0.0, 3.0])
+    @test ConicIP._csc(Gz) === Gz
+    Qz = spzeros(1, 1); Az = sparse(reshape([1.0], 1, 1)); cdz = [("R", 1)]
+    pdup = ConicIP._ldl_pattern(Qz, Az, Gdup, cdz)
+    pcan = ConicIP._ldl_pattern(Qz, Az, Gcan, cdz)
+    @test pdup.K.colptr == pcan.K.colptr
+    @test pdup.K.rowval == pcan.K.rowval
+    @test pdup.K.nzval == pcan.K.nzval
+    for j in 1:size(pdup.K, 2)
+      r = nzrange(pdup.K, j)
+      @test all(pdup.K.rowval[t] > pdup.K.rowval[t-1] for t in (first(r)+1):last(r))
+    end
+    @test ConicIP._ldl_structure_key(Qz, Az, Gdup, cdz) ==
+          ConicIP._ldl_structure_key(Qz, Az, Gcan, cdz)
   end
 end

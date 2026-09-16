@@ -6,6 +6,51 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-16
+
+### Changed
+- **KKT solver interface:** the `(a, b, c)` a `solve3x3` returns may now be
+  views into the backend's own workspace, valid until that backend's next
+  solve; `conicIP` copies them out. `kktsolver_ldl` returns views (three
+  slices per back-solve were the third-largest allocation of the loop);
+  the other built-in backends still return fresh vectors. A custom
+  `kktsolver` callback that keeps the scaling `F` it was handed now
+  observes the next iteration's scaling in the same object: `F` and
+  `F⁻ᵀ` are reused across iterations, so retain a `deepcopy`.
+- `LDLDiagnostics` gained `last_bound` (an upper bound on the unregularized,
+  unlifted 3×3 residual of the last solve), `lift_gain` (the factor the
+  lifted second-order-cone rows are charged back with), and `last_rtol`;
+  the positional constructor changed accordingly.
+- `mul!(y, B::Block, x)` and `ConicIP.mul_adjoint!(y, B, x)` give in-place
+  block-diagonal products whose kernels allocate nothing for `Diagonal`,
+  `SymWoodbury` and dense blocks; `mul!(y, B', x)` is also defined, though
+  forming `B'` itself allocates the wrapper. The allocating `*` methods are
+  unchanged.
+- The MOI wrapper assembles its matrices directly from the model handed to
+  `copy_to`/`optimize!` instead of copying it into a cache first; the index
+  map still renumbers variables to columns, and `VariableIndex` constraint
+  indices follow their variable.
+- The convexity guard on a quadratic objective settles a diagonal Hessian
+  and a zero-diagonal violation structurally and only then attempts the
+  shifted sparse Cholesky; the verdict and the error message are unchanged.
+
+### Performance
+- The main loop allocates nothing per pass on the LDLᵀ path with linear and
+  second-order cones (semidefinite blocks still allocate in the scaling and
+  the products): in-place Nesterov–Todd scaling, buffer-owned search
+  directions, in-place residual and right-hand-side formation. GC time on
+  large banded LP/QP instances fell from 18–39 % of wall to under 10 %.
+- The LDLᵀ KKT pattern is assembled directly in CSC form in O(nnz)
+  (previously a COO list, `sparse()`, and one binary search per scaling
+  entry); a hand-built noncanonical `SparseMatrixCSC` (duplicate or
+  unsorted row indices, wrapped or not) is canonicalized first, as the COO
+  route did implicitly. The KKT solver is routed once per solve.
+- Ruiz equilibration rescales one private copy of each matrix in place
+  (previously a fresh sparse product per sweep); the scaling factors are
+  bit-identical.
+- Block-diagonal products read each SOC block's dimension from its concrete
+  type instead of a dynamic `size` call.
+
 ## [0.5.0] - 2026-09-08
 
 ### Changed
@@ -308,7 +353,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.1...v0.3.2
