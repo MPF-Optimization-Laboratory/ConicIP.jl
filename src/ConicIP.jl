@@ -15,38 +15,27 @@ using Printf
 # the iterative-refinement loop. It flags an ill-conditioned KKT system.
 const REFINE_WARN_NORM = 1e-3
 
-# Safety factor of the refinement screens (see `_step_estimate` and the
+# Safety factor of the refinement screen (see `_step_estimate` and the
 # `refine!` closure in `_conicIP`): the estimate of ‖r − KΔz‖ built from
-# what the KKT backend reports has to be this many times UNDER the outer
-# target before the outer 4×4 residual evaluation is skipped. The estimate
-# and the evaluation are two formulas for the same mathematical quantity,
-# so they agree only to the rounding of each; the factor covers that.
-# Measured over the harness (every instance, the residual evaluated anyway
-# at each screen and compared): 291 of 766 outer residual evaluations were
-# screened away, and the residual a screen skipped never reached a sixth of
-# the target it was tested against.
+# what the KKT backend reports, plus the rounding floor of the outer
+# residual evaluation, has to be this many times UNDER the outer target
+# before that evaluation is skipped. The floor charges each rounded
+# quantity once (ε times its magnitude); a row sum of length k accumulates
+# γ_k = kε/(1 − kε) instead, and k is a per-row property of Q, A, G and the
+# cone blocks that no cheap scalar captures (charging the largest row would
+# make the floor useless on a dense row). The margin is what covers that
+# growth, and the fact that the estimate and the evaluation are two
+# formulas for the same quantity. Measured over the harness (14 instances,
+# the residual evaluated anyway at every screen and compared): 126 of 634
+# entry evaluations were screened away, and the residual a screen skipped
+# never reached 0.06 of the target it was tested against.
 const REFINE_SKIP_MARGIN = 8.0
 
-# The exit screen of `refine!` accepts a correction on the backend's report
-# for the CORRECTION solve, but the corrected step's residual is that report
-# only up to the rounding of the residual evaluation the correction was
-# built from. That rounding is not observable; it is charged as this
-# fraction of the residual it contaminated — the same assumption the
-# contraction test has always made, since a residual known only to itself is
-# no basis for accepting or rejecting anything.
-const REFINE_EVAL_FLOOR = 1/64
-
-# Growth factor of the rounding floor in `_step_estimate`. Every term of
-# that floor is the magnitude of ONE rounded quantity, so ε times the floor
-# is the bound for a single rounding per entry; a row sum of length k
-# accumulates γ_k = kε/(1 − kε) instead. k is a per-row property of Q, A
-# and G (and of the cone blocks) that no cheap scalar captures, so the
-# growth is charged as this fixed factor rather than as a row length that
-# would make the floor useless on a dense row. With REFINE_SKIP_MARGIN on
-# top, a screen fires only with 64× between the estimate and its target,
-# and the harness measurement in `REFINE_SKIP_MARGIN`'s comment is what
-# says the remainder is covered.
-const REFINE_ROUND_GROWTH = 8.0
+# Multiplier of ε in the rounding floor of `_step_estimate`. 1 charges each
+# rounded quantity exactly once; the row-length growth is left to
+# REFINE_SKIP_MARGIN (above). At 8 the screen fired on 30 of the same 634
+# evaluations with 49× headroom, i.e. it charged the growth twice.
+const REFINE_ROUND_GROWTH = 1.0
 
 """
     Id(n)
@@ -147,19 +136,12 @@ function _mag_copy!(dst::StepMagnitudes, src::StepMagnitudes)
   dst.nw   = src.nw;   dst.nv  = src.nv;  dst.ns = src.ns
   return dst
 end
-function _mag_add!(dst::StepMagnitudes, src::StepMagnitudes)
-  dst.elim += src.elim; dst.fdv += src.fdv; dst.ny += src.ny
-  dst.nw   += src.nw;   dst.nv  += src.nv;  dst.ns += src.ns
-  return dst
-end
 
-# Everything the screens need, in one object the loop owns: the norm
+# Everything the screen needs, in one object the loop owns: the norm
 # proxies of the operators `step_residual!` applies (`nQ`, `nA`, `nG` set
 # once at setup, `nλ` once per factorization by `solve4x4gen`, which is
 # handed λ), the record `solve4x4!` writes, and the accumulation `refine!`
-# keeps. One argument rather than three keeps `_step_estimate`'s arity —
-# it is reached through `_s3_cur[]`, so the call is dynamic and every extra
-# argument is paid for on every screen.
+# keeps (today the base solve alone).
 mutable struct RefineScreen
   nQ  :: Float64   # √(‖Q‖₁‖Q‖∞) ≥ ‖ |Q| ‖₂
   nA  :: Float64   # likewise for A, and so for Aᵀ (the bound is symmetric)
@@ -214,10 +196,7 @@ end
 #   δ‖Δy‖   the y row. `staticReg` puts `Qᵣ = Q + δI` into the
 #           factorization while every other use of Q — `step_residual!`
 #           included — keeps the original Q, so the backend's y row misses
-#           `δΔy`. `mag` is the LAST solve, whose system carried the shift
-#           (the correction's own Δy at the exit screen);
-#   slack   a caller-supplied allowance for what the caller knows it cannot
-#           see (the exit screen's `REFINE_EVAL_FLOOR·rres`; zero at entry);
+#           `δΔy`. `mag` is the LAST solve, whose system carried the shift;
 #   floor   the rounding floor above, `REFINE_ROUND_GROWTH·ε` times the
 #           magnitudes of the accumulated step: row by row,
 #             y   ‖|Q||Δy|‖ + ‖|Gᵀ||Δw|‖ + ‖|Aᵀ||Δv|‖   ≤ nQ‖Δy‖ + nG‖Δw‖ + nA‖Δv‖
@@ -240,7 +219,7 @@ end
 # none of its Float64 arguments has to be boxed on the way in.
 _step_bound(s3)::Union{Nothing,Float64} = _kkt_step_bound(kkt_diagnostics(s3))
 
-function _step_estimate(b::Union{Nothing,Float64}, δ, rs::RefineScreen, nr, slack)
+function _step_estimate(b::Union{Nothing,Float64}, δ, rs::RefineScreen, nr)
   b === nothing && return nothing
   acc = rs.acc
   rfloor = rs.nQ * acc.ny + rs.nG * acc.nw + rs.nA * acc.nv +   # y row
@@ -249,7 +228,7 @@ function _step_estimate(b::Union{Nothing,Float64}, δ, rs::RefineScreen, nr, sla
            2 * rs.nλ * acc.fdv +                                # s row
            2 * nr                                               # r, all rows
   return 2 * b + (δ == 0 ? 0.0 : δ * rs.mag.ny) +
-         REFINE_ROUND_GROWTH * eps(Float64) * rfloor + slack
+         REFINE_ROUND_GROWTH * eps(Float64) * rfloor
 end
 
 ViewTypes   = Union{SubArray}
@@ -1155,9 +1134,9 @@ Selected keyword arguments:
   on that residual, the bound plus the rounding the solver cannot see (the
   elimination that recovers `Δs`, and the evaluation of the 4×4 residual
   itself) is a factor `ConicIP.REFINE_SKIP_MARGIN` under the target, the
-  step (or a correction to it) is accepted on that estimate and the 4×4
-  residual is not formed; the tolerances themselves are unchanged in
-  meaning.
+  step is accepted on that estimate and the 4×4 residual is not formed
+  (corrections are always evaluated); the tolerances themselves are
+  unchanged in meaning.
 - `timeLimit` — wall-clock budget in seconds, checked once per iteration
   (a single factorization can overrun it). On expiry the status is
   `:TimeLimit` and the solution holds the best iterate so far; the
@@ -1455,7 +1434,7 @@ function _conicIP(
   absQ = _absmat(Q); absA = _absmat(A); absG = _absmat(G)
   absAᵀ = absA'; absGᵀ = absG'
   # Operator-norm proxies of the same data, for the rounding floor of the
-  # outer refinement screens (`_step_estimate`). Set once here; `nλ` is
+  # outer refinement screen (`_step_estimate`). Set once here; `nλ` is
   # rewritten per factorization by `solve4x4gen`.
   _screen = RefineScreen(_opnorm_proxy(absQ), _opnorm_proxy(absA),
                          _opnorm_proxy(absG))
@@ -2347,25 +2326,20 @@ function _conicIP(
     # it is used as is. Returns false after stamping sol when a correction
     # solve fails.
     #
-    # Two screens skip an evaluation the KKT backend has already paid for
-    # (see `_kkt_step_bound`: the outer 4×4 residual is the inner 3×3
-    # residual in exact arithmetic, so the backend's bound bounds it) once
-    # `_step_estimate` has added the rounding the backend cannot see.
-    #
-    #   entry — the estimate for the base solve is a factor
-    #           REFINE_SKIP_MARGIN under rtol, so the step already meets
-    #           the target and no residual is formed;
-    #   exit  — the estimate for the step a correction solve produced is
-    #           that factor under both rtol and the residual it has to
-    #           beat, so the correction is accepted and the loop left
-    #           without forming the residual either.
-    #
-    # Both leave the STEP exactly as the unscreened code would: the margin
-    # is what makes "the bound is under the target" imply "the residual is
-    # under the target" and "the correction contracts". When a screen
-    # fires, `rnorm` reports the backend's bound instead of a measured
-    # residual; the red-row warning keeps its meaning because the bound is
-    # an upper bound on what would have been measured.
+    # The entry screen skips the initial evaluation when the KKT backend
+    # has already paid for it (see `_kkt_step_bound`: the outer 4×4
+    # residual is the inner 3×3 residual in exact arithmetic, so the
+    # backend's bound bounds it) once `_step_estimate` has added the
+    # rounding the backend cannot see: when the estimate for the base solve
+    # is a factor REFINE_SKIP_MARGIN under rtol, the step already meets the
+    # target and no residual is formed. The screen leaves the STEP exactly
+    # as the unscreened code would; when it fires, `rnorm` reports the
+    # estimate instead of a measured residual, and the red-row warning
+    # keeps its meaning because the estimate is an upper bound on what
+    # would have been measured. There is no screen after a correction: the
+    # corrected step has to beat the residual it was built from, which is
+    # by construction at the evaluation's own rounding floor, so a
+    # floor-aware estimate cannot clear it (measured: 0 of 210).
     #
     # Timing: the whole call is t_dir_refine (inclusive diagnostic inside
     # t_direction, which the call sites wrap); the residual evaluations
@@ -2375,11 +2349,11 @@ function _conicIP(
       @phase timing t_dir_refine begin
       nr    = norm(r)
       rtol  = refineAbsTol + refineRelTol * nr
-      # `_mag` holds the base solve — every call site solves into `Δz`
-      # immediately before calling — and `_mag_acc` accumulates it and
-      # every correction, so it bounds the step actually under test.
+      # `_screen.mag` holds the base solve — every call site solves into
+      # `Δz` immediately before calling — and `acc` is the step under test
+      # (the base solve alone: the screen runs before any correction).
       _mag_copy!(_screen.acc, _screen.mag)
-      bound = _step_estimate(_step_bound(_s3_cur[]), δ, _screen, nr, 0.0)
+      bound = _step_estimate(_step_bound(_s3_cur[]), δ, _screen, nr)
       rres  = if bound !== nothing && REFINE_SKIP_MARGIN * bound <= rtol
         bound                           # entry screen
       else
@@ -2400,13 +2374,6 @@ function _conicIP(
         copy4!(_Δz_keep, Δz)
         axpy4!(1.0, Δzr, Δz)
         k += 1
-        _mag_add!(_screen.acc, _screen.mag)
-        cbound = _step_estimate(_step_bound(_s3_cur[]), δ, _screen, nr,
-                                REFINE_EVAL_FLOOR * rres)
-        if cbound !== nothing && REFINE_SKIP_MARGIN * cbound <= min(rtol, rres)
-          rres = cbound                 # exit screen
-          break
-        end
         timing === nothing || (timing.n_refine_resid += 1)
         rnew = @phase timing t_dir_refine_resid step_residual!(Δz, r)
         if !(rnew < rres)               # also catches a NaN residual

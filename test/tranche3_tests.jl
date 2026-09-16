@@ -229,7 +229,7 @@
     # `solve4x4!` is, in exact arithmetic, the 3×3 residual of the
     # back-solve underneath it (see `_step_estimate`). Hiding the report
     # behind a plain closure makes `kkt_diagnostics` fall back to `nothing`
-    # and turns both screens off without changing a single arithmetic
+    # and turns the screen off without changing a single arithmetic
     # operation, so the two runs must agree BITWISE: a screen may remove a
     # residual evaluation, never change a step.
     hidden = (Q, A, G, cd) -> begin
@@ -267,7 +267,7 @@
     @test ConicIP._kkt_step_bound(ConicIP.kkt_diagnostics(x -> x)) === nothing
     rs0 = ConicIP.RefineScreen(0.0, 0.0, 0.0)
     @test ConicIP._step_bound(x -> x) === nothing
-    @test ConicIP._step_estimate(nothing, 0.0, rs0, 0.0, 0.0) === nothing
+    @test ConicIP._step_estimate(nothing, 0.0, rs0, 0.0) === nothing
   end
 
   @testset "Refinement screen rounding floor" begin
@@ -322,7 +322,7 @@
       m.elim = norm(t1) + norm(FᵀFΔv); m.fdv = norm(FΔv)
       m.ny = norm(Δy); m.nw = 0.0; m.nv = norm(Δv); m.ns = norm(Δs)
     end
-    est = ConicIP._step_estimate(ConicIP._step_bound(s3), 0.0, rs, nr, 0.0)
+    est = ConicIP._step_estimate(ConicIP._step_bound(s3), 0.0, rs, nr)
 
     # The estimate now bounds the residual, so the entry screen refuses the
     # step for ANY tolerance the residual itself would fail.
@@ -332,7 +332,7 @@
     # ... and the term that does it is the Δs elimination: with `elim`
     # zeroed the estimate collapses to the old ε‖r‖-level value.
     rs0 = ConicIP.RefineScreen(rs.nQ, rs.nA, rs.nG); rs0.nλ = rs.nλ
-    old  = ConicIP._step_estimate(ConicIP._step_bound(s3), 0.0, rs0, nr, 0.0)
+    old  = ConicIP._step_estimate(ConicIP._step_bound(s3), 0.0, rs0, nr)
     @test old < 1e-13 && ConicIP.REFINE_SKIP_MARGIN * old <= rtol
 
     # The norm proxies are upper bounds on the operator norms they stand in

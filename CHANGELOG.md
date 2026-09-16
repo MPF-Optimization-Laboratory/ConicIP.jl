@@ -6,6 +6,72 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **KKT solver interface:** the `(a, b, c)` a `solve3x3` returns may now be
+  views into the backend's own workspace, valid until that backend's next
+  solve; `conicIP` copies them out. `kktsolver_ldl` returns views (three
+  slices per back-solve were the third-largest allocation of the loop);
+  the other built-in backends still return fresh vectors. A custom
+  `kktsolver` callback that keeps the scaling `F` it was handed now
+  observes the next iteration's scaling in the same object: `F` and
+  `F⁻ᵀ` are reused across iterations, so retain a `deepcopy`.
+- `LDLDiagnostics` gained `last_bound` (an upper bound on the unregularized,
+  unlifted 3×3 residual of the last solve), `lift_gain` (the factor the
+  lifted second-order-cone rows are charged back with), and `last_rtol`;
+  the positional constructor changed accordingly.
+- The outer iterative refinement evaluates the 4×4 residual of the base
+  predictor and corrector solves only when the KKT solver's own residual
+  bound, plus the rounding floor of the outer evaluation, does not already
+  settle the tolerance (`ConicIP.REFINE_SKIP_MARGIN`). Solves, iterates, and
+  iteration counts are unchanged; only residual evaluations are saved.
+- `mul!(y, B::Block, x)`, `mul!(y, B', x)` and `ConicIP.mul_adjoint!` give
+  in-place block-diagonal products (allocation-free for `Diagonal`,
+  `SymWoodbury` and dense blocks). The allocating `*` methods are unchanged.
+- The MOI wrapper assembles its matrices directly from the model handed to
+  `copy_to`/`optimize!` instead of copying it into a cache first; the index
+  map still renumbers variables to columns, and `VariableIndex` constraint
+  indices follow their variable.
+- The convexity guard on a quadratic objective settles a diagonal Hessian
+  and a zero-diagonal violation structurally and only then attempts the
+  shifted sparse Cholesky; the verdict and the error message are unchanged.
+
+### Performance
+- The main loop is allocation-free on the LDLᵀ path: in-place Nesterov–Todd
+  scaling, buffer-owned search directions, in-place residual and
+  right-hand-side formation. On the benchmark set (23 LP/QP/SOCP instances)
+  the total wall time fell from 1.27× to 1.02× Clarabel's, the shifted
+  geometric mean from 1.46× to 1.16×; GC time on the large banded instances
+  fell from 18–39 % of wall to under 10 %.
+- The LDLᵀ KKT pattern is assembled directly in CSC form in O(nnz)
+  (previously a COO list, `sparse()`, and one binary search per scaling
+  entry); the KKT solver is routed once per solve.
+- Ruiz equilibration rescales one private copy of each matrix in place
+  (previously a fresh sparse product per sweep); the scaling factors are
+  bit-identical.
+- Block-diagonal products read each SOC block's dimension from its concrete
+  type instead of a dynamic `size` call.
+
+### Fixed
+- `mul!(y, ::Block, x)` checks `length(y) == length(x) == size(B, 1)` and
+  one-based indexing before its unchecked loop; a destination shorter than
+  the blocks span threw only after writing past its end.
+- The MOI wrapper remaps `VariableIndex` constraint indices through the
+  variable map, as MOI requires; a model whose variables had been deleted
+  got an index map whose bound indices no longer matched their variables.
+- The LDLᵀ pattern assembly canonicalizes a noncanonical `SparseMatrixCSC`
+  (duplicate or unsorted row indices in a column, reachable only from a
+  hand-built matrix) instead of carrying duplicate rows into the KKT
+  pattern; canonical matrices pass through without a copy.
+- The refinement screen's estimate bounds the rounding of the outer residual
+  evaluation (the `Δs = t1 − FᵀFΔv` elimination and the residual products
+  themselves), not only the backend's bound on its 3×3 residual: an exact
+  3×3 back-solve with `Q = 2⁻¹²⁰`, `A = 2⁻⁶⁰` produced a step with a 4×4
+  residual of 2 that the estimate put at 7e-16.
+- `LDLDiagnostics.last_bound` measures the unlifted and auxiliary residual
+  norms on their own rows instead of recovering one from the other by
+  subtraction, which cancelled to zero when the auxiliary rows carried the
+  residual.
+
 ## [0.5.0] - 2026-09-08
 
 ### Changed
