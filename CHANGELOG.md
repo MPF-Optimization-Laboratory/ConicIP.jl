@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-16
+
 ### Changed
 - **KKT solver interface:** the `(a, b, c)` a `solve3x3` returns may now be
   views into the backend's own workspace, valid until that backend's next
@@ -36,37 +38,21 @@ uses [Semantic Versioning](https://semver.org/).
 - The main loop allocates nothing per pass on the LDLᵀ path with linear and
   second-order cones (semidefinite blocks still allocate in the scaling and
   the products): in-place Nesterov–Todd scaling, buffer-owned search
-  directions, in-place residual and right-hand-side formation. On the benchmark set (23 LP/QP/SOCP instances)
-  the total wall time fell from 1.27× to 1.02× Clarabel's, the shifted
-  geometric mean from 1.46× to 1.16×; GC time on the large banded instances
-  fell from 18–39 % of wall to under 10 %.
+  directions, in-place residual and right-hand-side formation. On the
+  benchmark set (23 LP/QP/SOCP instances) the total wall time fell from
+  1.27× to about 1.05× Clarabel's and the shifted geometric mean from 1.46×
+  to about 1.2×; GC time on the large banded instances fell from 18–39 % of
+  wall to under 10 %.
 - The LDLᵀ KKT pattern is assembled directly in CSC form in O(nnz)
   (previously a COO list, `sparse()`, and one binary search per scaling
-  entry); the KKT solver is routed once per solve.
+  entry); a hand-built noncanonical `SparseMatrixCSC` (duplicate or
+  unsorted row indices, wrapped or not) is canonicalized first, as the COO
+  route did implicitly. The KKT solver is routed once per solve.
 - Ruiz equilibration rescales one private copy of each matrix in place
   (previously a fresh sparse product per sweep); the scaling factors are
   bit-identical.
 - Block-diagonal products read each SOC block's dimension from its concrete
   type instead of a dynamic `size` call.
-
-### Fixed
-- `mul!(y, ::Block, x)` checks `length(y) == length(x) == size(B, 1)` and
-  one-based indexing before its unchecked loop; a destination shorter than
-  the blocks span threw only after writing past its end.
-- The MOI wrapper remaps `VariableIndex` constraint indices through the
-  variable map, as MOI requires; a model whose variables had been deleted
-  got an index map whose bound indices no longer matched their variables.
-- The LDLᵀ pattern assembly canonicalizes a noncanonical `SparseMatrixCSC`
-  (duplicate or unsorted row indices in a column, reachable only from a
-  hand-built matrix) instead of carrying duplicate rows into the KKT
-  pattern; canonical matrices pass through without a copy.
-- The LDLᵀ pattern assembly also canonicalizes a noncanonical matrix that
-  arrives wrapped (`D'`, `transpose(D)`, a view): `sparse` of the wrapper
-  keeps the duplicate rows, so the conversion alone was not enough.
-- `LDLDiagnostics.last_bound` measures the unlifted and auxiliary residual
-  norms on their own rows instead of recovering one from the other by
-  subtraction, which cancelled to zero when the auxiliary rows carried the
-  residual.
 
 ## [0.5.0] - 2026-09-08
 
@@ -165,14 +151,6 @@ uses [Semantic Versioning](https://semver.org/).
   back-solve per corrector on the current factorization.
 - MOI option `assemble_only`: `optimize!` returns after assembling the
   solver's matrices (`OPTIMIZE_NOT_CALLED`, `ResultCount == 0`).
-- Benchmark: `benchmark/baselines.jl` runs the instance set through
-  Clarabel, ECOS or ConicIP-via-MOI from one problem tuple
-  (`benchmark/moi_model.jl`), `benchmark/compare.jl` joins result CSVs;
-  `suite.jl --opt key=value,...` passes solver options, `--timeout` kills a
-  child process, and the CSV gains `kktsolver`, `kkt_repaired`,
-  `kkt_refactors` columns. `benchmark/sumnorms_diag.jl` attributes the
-  sum-of-norms SOCP regression; `benchmark/hsd-design.md` is the design
-  note for the homogeneous self-dual embedding.
 - `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
   quasi-definite KKT system (QDLDL.jl backend, pure Julia). Fixed pattern
   with AMD ordering analysed once, numeric refactorization in place each
@@ -225,11 +203,6 @@ uses [Semantic Versioning](https://semver.org/).
   callback (initial point, predictor, corrector, outer refinements). Solves
   a backend performs internally, such as `kktsolver_ldl`'s own refinement,
   are not counted.
-- `benchmark/suite.jl`: reproducible harness with phase timings, solve
-  counts, fill proxies, peak RSS in a fresh process, and residuals
-  recomputed from the original data.
-- `benchmark/large-scale-roadmap.md`: diagnosis of the scale limits and the
-  tranche plan to lift them.
 - The KKT-solver guide documents the callback contract: data and signs,
   the scaling-block types, calls per iteration, ownership of returned
   arrays, accuracy and regularization, and failure reporting.
@@ -238,10 +211,6 @@ uses [Semantic Versioning](https://semver.org/).
 - A certificate return (`:Infeasible`, `:DualInfeasible`) no longer carries
   the discarded iterate's `rEq`/`rGap`; they are `NaN`, like `pobj`, and
   `MOI.RelativeGap` is `NaN` for such a result.
-- `benchmark/suite.jl --opt` rejects entries with an empty key or value;
-  `test/testdata.jl` is no longer included twice when `suite.jl` and
-  `issue10.jl` are loaded into one module (no more "Replacing docs"
-  warnings from the review tests).
 - Automatic routing uses LDL for non-SDP problems with more equality rows
   than variables; dense QR cannot factor these systems. Its flop estimate
   is `Inf` in this unsupported regime instead of zero or negative.
@@ -387,7 +356,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.1...v0.3.2

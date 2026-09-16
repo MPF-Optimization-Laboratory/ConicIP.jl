@@ -126,11 +126,30 @@ ConicIP.vecm!
 ConicIP.imcols
 ```
 
+## Timing
+
+Opt-in per-phase instrumentation (`timing = PhaseTimes()`).
+
+```@docs
+ConicIP.PhaseTimes
+ConicIP.reset!
+ConicIP.phase_table
+```
+
 ## Internal
 
 These functions are implementation details and not part of the public API.
 
 ```@docs
+ConicIP.mul_adjoint!
+ConicIP.inv_adjoint_block!
+ConicIP.SOCScratch
+ConicIP.nestod_soc!
+ConicIP.soc_inv_adjoint!
+ConicIP.kkt_attach_timing!
+ConicIP.@phase
+ConicIP.@phase_start
+ConicIP.gc_start
 ConicIP.inv_adjoint!
 ConicIP.pivotgen
 ConicIP.placeholder
