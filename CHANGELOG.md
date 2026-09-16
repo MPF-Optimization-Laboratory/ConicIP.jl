@@ -38,11 +38,8 @@ uses [Semantic Versioning](https://semver.org/).
 - The main loop allocates nothing per pass on the LDLᵀ path with linear and
   second-order cones (semidefinite blocks still allocate in the scaling and
   the products): in-place Nesterov–Todd scaling, buffer-owned search
-  directions, in-place residual and right-hand-side formation. On the
-  benchmark set (23 LP/QP/SOCP instances) the total wall time fell from
-  1.27× to about 1.05× Clarabel's and the shifted geometric mean from 1.46×
-  to about 1.2×; GC time on the large banded instances fell from 18–39 % of
-  wall to under 10 %.
+  directions, in-place residual and right-hand-side formation. GC time on
+  large banded LP/QP instances fell from 18–39 % of wall to under 10 %.
 - The LDLᵀ KKT pattern is assembled directly in CSC form in O(nnz)
   (previously a COO list, `sparse()`, and one binary search per scaling
   entry); a hand-built noncanonical `SparseMatrixCSC` (duplicate or
