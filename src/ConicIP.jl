@@ -36,6 +36,18 @@ const REFINE_SKIP_MARGIN = 8.0
 # no basis for accepting or rejecting anything.
 const REFINE_EVAL_FLOOR = 1/64
 
+# Growth factor of the rounding floor in `_step_estimate`. Every term of
+# that floor is the magnitude of ONE rounded quantity, so ε times the floor
+# is the bound for a single rounding per entry; a row sum of length k
+# accumulates γ_k = kε/(1 − kε) instead. k is a per-row property of Q, A
+# and G (and of the cone blocks) that no cheap scalar captures, so the
+# growth is charged as this fixed factor rather than as a row length that
+# would make the floor useless on a dense row. With REFINE_SKIP_MARGIN on
+# top, a screen fires only with 64× between the estimate and its target,
+# and the harness measurement in `REFINE_SKIP_MARGIN`'s comment is what
+# says the remainder is covered.
+const REFINE_ROUND_GROWTH = 8.0
+
 """
     Id(n)
 
@@ -96,32 +108,148 @@ _kkt_step_bound(::Any) = nothing
 _kkt_step_bound(dg::LDLDiagnostics) =
   isfinite(dg.last_bound) ? dg.last_bound : nothing
 
-# Estimate of ‖r − KΔz‖ for the step the backend's last solve produced,
-# from what the backend reports plus the two terms it cannot see, or
-# `nothing` when it reports nothing:
+# ── The rounding floor of the outer residual ──────────────────────────
 #
-#   bound   its bound on its own 3×3 residual, which IS the 4×4 residual in
-#           exact arithmetic (above);
+# A screen stands in for an evaluation of `step_residual!`, so what it is
+# tested against has to bound the number THAT evaluation would report, not
+# just the mathematical residual. Two sources of rounding are invisible to
+# a backend that bounds its own 3×3 residual by its own formula:
+#
+#   * the Δs elimination of `solve4x4!`. `Δs = t1 − FᵀFΔv` is rounded to
+#     about `ε(‖t1‖ + ‖FᵀFΔv‖)`, and the two terms cancel. With
+#     `Q = 2⁻¹²⁰`, `A = 2⁻⁶⁰`, no equalities, `F = F⁻ᵀ = I`, `λ = 1` and
+#     `r = (−1, ·, −1, 1)` the 3×3 back-solve is EXACT in floating point
+#     (`Δy = −2¹¹⁹`, `Δv = 2⁵⁹`, the backend reports bound 0), yet
+#     `fl(1 − 2⁵⁹) = −2⁵⁹` drops the 1 and the 4×4 residual is 2. That
+#     rounding scales with `‖t1‖` and `‖FᵀFΔv‖`, not with `‖r‖`, which is
+#     why the `ε‖r‖` term this estimate used to carry was no proxy for it;
+#   * the evaluation itself. `step_residual!` forms `‖|Q||Δy|‖`-sized sums
+#     per row and the residual it prints cannot go below their rounding.
+#
+# `StepMagnitudes` records, per `solve4x4!` call, the magnitudes of the
+# first kind (nothing outside that call can recover them) together with the
+# blockwise norms of the direction. `refine!` keeps a second record in
+# which it ACCUMULATES the solves that make up the step under test: a step
+# is the sum of its base solve and its accepted corrections, and every
+# field is a norm of a linear function of one solve's output, so the sum of
+# the records bounds the record of the sum.
+mutable struct StepMagnitudes
+  elim :: Float64   # ‖t1‖ + ‖FᵀFΔv‖, the two terms of the Δs elimination
+  fdv  :: Float64   # ‖FΔv‖
+  ny   :: Float64   # ‖Δy‖
+  nw   :: Float64   # ‖Δw‖
+  nv   :: Float64   # ‖Δv‖
+  ns   :: Float64   # ‖Δs‖
+end
+StepMagnitudes() = StepMagnitudes(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+function _mag_copy!(dst::StepMagnitudes, src::StepMagnitudes)
+  dst.elim = src.elim; dst.fdv = src.fdv; dst.ny = src.ny
+  dst.nw   = src.nw;   dst.nv  = src.nv;  dst.ns = src.ns
+  return dst
+end
+function _mag_add!(dst::StepMagnitudes, src::StepMagnitudes)
+  dst.elim += src.elim; dst.fdv += src.fdv; dst.ny += src.ny
+  dst.nw   += src.nw;   dst.nv  += src.nv;  dst.ns += src.ns
+  return dst
+end
+
+# Everything the screens need, in one object the loop owns: the norm
+# proxies of the operators `step_residual!` applies (`nQ`, `nA`, `nG` set
+# once at setup, `nλ` once per factorization by `solve4x4gen`, which is
+# handed λ), the record `solve4x4!` writes, and the accumulation `refine!`
+# keeps. One argument rather than three keeps `_step_estimate`'s arity —
+# it is reached through `_s3_cur[]`, so the call is dynamic and every extra
+# argument is paid for on every screen.
+mutable struct RefineScreen
+  nQ  :: Float64   # √(‖Q‖₁‖Q‖∞) ≥ ‖ |Q| ‖₂
+  nA  :: Float64   # likewise for A, and so for Aᵀ (the bound is symmetric)
+  nG  :: Float64
+  nλ  :: Float64   # maxᵦ ‖x ↦ λᵦ∘x‖₂
+  mag :: StepMagnitudes   # the last solve
+  acc :: StepMagnitudes   # the solves that built the step under test
+end
+RefineScreen(nQ, nA, nG) =
+  RefineScreen(nQ, nA, nG, 0.0, StepMagnitudes(), StepMagnitudes())
+
+# √(‖M‖₁‖M‖∞), the standard bound on ‖M‖₂, computed from the entrywise
+# |M| — which has M's 1- and ∞-norms, so the same number bounds ‖ |M| ‖₂,
+# and bounds ‖Mᵀ‖₂ = ‖M‖₂ as well. Two matrix-vector products, O(nnz),
+# once at setup.
+function _opnorm_proxy(absM)
+  (size(absM, 1) == 0 || size(absM, 2) == 0) && return 0.0
+  rowsums = absM * ones(size(absM, 2))
+  colsums = absM' * ones(size(absM, 1))
+  return sqrt(maximum(rowsums) * maximum(colsums))
+end
+
+# ‖x ↦ λ∘x‖₂, the largest over the cone blocks — blockwise because the
+# products are blockwise, ‖λ∘x‖² = Σᵦ‖λᵦ∘xᵦ‖². On an "R" block the product
+# is entrywise, so the norm is ‖λᵦ‖∞; on a "Q" block it is the arrow matrix
+# `[λ₀ λ₁ᵀ; λ₁ λ₀I]`, of norm at most `|λ₀| + ‖λ₁‖`; on an "S" block
+# `X∘Y = (XY + YX)/2` and `‖X∘Y‖_F ≤ ‖X‖₂‖Y‖_F ≤ ‖x‖‖y‖`. Called once per
+# factorization, not per solve.
+function _cone_mul_norm(λ, block_data)
+  nmax = 0.0
+  for (btype, I, _) in block_data
+    isempty(I) && continue
+    v  = view(λ, I)
+    nb = btype == "R" ? maximum(abs, v) :
+         btype == "Q" ? abs(v[1]) + norm(view(v, 2:length(v))) :
+                        norm(v)
+    nmax = max(nmax, nb)
+  end
+  return nmax
+end
+
+# Estimate of the 4×4 residual `step_residual!` WOULD report for the step
+# the backend's last solves produced, or `nothing` when the backend reports
+# no bound:
+#
+#   2b      the backend's bound on its own 3×3 residual, which IS the 4×4
+#           residual in exact arithmetic (above). The 2 is the norm
+#           convention, made explicit rather than left to the margin:
+#           `norm(::v4x1)` SUMS four block norms while the backend reports
+#           the Euclidean norm of the concatenation, and Cauchy–Schwarz
+#           over four blocks gives Σ‖xᵢ‖ ≤ 2‖x‖;
 #   δ‖Δy‖   the y row. `staticReg` puts `Qᵣ = Q + δI` into the
 #           factorization while every other use of Q — `step_residual!`
 #           included — keeps the original Q, so the backend's y row misses
-#           `δΔy`. `Δy` is the y block of the step that solve produced (the
-#           correction's own Δy at the exit screen);
+#           `δΔy`. `mag` is the LAST solve, whose system carried the shift
+#           (the correction's own Δy at the exit screen);
 #   slack   a caller-supplied allowance for what the caller knows it cannot
 #           see (the exit screen's `REFINE_EVAL_FLOOR·rres`; zero at entry);
-#   ε‖r‖    the s row. It cancels exactly only if `F⁻ᵀFᵀ = I`; computed,
-#           `λ∘FΔv + λ∘F⁻ᵀΔs` reproduces `r.s` to about `ε‖r.s‖`, and on an
-#           ill-conditioned scaling that term is the whole 4×4 residual
-#           while the 3×3 residual stays small (on cvxqp1_s it is 60× the
-#           backend's bound).
+#   floor   the rounding floor above, `REFINE_ROUND_GROWTH·ε` times the
+#           magnitudes of the accumulated step: row by row,
+#             y   ‖|Q||Δy|‖ + ‖|Gᵀ||Δw|‖ + ‖|Aᵀ||Δv|‖   ≤ nQ‖Δy‖ + nG‖Δw‖ + nA‖Δv‖
+#             w   ‖|G||Δy|‖                              ≤ nG‖Δy‖
+#             v   ‖|A||Δy|‖ + ‖Δs‖ + the Δs elimination  ≤ nA‖Δy‖ + ns + elim
+#             s   ‖λ∘FΔv‖ + ‖λ∘F⁻ᵀΔs‖                    ≤ 2nλ‖FΔv‖ + ‖r.s‖
+#           plus ‖r.y‖ + ‖r.w‖ + ‖r.v‖ + ‖r.s‖ = `nr` for the subtraction
+#           each row ends with. The s row's second product is bounded by
+#           the first: `λ∘F⁻ᵀΔs = r.s − λ∘FΔv` up to the elimination, so it
+#           is at most `‖r.s‖ + ‖λ∘FΔv‖`, and both halves of the `nr` term
+#           above cover the `‖r.s‖`.
 #
 # `REFINE_SKIP_MARGIN` multiplies the sum, and covers what is left: the two
-# residuals are different formulas for the same quantity, so they agree only
-# to the rounding of their own evaluations.
-function _step_estimate(s3, δ, Δy, nr, slack)
-  b = _kkt_step_bound(kkt_diagnostics(s3))
+# residuals are different formulas for the same quantity, so they agree
+# only to the rounding of their own evaluations.
+# The backend's bound for its last solve, hoisted out of `_step_estimate`
+# as a value inference can follow. `kkt_diagnostics` is reached through
+# `_s3_cur[]`, so that lookup is a dynamic call whatever happens; keeping it
+# here leaves `_step_estimate` an ordinary statically dispatched call, and
+# none of its Float64 arguments has to be boxed on the way in.
+_step_bound(s3)::Union{Nothing,Float64} = _kkt_step_bound(kkt_diagnostics(s3))
+
+function _step_estimate(b::Union{Nothing,Float64}, δ, rs::RefineScreen, nr, slack)
   b === nothing && return nothing
-  return b + (δ == 0 ? 0.0 : δ * norm(Δy)) + eps(Float64) * nr + slack
+  acc = rs.acc
+  rfloor = rs.nQ * acc.ny + rs.nG * acc.nw + rs.nA * acc.nv +   # y row
+           rs.nG * acc.ny +                                     # w row
+           rs.nA * acc.ny + acc.ns + acc.elim +                 # v row
+           2 * rs.nλ * acc.fdv +                                # s row
+           2 * nr                                               # r, all rows
+  return 2 * b + (δ == 0 ? 0.0 : δ * rs.mag.ny) +
+         REFINE_ROUND_GROWTH * eps(Float64) * rfloor + slack
 end
 
 ViewTypes   = Union{SubArray}
@@ -1024,10 +1152,12 @@ Selected keyword arguments:
   `‖r − KΔz‖ ≤ refineAbsTol + refineRelTol·‖r‖` or the step budget is spent.
   The 4×4 residual of such a step is, in exact arithmetic, the residual of
   the 3×3 back-solve underneath it, so when the KKT solver reports a bound
-  on that residual and the bound is a factor `ConicIP.REFINE_SKIP_MARGIN`
-  under the target, the step (or a correction to it) is accepted on the
-  report and the 4×4 residual is not formed; the tolerances themselves are
-  unchanged in meaning.
+  on that residual, the bound plus the rounding the solver cannot see (the
+  elimination that recovers `Δs`, and the evaluation of the 4×4 residual
+  itself) is a factor `ConicIP.REFINE_SKIP_MARGIN` under the target, the
+  step (or a correction to it) is accepted on that estimate and the 4×4
+  residual is not formed; the tolerances themselves are unchanged in
+  meaning.
 - `timeLimit` — wall-clock budget in seconds, checked once per iteration
   (a single factorization can overrun it). On expiry the status is
   `:TimeLimit` and the solution holds the best iterate so far; the
@@ -1324,6 +1454,11 @@ function _conicIP(
   # lazy wrappers; the products below never materialize them).
   absQ = _absmat(Q); absA = _absmat(A); absG = _absmat(G)
   absAᵀ = absA'; absGᵀ = absG'
+  # Operator-norm proxies of the same data, for the rounding floor of the
+  # outer refinement screens (`_step_estimate`). Set once here; `nλ` is
+  # rewritten per factorization by `solve4x4gen`.
+  _screen = RefineScreen(_opnorm_proxy(absQ), _opnorm_proxy(absA),
+                         _opnorm_proxy(absG))
   # Scratch for those products: |y|, |w|, |v| and the outputs
   _absy = zeros(n); _absw = zeros(p); _absv = zeros(m)
   _nrm_n = zeros(n); _nrm_m = zeros(m); _nrm_p = zeros(p)
@@ -1656,6 +1791,10 @@ function _conicIP(
 
     solve3x3 = solve3x3gen(F, F⁻ᵀ)
     _s3_cur[] = solve3x3
+    # The s row of the outer residual applies x ↦ λ∘x twice; its norm is
+    # the one term of `_step_estimate`'s rounding floor that changes with
+    # the scaling. One O(m) pass per factorization, not per solve.
+    _screen.nλ = _cone_mul_norm(λ, block_data)
     # The wall time of this factorization is charged by the caller
     # (t_init for the initial point, t_kktupdate in the loop).
     if timing !== nothing
@@ -1681,7 +1820,15 @@ function _conicIP(
       copyto!(out.y, Δy); copyto!(out.w, Δw); copyto!(out.v, Δv)
       mul!(_dir_buf1, F, out.v)
       mul_adjoint!(_dir_buf2, F, _dir_buf1)
+      # The two magnitudes of the elimination below, taken while out.s is
+      # still t1: their rounding is the part of the outer residual that no
+      # backend can see (`_step_estimate`).
+      mag = _screen.mag
+      mag.elim = norm(out.s) + norm(_dir_buf2)
+      mag.fdv  = norm(_dir_buf1)
       axpy!(-1, _dir_buf2, out.s)         # > Δs = t1 - F'*(F*Δv)
+      mag.ny = norm(out.y); mag.nw = norm(out.w)
+      mag.nv = norm(out.v); mag.ns = norm(out.s)
       return out
 
     end
@@ -2170,6 +2317,8 @@ function _conicIP(
     # Scaled KKT residual of the step Δz against the right-hand side r,
     # left in the preallocated _rIr:
     #   rkkt = (QΔy + GᵀΔw − AᵀΔv, GΔy, AΔy − Δs, λ∘FΔv + λ∘F⁻ᵀΔs)
+    # The magnitudes of these products are what `_step_estimate` has to
+    # bound when a screen stands in for this evaluation.
     function step_residual!(Δz, r)
       mul!(_res_buf3, F, Δz.v)
       cone_prod!(_res_buf1, λ, _res_buf3)
@@ -2200,15 +2349,16 @@ function _conicIP(
     #
     # Two screens skip an evaluation the KKT backend has already paid for
     # (see `_kkt_step_bound`: the outer 4×4 residual is the inner 3×3
-    # residual in exact arithmetic, so the backend's bound bounds it).
+    # residual in exact arithmetic, so the backend's bound bounds it) once
+    # `_step_estimate` has added the rounding the backend cannot see.
     #
-    #   entry — the backend's bound for the base solve is a factor
+    #   entry — the estimate for the base solve is a factor
     #           REFINE_SKIP_MARGIN under rtol, so the step already meets
     #           the target and no residual is formed;
-    #   exit  — the backend's bound for a correction solve is that factor
-    #           under both rtol and the residual it has to beat, so the
-    #           correction is accepted and the loop left without forming
-    #           the residual either.
+    #   exit  — the estimate for the step a correction solve produced is
+    #           that factor under both rtol and the residual it has to
+    #           beat, so the correction is accepted and the loop left
+    #           without forming the residual either.
     #
     # Both leave the STEP exactly as the unscreened code would: the margin
     # is what makes "the bound is under the target" imply "the residual is
@@ -2225,7 +2375,11 @@ function _conicIP(
       @phase timing t_dir_refine begin
       nr    = norm(r)
       rtol  = refineAbsTol + refineRelTol * nr
-      bound = _step_estimate(_s3_cur[], δ, Δz.y, nr, 0.0)
+      # `_mag` holds the base solve — every call site solves into `Δz`
+      # immediately before calling — and `_mag_acc` accumulates it and
+      # every correction, so it bounds the step actually under test.
+      _mag_copy!(_screen.acc, _screen.mag)
+      bound = _step_estimate(_step_bound(_s3_cur[]), δ, _screen, nr, 0.0)
       rres  = if bound !== nothing && REFINE_SKIP_MARGIN * bound <= rtol
         bound                           # entry screen
       else
@@ -2246,7 +2400,9 @@ function _conicIP(
         copy4!(_Δz_keep, Δz)
         axpy4!(1.0, Δzr, Δz)
         k += 1
-        cbound = _step_estimate(_s3_cur[], δ, Δzr.y, nr, REFINE_EVAL_FLOOR * rres)
+        _mag_add!(_screen.acc, _screen.mag)
+        cbound = _step_estimate(_step_bound(_s3_cur[]), δ, _screen, nr,
+                                REFINE_EVAL_FLOOR * rres)
         if cbound !== nothing && REFINE_SKIP_MARGIN * cbound <= min(rtol, rres)
           rres = cbound                 # exit screen
           break

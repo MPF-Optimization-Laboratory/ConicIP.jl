@@ -87,6 +87,36 @@
       @test true3 <= db.last_bound + 1e-12 * (1 + nrhs)
     end
 
+    # F4. `last_bound` is ‖r_u‖ + lift_gain·‖r_a‖ with both norms taken on
+    # their own rows. Recovering ‖r_u‖ as √(‖res‖² − ‖r_a‖²) — which is
+    # what it used to do — cancels away whenever the auxiliary rows carry
+    # the residual: at ‖r_u‖ = 1e-9 against ‖r_a‖ = 1 the subtraction
+    # returns 0 and the bound is out by nine orders. The sweep below drives
+    # the two parts apart by scaling the right-hand side over 24 orders of
+    # magnitude, on lifted mixes and with the internal refinement off (so
+    # the residual is whatever the factorization leaves), and the contract
+    # `last_bound ≥ ‖unlifted 3×3 residual‖` has to survive every one.
+    Random.seed!(6182)
+    for mix in ([("Q", 30)], [("Q", 12), ("Q", 7), ("R", 5)], [("Q", 8), ("S", 6)])
+      csl = t3_contract_case(mix)
+      for steps in (0, 2), σ in (1e-12, 1e-6, 1.0, 1e6, 1e12)
+        (bx, by, bz) = (σ .* csl.bx, σ .* csl.by, σ .* csl.bz)
+        sl = ConicIP.kktsolver_ldl(csl.Q, csl.A, csl.G, mix;
+                                   refine_steps = steps)(csl.F, csl.F⁻ᵀ)
+        (x, y, z) = sl(bx, by, bz)
+        dl = ConicIP.kkt_diagnostics(sl)
+        @test dl.lift_gain > 0                    # the mix does lift
+        @test dl.last_bound >= 0
+        r3 = norm([csl.Q*x + csl.G'*y - csl.A'*z - bx;
+                   csl.G*x - by;
+                   csl.A*x + csl.F'*(csl.F*z) - bz])
+        @test r3 <= dl.last_bound + 1e-12 * (1 + norm([bx; by; bz]))
+        # A nonzero lifted residual cannot leave the unlifted part looking
+        # exactly zero unless it really is: the two norms are independent.
+        @test (dl.last_bound == 0.0) == (dl.last_residual == 0.0)
+      end
+    end
+
     # The contract holds after a manual bump too, on every cone mix, and
     # the bump multiplies the base shift by retry_factor.
     for mix in t3_mixes
@@ -235,7 +265,85 @@
     # tests in runtests.jl (custom solvers, refineAbsTol = refineRelTol = 0).
     @test ConicIP._kkt_step_bound(nothing) === nothing
     @test ConicIP._kkt_step_bound(ConicIP.kkt_diagnostics(x -> x)) === nothing
-    @test ConicIP._step_estimate(x -> x, 0.0, Float64[], 0.0, 0.0) === nothing
+    rs0 = ConicIP.RefineScreen(0.0, 0.0, 0.0)
+    @test ConicIP._step_bound(x -> x) === nothing
+    @test ConicIP._step_estimate(nothing, 0.0, rs0, 0.0, 0.0) === nothing
+  end
+
+  @testset "Refinement screen rounding floor" begin
+    # F2. The 3×3 back-solve can be EXACT while the step `solve4x4!` builds
+    # from it is not: `Δs = t1 − FᵀFΔv` is one subtraction, and when the two
+    # terms are 2⁵⁹ apart the smaller one is lost entirely. With
+    #
+    #   Q = 2⁻¹²⁰,  A = 2⁻⁶⁰,  no equalities,  F = F⁻ᵀ = I,  λ = 1,
+    #   r.y = −1,   r.v = −1,  r.s = 1
+    #
+    # the 3×3 system is (q + a²)Δy = r.y with q = a² = 2⁻¹²⁰, so Δy = −2¹¹⁹
+    # and Δv = 2⁵⁹ come out exactly and the backend reports bound 0 — while
+    # the 4×4 residual of the step is 2. An estimate whose only rounding
+    # term is ε‖r‖ puts it at 7e-16 and the entry screen takes the step.
+    n = 1; m = 1
+    Q = sparse(reshape([2.0^-120], 1, 1))
+    A = sparse(reshape([2.0^-60],  1, 1))
+    G = spzeros(0, 1)
+    cd = [("R", 1)]
+    Fi  = Block([Diagonal([1.0])])
+    Fi⁻ᵀ = Block([Diagonal([1.0])])
+    λ  = [1.0]
+    ry = [-1.0]; rw = Float64[]; rv = [-1.0]; rs = [1.0]
+
+    s3 = ConicIP.kktsolver_ldl(Q, A, G, cd; static_reg = 0.0,
+                               dynamic_eps = 0.0)(Fi, Fi⁻ᵀ)
+    # The arithmetic of solve4x4!, spelled out, including the magnitudes it
+    # records into a StepMagnitudes.
+    t1 = copy(rs)                        # Fᵀ(r.s ∘\ λ) with F = I, λ = 1
+    (Δy, Δw, Δv) = s3(ry, rw, rv .+ t1)
+    Δy = collect(Δy); Δw = collect(Δw); Δv = collect(Δv)
+    FΔv   = copy(Δv)                     # F*Δv
+    FᵀFΔv = copy(FΔv)                    # Fᵀ*(F*Δv)
+    Δs    = t1 .- FᵀFΔv                  # the lossy subtraction
+    @test Δy == [-2.0^119] && Δv == [2.0^59]
+    @test Δs == [-2.0^59]                # fl(1 − 2⁵⁹): the 1 is gone
+    dg = ConicIP.kkt_diagnostics(s3)
+    @test dg.last_bound == 0.0           # the 3×3 back-solve IS exact
+
+    # The 4×4 residual, in the solver's own (block-sum) norm.
+    true4 = abs(ry[1] - (Q[1,1]*Δy[1] - A[1,1]*Δv[1])) +
+            abs(rv[1] - (A[1,1]*Δy[1] - Δs[1])) +
+            abs(rs[1] - (λ[1]*FΔv[1] + λ[1]*Δs[1]))
+    @test true4 ≈ 2.0
+
+    nr  = abs(ry[1]) + abs(rv[1]) + abs(rs[1])
+    rs = ConicIP.RefineScreen(ConicIP._opnorm_proxy(abs.(Q)),
+                              ConicIP._opnorm_proxy(abs.(A)),
+                              ConicIP._opnorm_proxy(abs.(G)))
+    rs.nλ = ConicIP._cone_mul_norm(λ, zip(["R"], [1:1], [1]))
+    for m in (rs.mag, rs.acc)
+      m.elim = norm(t1) + norm(FᵀFΔv); m.fdv = norm(FΔv)
+      m.ny = norm(Δy); m.nw = 0.0; m.nv = norm(Δv); m.ns = norm(Δs)
+    end
+    est = ConicIP._step_estimate(ConicIP._step_bound(s3), 0.0, rs, nr, 0.0)
+
+    # The estimate now bounds the residual, so the entry screen refuses the
+    # step for ANY tolerance the residual itself would fail.
+    @test est >= true4
+    rtol = 1e-12 + 1e-13 * nr
+    @test !(ConicIP.REFINE_SKIP_MARGIN * est <= rtol)
+    # ... and the term that does it is the Δs elimination: with `elim`
+    # zeroed the estimate collapses to the old ε‖r‖-level value.
+    rs0 = ConicIP.RefineScreen(rs.nQ, rs.nA, rs.nG); rs0.nλ = rs.nλ
+    old  = ConicIP._step_estimate(ConicIP._step_bound(s3), 0.0, rs0, nr, 0.0)
+    @test old < 1e-13 && ConicIP.REFINE_SKIP_MARGIN * old <= rtol
+
+    # The norm proxies are upper bounds on the operator norms they stand in
+    # for, and the cone-multiplication norm is blockwise (an "R" block's
+    # ‖λ‖∞, an arrow matrix's |λ₀| + ‖λ₁‖, an "S" block's Frobenius norm).
+    M = sparse([1.0 -2.0; 0.5 3.0])
+    @test ConicIP._opnorm_proxy(abs.(M)) >= opnorm(Matrix(M), 2)
+    @test ConicIP._opnorm_proxy(spzeros(0, 3)) == 0.0
+    bd = zip(["R", "Q"], [1:3, 4:6], [1, 2])
+    lv = [1.0, -4.0, 2.0, 3.0, 1.0, 1.0]
+    @test ConicIP._cone_mul_norm(lv, bd) ≈ max(4.0, 3.0 + sqrt(2.0))
   end
 
   @testset "Solution fields" begin
