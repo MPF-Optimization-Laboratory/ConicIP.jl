@@ -3051,14 +3051,22 @@ end
         @test occursin("dense_bytes_max", err.msg) && occursin("GiB", err.msg) &&
               occursin("semidefinite", err.msg) && occursin("kktsolver_qr", err.msg)
         # A large SDP cone list over the default 4 GiB budget errors too
-        # (n = m = 30_000 with a 1 × 1 SDP block is 14 GiB of dense storage).
-        @test_throws ArgumentError choose_kktsolver(spzeros(30_000, 30_000),
+        # (n = m = 30_000 with a 1 × 1 SDP block is 14 GiB of dense storage)
+        # — unless it is in standard form (Q = 0, A a scaled permutation),
+        # which kktsolver_sdpschur solves without the dense matrix at all.
+        @test_throws ArgumentError choose_kktsolver(sparse(1.0I, 30_000, 30_000),
             sparse(1.0I, 30_000, 30_000), spzeros(0, 30_000), [("R", 29_999), ("S", 1)])
+        @test choose_kktsolver(spzeros(30_000, 30_000), sparse(1.0I, 30_000, 30_000),
+            spzeros(0, 30_000), [("R", 29_999), ("S", 1)]) === ConicIP.kktsolver_sdpschur
         # Through conicIP the error propagates (ArgumentError is not a
-        # KKT_FAILURES member), like kktsolver_qr's own p > n check.
+        # KKT_FAILURES member), like kktsolver_qr's own p > n check. (A
+        # nonzero Q keeps the problem off the standard-form route.)
         ks_tiny = (Q, A, G, cd) -> choose_kktsolver(Q, A, G, cd; dense_bytes_max = 1)(Q, A, G, cd)
-        @test_throws ArgumentError conicIP(spzeros(3, 3), -[1.0, 0.0, 1.0], sparse(1.0I, 3, 3),
+        @test_throws ArgumentError conicIP(sparse(0.1I, 3, 3), -[1.0, 0.0, 1.0], sparse(1.0I, 3, 3),
             zeros(3), [("S", 3)], sparse([1.0 0.0 1.0]), [1.0]; kktsolver = ks_tiny, verbose = false)
+        @test conicIP(spzeros(3, 3), -[1.0, 0.0, 1.0], sparse(1.0I, 3, 3),
+            zeros(3), [("S", 3)], sparse([1.0 0.0 1.0]), [1.0]; kktsolver = ks_tiny,
+            verbose = false).status == :Optimal
         # Without SDP blocks the guard still routes to LDLᵀ.
         @test choose_kktsolver(spzeros(20, 20), sprandn(21, 20, 0.5), spzeros(0, 20),
                                [("R", 21)]; dense_bytes_max = 1) ===

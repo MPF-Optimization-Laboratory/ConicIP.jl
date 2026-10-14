@@ -564,8 +564,23 @@ separate multiweek effort; correctors are 1–2 weeks including measurement.
 
 ### Tranche 4: SDP at scale
 
-**Status:** not started. **Estimate:** research-grade, months; milestone-based. Only
-worth funding around a named family (dense-block SDPs, or chordally sparse SDPs).
+**Status:** first milestones done on dev (2026-10-14, 152a292 → 388c4a1). The k⁶ wall was
+the *formulation*: a PSD variable makes n = k(k+1)/2 and `kktsolver_qr` factored an (n−p)²
+matrix (O(k⁶), refused past k ≈ 150 by the 4 GiB budget); the LMI form was already a dense
+reduced Hessian. Landed: `benchmark/sdp_scaling.jl` (max-cut / theta, both forms) with
+`t_kkt_assemble`/`t_kkt_factor`; closed-form `dsdc_diag!`; a Dualization.jl guide and tests
+for models outside standard form; `kktsolver_sdpschur` (Q = 0, A a scaled permutation:
+eliminate the cone variables, factor the p×p equality Schur complement; presolve keeps
+singleton rows of such problems; staticReg applied dual-side); and a shared trace-form Gram
+kernel (`src/schur.jl`, four-index / rank-two / dense per column) that also replaces
+`kktsolver_qr`'s dense F⁻ᵀAQ₂ for every SDP. Measured (`benchmark/results/sdp-*.csv`):
+PSD-variable max-cut 1.66 → 0.0063 s/iter at k = 100, k = 150/200 now solve in 0.15/0.28 s;
+LMI form 2.5–8.8× per iteration; same iterations and objectives; SDPLIB unchanged on every
+instance that solved, theta2 1.73 → 0.15 s, arch0 4.5 → 1.35 s. Still open: a mixed
+standard form (free variables or bounds alongside the PSD variable; the reduced system is not
+automatically quasi-definite), certificate fallbacks (Q = I, stay on QR), chordal
+decomposition, and families with p = Θ(k²) equalities, where the p×p factorization is the
+wall. **Estimate for the rest:** research-grade, months; milestone-based.
 
 In this package's notation `A` maps n free variables to m cone coordinates. For an SDP
 block with row range I, the coefficient matrix of variable j is `B_j = mat(A[I, j])`, a
