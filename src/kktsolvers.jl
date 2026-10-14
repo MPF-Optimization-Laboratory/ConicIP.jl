@@ -88,6 +88,9 @@ Pick a KKT solver from the problem's cone mix, size, and predicted
 factorization cost (issue #10). Returns one of the solver constructors,
 chosen by:
 
+- a standard-form semidefinite program ([`sdpschur_eligible`](@ref):
+  `Q = 0` and every variable one cone coordinate, as a PSD variable
+  gives) ⇒ [`kktsolver_sdpschur`](@ref), before any rule below;
 0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
    `dense_bytes_max` ⇒ [`kktsolver_ldl`](@ref), whatever the rules
    below would say — dense QR at that size is an out-of-memory error,
@@ -124,6 +127,11 @@ function _choose_kktsolver(Q, A, G, cone_dims;
                            ldl_flop_weight = 10.0)
   n = size(Q,1); m = size(A,1); p = size(G,1)
   has_sdp = any(cd -> isequal(cd[1], "S"), cone_dims)
+  # Standard-form semidefinite programs (a PSD *variable*) eliminate the
+  # cone variables exactly and factor only the p×p equality Schur
+  # complement; decided before the dense-storage budget, which counts the
+  # k(k+1)/2 variables this solver never factors.
+  has_sdp && sdpschur_eligible(Q, A, cone_dims) && return (kktsolver_sdpschur, nothing)
   bytes = dense_kkt_bytes(n, m, p)
   if bytes > dense_bytes_max
     if has_sdp

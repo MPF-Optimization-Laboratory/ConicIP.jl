@@ -48,6 +48,7 @@ include("blockmatrices.jl")
 include("timing.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
+include("schur.jl")
 include("correctors.jl")
 
 ViewTypes   = Union{SubArray}
@@ -1567,7 +1568,12 @@ function _conicIP(
   # Route once when the default router is in charge: `default_kktsolver`
   # would repeat this call, and so would the verbose line below, each time
   # paying for a symbolic analysis and an AMD ordering of the KKT pattern.
-  routed = kktsolver === default_kktsolver ?
+  # A standard-form SDP is decided on the unregularized Q: Qᵣ = δI would
+  # hide it, and kktsolver_sdpschur applies δ on the dual side instead.
+  schur = (kktsolver === default_kktsolver || kktsolver === kktsolver_sdpschur) &&
+          sdpschur_eligible(Q, A, cone_dims)
+  routed = schur ? (kktsolver_sdpschur, nothing) :
+           kktsolver === default_kktsolver ?
            _choose_kktsolver(Qᵣ, A, G, cone_dims) : nothing
 
   if verbose && routed !== nothing
@@ -1578,6 +1584,8 @@ function _conicIP(
   solve3x3gen = try
     if routed === nothing
       kktsolver(Qᵣ,A,G,cone_dims)
+    elseif routed[1] === kktsolver_sdpschur
+      kktsolver_sdpschur(Q,A,G,cone_dims; static_reg = δ)
     elseif routed[2] === nothing
       routed[1](Qᵣ,A,G,cone_dims)
     else

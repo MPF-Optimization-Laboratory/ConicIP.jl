@@ -98,6 +98,8 @@ ConicIP.kktsolver_ldl
 ConicIP.cached_kktsolver_ldl
 ConicIP.soc_uv
 ConicIP.kktsolver_qr
+ConicIP.kktsolver_sdpschur
+ConicIP.sdpschur_eligible
 ConicIP.kktsolver_sparse
 ConicIP.kktsolver_2x2
 ConicIP.pivot

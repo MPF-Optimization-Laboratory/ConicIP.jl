@@ -3728,6 +3728,7 @@ end
 
     include("sdp_tests.jl")
     include("dualization_tests.jl")
+    include("sdpschur_tests.jl")
 
     include("sdplib_tests.jl")
 

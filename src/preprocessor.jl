@@ -98,7 +98,12 @@ function preprocess_conicIP(Q, c::AbstractVector,
     println()
   end
 
-  fx = @phase timing t_presolve b_presolve (fix_singletons ? _singleton_fixings(G, d) : nothing)
+  # A standard-form SDP keeps its singleton rows: fixing a matrix entry
+  # (X_ii = 1 in a max-cut relaxation) would leave a constant cone
+  # coordinate behind, A would stop being a scaled permutation, and the
+  # problem would lose kktsolver_sdpschur for the O(k⁶) dense path.
+  fix = fix_singletons && !sdpschur_eligible(Q, A, cone_dims)
+  fx = @phase timing t_presolve b_presolve (fix ? _singleton_fixings(G, d) : nothing)
   if fx === nothing
     return gc_stop!(timing, gc0, _preprocess_core(Q, c, A, b, cone_dims, G, d;
                             verbose = verbose, rank_check = rank_check, timeLimit = time_left(),
