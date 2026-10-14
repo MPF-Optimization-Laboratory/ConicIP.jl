@@ -1,9 +1,9 @@
 # Formulating Semidefinite Programs
 
-The same semidefinite program can be written in JuMP in two ways, and for
-ConicIP the choice decides how large a problem is practical. This guide
-explains why and shows how to keep a model in the form that is natural to
-write while ConicIP solves the cheap one.
+The same semidefinite program can be written in JuMP in two ways. ConicIP
+solves both efficiently in the common cases, but not every matrix-variable
+model qualifies; this guide explains which do, and what to do with one that
+does not.
 
 ## Two forms of one problem
 
@@ -27,28 +27,46 @@ few variables:
 These two models are duals of each other and have the same optimal value
 (here, the max-cut relaxation of a graph with Laplacian `L`).
 
-## Why the form matters
+## How ConicIP solves each
 
-ConicIP's variables are the model's variables. In matrix-variable form
-every entry of the upper triangle of `X` is one, so an order-`k` matrix
-gives `k(k+1)/2` solver variables. The semidefinite scaling block is dense,
-so ConicIP factors a dense matrix of that size each iteration: the work
-grows like `k⁶` and the memory like `k⁴`. Past roughly `k ≈ 150` the
-automatic KKT solver choice refuses the problem rather than allocate tens
-of gigabytes (see the [KKT Solvers](@ref) guide for the `dense_bytes_max`
-budget).
+ConicIP's variables are the model's variables. An order-`k` matrix
+variable therefore brings `k(k+1)/2` of them, one per entry of the upper
+triangle.
 
-In linear-matrix-inequality form the solver variables are the `y`, here
-`k` of them, and each iteration costs about `n k³ + n² k²` for `n`
-variables. The max-cut relaxation above solves at `k = 300` in a few seconds
-on a laptop in this form. In matrix-variable form, `k = 100` already takes
-about 40 times longer than in this form.
+- **Linear-matrix-inequality form.** The `n` variables are few. Each
+  iteration forms an `n × n` reduced matrix directly from the coefficient
+  matrices of the inequality, exploiting their sparsity, and factors it.
+  The dense worst case is about `n k³ + n² k²` operations.
+- **Matrix-variable form in standard form.** ConicIP recognizes the
+  standard form below and eliminates the matrix entries exactly. It then
+  factors only a `p × p` matrix for the `p` equality constraints
+  ([`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur)), at a cost of
+  about `p k³ + p² k² + p³` per iteration. The max-cut model above is in
+  this form.
+- **Matrix-variable form otherwise.** ConicIP factors a dense matrix in
+  all `k(k+1)/2` variables. That costs on the order of `k⁶` per iteration
+  and `k⁴` memory, and past roughly `k ≈ 150` the automatic KKT solver
+  choice refuses the problem rather than allocate tens of gigabytes.
 
-## Keep the model, change what the solver sees
+A model is in **standard form** when:
 
-[Dualization.jl](https://jump.dev/Dualization.jl/stable/) builds the dual of
-a JuMP model automatically. Wrapping the optimizer leaves the model in
-matrix-variable form while ConicIP solves the dual:
+- the objective is linear;
+- every variable is an entry of exactly one PSD (or nonnegative, or
+  second-order cone) constraint written on variables
+  (`@variable(model, X, PSD)`, `x[1:n] >= 0` with `x in Nonnegatives`);
+- the remaining constraints are linear equalities.
+
+Things that leave it: a quadratic objective in `X`; a bound or a second
+cone constraint on an entry of `X` (for example `X .>= 0` alongside
+`X ⪰ 0`); a variable shared between two cone constraints; free variables
+alongside the matrix.
+
+## Outside standard form: let Dualization.jl hand ConicIP the dual
+
+[Dualization.jl](https://jump.dev/Dualization.jl/stable/) builds the dual
+of a JuMP model automatically. Wrapping the optimizer leaves the model as
+written while ConicIP solves the dual, whose variables are the original
+constraints:
 
 ```julia
 using JuMP, ConicIP, Dualization
@@ -79,11 +97,10 @@ with their certificates mapped back to the original model.
 ## When dualizing does not help
 
 - The model is already in linear-matrix-inequality form. Dualizing it
-  produces a matrix-variable model, the expensive form.
+  produces a matrix-variable model.
 - The model has about as many equality constraints as matrix entries, for
-  example a semidefinite relaxation with a constraint per pair of indices.
-  Both forms are then large; ConicIP has no sparse semidefinite
-  specialization yet.
+  example a relaxation with a constraint per pair of indices. Both forms
+  are then large.
 - The model mixes a few semidefinite blocks with many other variables and
   constraints. The dual then carries those too; compare both on a small
   instance first.

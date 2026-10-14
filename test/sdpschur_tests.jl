@@ -105,6 +105,28 @@ end
         @test M == M'
     end
 
+    @testset "kktsolver_qr assembles the SDP Hessian by the trace form" begin
+        # Affine (LMI) form: n free variables, A with sparse and dense
+        # columns over R, Q and two S blocks, with and without equalities.
+        # kktsolver_qr now forms Q + AᵀF⁻¹F⁻ᵀA with the Gram kernel rather
+        # than (F⁻ᵀAQ₂)ᵀ(F⁻ᵀAQ₂); the 3×3 residual must stay at rounding.
+        cd = [("R", 3), ("Q", 4), ("S", 10), ("S", 21)]
+        m = sum(last, cd); n = 9
+        for p in (0, 3)
+            Random.seed!(60 + p)
+            A = sprandn(m, n, 0.15); A[:, 1] = randn(m)
+            Q = p == 0 ? spzeros(n, n) : (B = sprandn(n, n, 0.2); B' * B)
+            G = sprandn(p, n, 0.5) + sparse(1:p, 1:p, ones(p), p, n)
+            z = interior(cd); s = interior(cd)
+            F = nt_block(cd, z, s); F⁻ᵀ = inv(F)'
+            s3 = C.kktsolver_qr(Q, A, G, cd)(F, F⁻ᵀ)
+            for _ in 1:2
+                b = (randn(n), randn(p), randn(m))
+                @test resid3(Q, A, G, F, b, s3(b...)) <= 1e-11
+            end
+        end
+    end
+
     @testset "dual-side regularization and dependent rows" begin
         cd = [("S", 10)]
         P = standard_form(cd, 3; seed = 41)

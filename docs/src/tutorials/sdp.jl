@@ -13,25 +13,28 @@
 # objectives through the direct [`conicIP`](@ref) API. Through JuMP, see the
 # [JuMP Integration](@ref) guide for what the wrapper accepts.
 #
-# **How it is solved.** A problem with any `"S"` block is routed to
-# [`kktsolver_qr`](@ref ConicIP.kktsolver_qr), the dense double-QR method —
-# see the [KKT Solvers](@ref) guide. The Nesterov-Todd scaling block of a
-# semidefinite cone is a dense congruence transform, so the sparse solver has
-# nothing to exploit. The cost model follows from that routing: the dense
-# variable-space and reduced matrices grow with the *total* cone-vector
-# dimension times the number of variables, not with the order of a single
-# block. An order-`n` block contributes `n(n+1)/2` rows, so a single
-# order-100 block is 5050 rows, and a hundred order-10 blocks are 5500 rows —
-# comparable cost, even though the largest matrix differs by an order of
-# magnitude. Memory, not iteration count, is the binding constraint.
+# **How it is solved.** A problem with any `"S"` block is routed to a dense
+# method — see the [KKT Solvers](@ref) guide. The Nesterov-Todd scaling block
+# of a semidefinite cone is a dense congruence transform, so the sparse
+# solver has nothing to exploit. A standard-form problem (`Q = 0`, every
+# variable one cone coordinate) goes to
+# [`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur), which factors a
+# matrix the size of the equality block; every other one to
+# [`kktsolver_qr`](@ref ConicIP.kktsolver_qr), which factors a matrix the
+# size of the variable count. Both assemble their matrix from the sparse
+# coefficient matrices of each block, in work that grows with the block
+# order cubed per coefficient matrix (less when it is sparse), so the
+# number of variables or equalities — not the order of a single block — is
+# what bounds memory.
 #
 # **The formulation matters.** A PSD *variable* (`@variable(model, X, PSD)`)
-# makes every matrix entry a solver variable, and the dense path then grows
-# like `k⁶` in the block order `k`; the same problem written as a linear
-# matrix inequality in a few variables is far cheaper. The
-# [SDP Formulation](@ref "Formulating Semidefinite Programs") guide shows
-# how to keep the matrix-variable model and let Dualization.jl hand ConicIP
-# the cheap form.
+# makes every matrix entry a solver variable. In standard form (linear
+# objective, the entries constrained only by the cone and by linear
+# equalities) ConicIP eliminates them and factors an equality-sized system
+# instead ([`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur)); outside
+# it, the dense path grows like `k⁶` in the block order `k`. The
+# [SDP Formulation](@ref "Formulating Semidefinite Programs") guide says
+# which models qualify and how Dualization.jl handles the rest.
 #
 # **Accuracy in practice.** The SDPLIB 1.2 benchmark set (Borchers 1999) is
 # the reference. `benchmark/sdplib.jl` runs a spread of instances through the
@@ -56,9 +59,10 @@
 #
 # **What is not there.**
 #
-# - No chordal decomposition and no sparse-SDP specialization. A large
-#   sparse coefficient matrix is factored densely once an `"S"` block is
-#   present.
+# - No chordal decomposition. The reduced matrix is dense and factored by
+#   Cholesky: sparse coefficient matrices make its assembly cheap, not its
+#   factorization, so the number of variables (or of equalities, in
+#   standard form) bounds the problem size.
 # - The degenerate instances need a loose tolerance. The `hinf` family lacks
 #   strict complementarity, and `qap6` behaves the same way: once feasibility
 #   reaches roughly `1e-6` the KKT system is ill-conditioned, the Newton step

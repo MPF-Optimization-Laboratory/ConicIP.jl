@@ -248,9 +248,19 @@ function kktsolver_qr(Q, A, G, cone_dims)
   Q1 = @view Q0[:, 1:p]
   Q2 = @view Q0[:, p+1:end]
 
+  # With a semidefinite cone, A has k(k+1)/2 rows per order-k block, and
+  # the dense W = F⁻ᵀ(AQ2) below is (k(k+1)/2)×(n−p) — the memory wall of
+  # the affine (LMI) form. There the Hessian Q + AᵀF⁻¹F⁻ᵀA is assembled
+  # instead by the trace-form Gram kernel (src/schur.jl) straight from the
+  # sparse columns of A, and projected onto ker G afterwards; the dense
+  # m×(n−p) products are never formed.
+  gram = any(cd -> cd[1] == "S", cone_dims)
+
   # Constants across iterations
-  AQ2 = A * Q2           # m×(n−p) dense
-  S22 = Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
+  AQ2  = gram ? nothing : A * Q2           # m×(n−p) dense
+  S22  = gram ? nothing : Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
+  plan = gram ? _gram_plan(sparse(A), cone_dims) : nothing
+  Hbuf = gram ? zeros(n, n) : nothing
 
   function solve3x3gen(F, F⁻ᵀ, pt = nothing)
 
@@ -258,8 +268,14 @@ function kktsolver_qr(Q, A, G, cone_dims)
     # F⁻ᵀ is the cached block-diagonal inverse the caller passes in —
     # never densify it (it used to be shadowed by a dense m×m inverse).
     Lmat = @phase pt t_kkt_assemble begin
-      W = F⁻ᵀ * AQ2
-      S22 + W'W
+      if gram
+        _gram!(Hbuf, plan, F⁻ᵀ)             # AᵀF⁻¹F⁻ᵀA = (F⁻ᵀA)ᵀ(F⁻ᵀA)
+        Hbuf .+= Q
+        p == 0 ? Hbuf : Matrix(Symmetric(Q2' * Hbuf * Q2))
+      else
+        W = F⁻ᵀ * AQ2
+        S22 + W'W
+      end
     end
     L = @phase pt t_kkt_factor try
       cholesky(Symmetric(Lmat))   # SPD by construction (CVXOPT §10.2)
