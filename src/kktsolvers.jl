@@ -244,19 +244,22 @@ function kktsolver_qr(Q, A, G, cone_dims)
   AQ2 = A * Q2           # m×(n−p) dense
   S22 = Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
 
-  function solve3x3gen(F, F⁻ᵀ)
+  function solve3x3gen(F, F⁻ᵀ, pt = nothing)
 
     # Reduced Hessian Q2'(Q + A'F⁻¹F⁻ᵀA)Q2 = S22 + W'W, W = F⁻ᵀ(AQ2).
     # F⁻ᵀ is the cached block-diagonal inverse the caller passes in —
     # never densify it (it used to be shadowed by a dense m×m inverse).
-    W = F⁻ᵀ * AQ2
-    Lmat = S22 + W'W
-    L = try
+    Lmat = @phase pt t_kkt_assemble begin
+      W = F⁻ᵀ * AQ2
+      S22 + W'W
+    end
+    L = @phase pt t_kkt_factor try
       cholesky(Symmetric(Lmat))   # SPD by construction (CVXOPT §10.2)
     catch err
       err isa LinearAlgebra.PosDefException || rethrow()
       qr(Lmat)                    # marginal PD: fall back to QR
     end
+    pt === nothing || (pt.n_kkt_factor += 1)
 
     # H*u = (Q + A'F⁻¹F⁻ᵀA)u via sparse matvecs and block applies;
     # F⁻¹ = (F⁻ᵀ)' holds for every scaling block (no symmetry assumed).
@@ -283,7 +286,21 @@ function kktsolver_qr(Q, A, G, cone_dims)
 
   end
 
+  return DenseKKTGen(solve3x3gen, nothing)
+
 end
+
+# Generator returned by the dense backends (`kktsolver_qr`,
+# `kktsolver_sdpschur`): callable as `gen(F, F⁻ᵀ)` like any solve3x3gen,
+# and the holder of the `PhaseTimes` that `kkt_attach_timing!` attaches,
+# which every later factorization reports its assembly and factorization
+# time into. Unattached, the timing sites cost one `nothing` check each.
+mutable struct DenseKKTGen{G}
+  gen::G
+  timing::Union{Nothing,PhaseTimes}
+end
+(g::DenseKKTGen)(F, F⁻ᵀ) = g.gen(F, F⁻ᵀ, g.timing)
+kkt_attach_timing!(g::DenseKKTGen, pt::PhaseTimes) = (g.timing = pt; nothing)
 
 function lift(F::Block)
 

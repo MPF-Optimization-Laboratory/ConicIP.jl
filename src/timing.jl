@@ -30,6 +30,12 @@
 #   child of t_kktupdate), t_ldl_solve (triangular solves) and t_ldl_resid
 #   (residual products of the internal refinement), both children of the
 #   solve that called them. Custom KKT callables leave them zero.
+# * Dense-backend children are INCLUSIVE diagnostics reported through
+#   `kkt_attach_timing!` by `kktsolver_qr` and `kktsolver_sdpschur`:
+#   t_kkt_assemble (forming the reduced matrix from the scaling blocks) and
+#   t_kkt_factor (its Cholesky, or the QR fallback), with n_kkt_factor
+#   counting the factorizations. They are children of t_kktupdate, except
+#   that the initial-point factorization is charged to t_init.
 # * Counts: n_passes = loop passes including the final convergence check,
 #   n_steps = completed iterate updates, n_kktupdate = factorizations
 #   (initial one included), n_solve = calls to the 4×4 solve (initial point,
@@ -82,6 +88,9 @@ mutable struct PhaseTimes
   t_ldl_factor::UInt64
   t_ldl_solve::UInt64
   t_ldl_resid::UInt64
+  # dense-backend children (inclusive diagnostics within t_kktupdate)
+  t_kkt_assemble::UInt64
+  t_kkt_factor::UInt64
   # allocation bytes for the loop children and the whole-call phases that matter
   b_presolve::Int64
   b_equilibrate::Int64
@@ -102,6 +111,7 @@ mutable struct PhaseTimes
   n_ldl_factor::Int
   n_ldl_solve::Int
   n_ldl_resid::Int
+  n_kkt_factor::Int
   # GC time over the outermost call, kept apart from the phases
   t_gc::UInt64
 end
