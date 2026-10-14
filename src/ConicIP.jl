@@ -672,6 +672,31 @@ function dsdc!(x, y, o)
 
 end
 
+function dsdc_diag!(x, y, o)
+
+  # dsdc! for a divisor whose matrix is diagonal, Y = Diag(λ₁, …, λₙ): the
+  # solver's λ = F*z, which nestod_sdc makes diagonal (R'ZR = Λ), and the
+  # identity e at the initial point. Then (YZ + ZY)/2 = X is entrywise
+  # Z_ij (λ_i + λ_j)/2 = X_ij, so Z_ij = X_ij / ((λ_i + λ_j)/2) — the √2
+  # packing weight cancels, and the packed coordinates divide in place.
+  # Only the diagonal of mat(y) is read: its off-diagonals are rounding.
+  # The mean is formed as λ_i/2 + λ_j/2, which cannot overflow, and the
+  # quotient is representable whenever Z_ij is. O(k²) for order k against
+  # lyap's O(k³) Schur factorization, and allocation-free.
+  n = ord(y)
+  dpos(j) = (j - 1)*n - div((j - 1)*(j - 2), 2) + 1   # packed index of (j,j)
+  c = 1
+  @inbounds for i = 1:n
+    λi = y[c]
+    o[c] = x[c] / λi; c += 1
+    for j = i+1:n
+      o[c] = x[c] / (λi/2 + y[dpos(j)]/2); c += 1
+    end
+  end
+  return o
+
+end
+
 function xsdc!(x, y, o)
 
   # Jordan product (X*Y + Y*X)/2 of the semidefinite cone, whose identity
@@ -1489,13 +1514,15 @@ function _conicIP(
   function cone_div!(o,x,y)
 
     # In-place group division x ○\ y → o
-    # (each per-cone primitive fully overwrites its output view)
+    # (each per-cone primitive fully overwrites its output view).
+    # The divisor is always the scaled point λ = F*z.v, or e at the
+    # initial point; both are diagonal on S blocks, hence dsdc_diag!.
 
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; drp!(xI, yI, oI);  end
       if btype == "Q"; dsoc!(xI, yI, oI); end
-      if btype == "S"; dsdc!(xI, yI, oI); end
+      if btype == "S"; dsdc_diag!(xI, yI, oI); end
     end
     return o;
 

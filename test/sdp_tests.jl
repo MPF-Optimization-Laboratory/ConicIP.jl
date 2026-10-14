@@ -149,6 +149,36 @@ end
         end
     end
 
+    @testset "Division by the diagonal scaled point" begin
+        # The solver divides only by λ = F*z (and e at the initial point),
+        # which nestod_sdc makes diagonal, so cone_div! uses the Hadamard
+        # closed form dsdc_diag! instead of the general Lyapunov dsdc!.
+        # The two must agree on such divisors, including at extreme and
+        # jointly extreme scales, and the closed form must not allocate.
+        Random.seed!(77)
+        for n in (1, 2, 3, 6), (az, as) in ((1.0, 1.0), (1e-100, 1e100), (1e100, 1e-100))
+            Mz = randn(n, n); Ms = randn(n, n)
+            z = ConicIP.vecm(az * (Mz' * Mz + 0.1I))
+            s = ConicIP.vecm(as * (Ms' * Ms + 0.1I))
+            λ = ConicIP.nestod_sdc(z, s) * z
+            x = ConicIP.vecm(Symmetric(randn(n, n))) .* sqrt(az * as)
+            o1 = zeros(length(x)); o2 = zeros(length(x))
+            ConicIP.dsdc!(x, λ, o1); ConicIP.dsdc_diag!(x, λ, o2)
+            @test norm(o2 - o1) <= 1e-12 * norm(o1)
+            Y = ConicIP.mat(λ); O = ConicIP.mat(o2)
+            @test norm(Y * O + O * Y - 2 * ConicIP.mat(x)) <= 1e-12 * norm(2 * ConicIP.mat(x))
+        end
+        # λᵢ/2 + λⱼ/2 keeps both representable extremes finite and exact.
+        o = zeros(3)
+        ConicIP.dsdc_diag!(fill(1e308, 3), ConicIP.vecm([1.0 0; 0 1.0]), o)
+        @test o == fill(1e308, 3)
+        ConicIP.dsdc_diag!(ones(3), ConicIP.vecm([1e308 0; 0 1e308]), o)
+        @test o == fill(1e-308, 3)
+        λ = ConicIP.vecm(Matrix(Diagonal(rand(8) .+ 1))); x = randn(length(λ)); o = similar(x)
+        ConicIP.dsdc_diag!(x, λ, o)
+        @test (@allocated ConicIP.dsdc_diag!(x, λ, o)) == 0
+    end
+
     @testset "vecm(I) is the identity of the cone product" begin
         # x ∘ e = x for the S block.  Fails on the pre-fix code, which
         # returned 2X here.
