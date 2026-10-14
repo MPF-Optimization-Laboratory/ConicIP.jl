@@ -3727,6 +3727,7 @@ end
     include("harness_tests.jl")
 
     include("sdp_tests.jl")
+    include("dualization_tests.jl")
 
     include("sdplib_tests.jl")
 

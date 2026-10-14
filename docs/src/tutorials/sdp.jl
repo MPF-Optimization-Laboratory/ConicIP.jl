@@ -25,6 +25,14 @@
 # comparable cost, even though the largest matrix differs by an order of
 # magnitude. Memory, not iteration count, is the binding constraint.
 #
+# **The formulation matters.** A PSD *variable* (`@variable(model, X, PSD)`)
+# makes every matrix entry a solver variable, and the dense path then grows
+# like `k⁶` in the block order `k`; the same problem written as a linear
+# matrix inequality in a few variables is far cheaper. The
+# [SDP Formulation](@ref "Formulating Semidefinite Programs") guide shows
+# how to keep the matrix-variable model and let Dualization.jl hand ConicIP
+# the cheap form.
+#
 # **Accuracy in practice.** The SDPLIB 1.2 benchmark set (Borchers 1999) is
 # the reference. `benchmark/sdplib.jl` runs a spread of instances through the
 # MOI wrapper and reports status, iterations, time and relative error against

@@ -244,7 +244,17 @@ function run_sdp(inst::Instance)
 end
 
 function run_one_sdp(inst::Instance)
-    result = run_sdp(inst)
+    # The router refuses an SDP whose dense KKT storage exceeds its budget
+    # with an ArgumentError out of optimize!; record that as the outcome.
+    result = try
+        run_sdp(inst)
+    catch err
+        err isa ArgumentError || rethrow()
+        msg = sprint(showerror, err)
+        gib = match(r"estimated ([0-9.]+) GiB", msg)
+        Dict{String, Any}("status" => gib === nothing ? "REJECTED" : "REJECTED($(gib[1])GiB)",
+                          "k" => parse_inst(inst.name).k, "form" => parse_inst(inst.name).form)
+    end
     result["maxrss_mb"] = Sys.maxrss() / 2^20
     return result
 end
