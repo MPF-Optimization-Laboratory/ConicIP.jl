@@ -27,7 +27,8 @@ dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
 # Default dense storage budget of choose_kktsolver (4 GiB).
 const _DENSE_BYTES_MAX = 4 * 2^30
 
-# Persistent and peak dense storage of kktsolver_sdpschur in standard form:
+# Persistent and peak dense storage of kktsolver_sdpschur in standard form
+# (the mixed form's is `_sdpschur_bytes`):
 # the p×p Schur matrix, its equilibrated copy and the Cholesky factor.
 sdpschur_bytes(p) = 8 * 3p^2
 
@@ -95,10 +96,11 @@ Pick a KKT solver from the problem's cone mix, size, and predicted
 factorization cost (issue #10). Returns one of the solver constructors,
 chosen by:
 
-- a standard-form semidefinite program ([`sdpschur_eligible`](@ref):
-  `Q = 0` and every variable one cone coordinate, as a PSD variable
-  gives) whose Schur storage `sdpschur_bytes(p)` fits `dense_bytes_max`
-  ⇒ [`kktsolver_sdpschur`](@ref), before any rule below;
+- a semidefinite program with a PSD variable ([`sdpschur_eligible`](@ref):
+  standard form, or a semidefinite block whose entries are variables
+  with a reduced system at most half the variable count) whose reduced
+  matrix and factorization fit `dense_bytes_max` (`sdpschur_bytes(p)` in
+  standard form) ⇒ [`kktsolver_sdpschur`](@ref), before any rule below;
 0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
    `dense_bytes_max` ⇒ [`kktsolver_ldl`](@ref), whatever the rules
    below would say — dense QR at that size is an out-of-memory error,
@@ -135,16 +137,16 @@ function _choose_kktsolver(Q, A, G, cone_dims;
                            ldl_flop_weight = 10.0)
   n = size(Q,1); m = size(A,1); p = size(G,1)
   has_sdp = any(cd -> isequal(cd[1], "S"), cone_dims)
-  # Standard-form semidefinite programs (a PSD *variable*) eliminate the
-  # cone variables exactly and factor only the p×p equality Schur
-  # complement; decided before the dense-storage budget, which counts the
-  # k(k+1)/2 variables this solver never factors.
-  # Its own storage is the p×p matrix and its factorization: budgeted
+  # Semidefinite programs with a PSD *variable* eliminate the cone
+  # variables exactly and factor only a reduced system (the p×p equality
+  # Schur complement in standard form); decided before the dense-storage
+  # budget, which counts the k(k+1)/2 variables this solver never factors.
+  # Its own storage is the reduced matrix and its factorization: budgeted
   # here, and a problem whose Schur matrix does not fit falls through to
   # the rules below (which refuse it when the dense path does not fit
   # either).
-  has_sdp && sdpschur_eligible(Q, A, cone_dims) &&
-    sdpschur_bytes(p) <= dense_bytes_max && return (kktsolver_sdpschur, nothing)
+  has_sdp && _sdpschur_fits(Q, A, G, cone_dims, dense_bytes_max) &&
+    return (kktsolver_sdpschur, nothing)
   bytes = dense_kkt_bytes(n, m, p)
   if bytes > dense_bytes_max
     if has_sdp

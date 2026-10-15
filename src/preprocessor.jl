@@ -98,12 +98,17 @@ function preprocess_conicIP(Q, c::AbstractVector,
     println()
   end
 
-  # A standard-form SDP keeps its singleton rows: fixing a matrix entry
-  # (X_ii = 1 in a max-cut relaxation) would leave a constant cone
-  # coordinate behind, A would stop being a scaled permutation, and the
-  # problem would lose kktsolver_sdpschur for the O(k⁶) dense path.
-  fix = fix_singletons && !sdpschur_eligible(Q, A, cone_dims)
-  fx = @phase timing t_presolve b_presolve (fix ? _singleton_fixings(G, d) : nothing)
+  # An SDP routed to kktsolver_sdpschur keeps the singleton rows on its
+  # cone variables: fixing a matrix entry (X_ii = 1 in a max-cut
+  # relaxation) would leave a constant cone coordinate behind, the block
+  # would stop being eliminable, and the problem would lose
+  # kktsolver_sdpschur for the O(k⁶) dense path. Singletons on the other
+  # variables are fixed as usual.
+  fx = @phase timing t_presolve b_presolve begin
+    sp = fix_singletons ? _schur_split(Q, A, cone_dims) : nothing
+    protect = _split_eligible(sp, size(A, 2), size(G, 1)) ? sp.S : nothing
+    fix_singletons ? _singleton_fixings(G, d; protect = protect) : nothing
+  end
   if fx === nothing
     return gc_stop!(timing, gc0, _preprocess_core(Q, c, A, b, cone_dims, G, d;
                             verbose = verbose, rank_check = rank_check, timeLimit = time_left(),
@@ -238,7 +243,8 @@ end
 #                            on column j whose fixed values disagree beyond
 #                            `tol` (relative), which makes the problem
 #                            infeasible.
-function _singleton_fixings(G, d; tol = 1e-9)
+# Rows on a column in `protect` (column indices) are left alone.
+function _singleton_fixings(G, d; tol = 1e-9, protect = nothing)
   Gs = sparse(G)
   p = size(Gs, 1)
   p == 0 && return nothing
@@ -254,9 +260,12 @@ function _singleton_fixings(G, d; tol = 1e-9)
   fixrow = zeros(Int, size(Gs, 2))       # row that fixed each column
   fixval = zeros(size(Gs, 2))
   conflict = nothing
+  isprot = falses(size(Gs, 2))
+  protect === nothing || (isprot[protect] .= true)
   for i in 1:p
     cnt[i] == 1 || continue
     j = lastcol[i]
+    isprot[j] && continue
     v = d[i] / Gs[i, j]
     if fixrow[j] == 0
       fixrow[j] = i; fixval[j] = v

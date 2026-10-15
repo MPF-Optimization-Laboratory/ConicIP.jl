@@ -65,7 +65,7 @@ end
                  [("S", 6), ("Q", 4), ("R", 2), ("S", 15)])
         for (ci, cd) in enumerate(cases), p in (0, 4)
             P = standard_form(cd, p; seed = 10ci + p)
-            @test C.sdpschur_eligible(P.Q, P.A, cd)
+            @test C.sdpschur_eligible(P.Q, P.A, P.G, cd)
             z = interior(cd); s = interior(cd)
             F = nt_block(cd, z, s); F⁻ᵀ = inv(F)'
             sq = C.kktsolver_qr(P.Q, P.A, P.G, cd)(F, F⁻ᵀ)
@@ -269,13 +269,14 @@ end
         cd = [("S", 6)]; m = 6
         A = sparse(1.0I, m, m); G = sparse(ones(1, m)); Q = spzeros(m, m)
         @test C.choose_kktsolver(Q, A, G, cd) === C.kktsolver_sdpschur
-        # Declines: a quadratic objective, a variable in two cone rows (a
-        # bound), a cone row in two variables, no semidefinite cone.
-        @test !C.sdpschur_eligible(sparse(1.0I, m, m), A, cd)
-        @test !C.sdpschur_eligible(Q, [A; sparse([1], [1], [1.0], 1, m)], [("S", 6), ("R", 1)])
+        # Declines: a quadratic objective on the cone variables, a cone row
+        # in two variables, no semidefinite cone.
+        @test !C.sdpschur_eligible(sparse(1.0I, m, m), A, G, cd)
         A2 = copy(A); A2[1, 2] = 1.0
-        @test !C.sdpschur_eligible(Q, A2, cd)
-        @test !C.sdpschur_eligible(Q, A, [("R", 6)])
+        @test !C.sdpschur_eligible(Q, A2, G, cd)
+        @test !C.sdpschur_eligible(Q, A, G, [("R", 6)])
+        # A bound on one entry is mixed form with a small reduced system.
+        @test C.sdpschur_eligible(Q, [A; sparse([1], [1], [1.0], 1, m)], G, [("S", 6), ("R", 1)])
         @test C.choose_kktsolver(sparse(1.0I, m, m), A, G, cd) === C.kktsolver_qr
         @test_throws ArgumentError C.kktsolver_sdpschur(sparse(1.0I, m, m), A, G, cd)
         # The storage budget does not apply: the k(k+1)/2 variables are never
@@ -390,5 +391,307 @@ end
         @test slope > 0
         @test norm(G * sol.y) <= 1e-8 * slope
         @test eigmin(Symmetric(C.mat(A * sol.y))) >= -1e-8 * slope
+    end
+
+    # ── Mixed form: a PSD variable among other variables and rows ──────
+    #
+    # Only the cone variables of the eliminated blocks go; free variables,
+    # bounds or a second cone on matrix entries, LMIs in the free variables
+    # and a quadratic objective on them stay in a reduced system factored
+    # by Bunch-Kaufman.
+
+    # Columns: the PSD variables' coordinates (shuffled), then `nfree`
+    # free variables, then `nonneg` nonnegative variables used nowhere else.
+    # Rows: the PSD blocks; a nonnegative block with `nbound` bounds on
+    # matrix entries, the nonnegative variables and (if `freebounds`) bounds
+    # on the free variables; optionally an SOC on (free₁, two entries) and an
+    # order-3 LMI in the free variables. `rrow` makes the last equality row
+    # touch a free variable only, so C_S loses rank.
+    function mixed_form(; ks, nfree, nbound, nonneg = 0, soc = false, lmi = false,
+                        freebounds = true, p, rrow = false, qfree = true, seed)
+        Random.seed!(seed)
+        mS = [div(k * (k + 1), 2) for k in ks]; nS = sum(mS)
+        n = nS + nfree + nonneg
+        perm = randperm(nS)
+        fr = nS .+ (1:nfree); nn = nS + nfree .+ (1:nonneg)
+        blocks = SparseMatrixCSC{Float64,Int}[]; cd = Tuple{String,Int}[]
+        off = 0
+        for mk in mS
+            push!(blocks, sparse(1:mk, perm[off+1:off+mk],
+                                 (rand(mk) .+ 0.5) .* rand([-1, 1], mk), mk, n))
+            push!(cd, ("S", mk)); off += mk
+        end
+        rc = [rand(1:nS, nbound); nn; freebounds ? fr : Int[]]
+        if !isempty(rc)
+            push!(blocks, sparse(1:length(rc), rc, rand(length(rc)) .+ 0.5, length(rc), n))
+            push!(cd, ("R", length(rc)))
+        end
+        if soc
+            push!(blocks, sparse(1:3, [fr[1]; rand(1:nS, 2)], [1.0, 0.7, -0.4], 3, n))
+            push!(cd, ("Q", 3))
+        end
+        if lmi
+            B = spzeros(6, n)
+            for j in fr; B[:, j] = randn(6); end
+            push!(blocks, B); push!(cd, ("S", 6))
+        end
+        A = reduce(vcat, blocks)
+        G = sprandn(p, n, 0.3)
+        for i in 1:min(p, nfree); G[i, fr[i]] = 1.0 + rand(); end
+        for i in nfree+1:p; G[i, perm[i]] += 2.0; end
+        if rrow
+            G[p, :] .= 0; G[p, fr[end]] = 1.0
+        end
+        Q = spzeros(n, n)
+        if qfree && nfree > 0
+            B = randn(nfree, nfree); Q[fr, fr] = B' * B
+        end
+        dropzeros!(G)
+        return (Q = Q, A = A, G = G, cd = cd, n = n, m = size(A, 1), p = p)
+    end
+
+    @testset "mixed form: split" begin
+        # X (order 3, cols 1:6), t (col 7), z (col 8).
+        n = 8
+        A = [sparse(1:6, 1:6, ones(6), 6, n);                 # X ⪰ 0         → P
+             sparse(1:3, [1, 8, 7], ones(3), 3, n);           # X₁, z, t ≥ 0  → K, P, O
+             sparse(1:3, [7, 2, 3], ones(3), 3, n);           # (t, X₂, X₃) ∈ SOC → K
+             sparse([1, 3], [7, 7], [1.0, 1.0], 3, n)]        # LMI in t      → O
+        cd = [("S", 6), ("R", 3), ("Q", 3), ("S", 3)]
+        sp = C._schur_split(spzeros(n, n), A, cd)
+        P, K, O = C._ROW_P, C._ROW_K, C._ROW_O
+        @test sp.kind == [P, P, P, P, P, P, K, P, O, K, K, K, O, O, O]
+        @test sp.S == [1:6; 8] && sp.R == [7] && sp.K == [7, 10, 11, 12]
+        @test !sp.pure
+        # A quadratic term on z keeps it (its row becomes O); on X, no split.
+        Qz = sparse([8], [8], [1.0], n, n)
+        @test C._schur_split(Qz, A, cd).kind[8] == O
+        @test C._schur_split(sparse([1], [1], [1.0], n, n), A, cd) === nothing
+        # An SDP block on claimed variables is K, not a second P.
+        A2 = [A; sparse(1:6, 1:6, ones(6), 6, n)]
+        @test all(==(K), C._schur_split(spzeros(n, n), A2, [cd; ("S", 6)]).kind[16:21])
+    end
+
+    @testset "mixed form: 3×3 solve agrees with kktsolver_qr" begin
+        cases = [
+            # everything at once, quadratic objective on the free variables
+            (ks = [3], nfree = 2, nbound = 2, nonneg = 1, soc = true, lmi = true, p = 3),
+            # free variables in equality rows only: H_R = 0, and C_S rank-deficient
+            (ks = [4], nfree = 2, nbound = 0, freebounds = false, p = 3, rrow = true, qfree = false),
+            # two PSD variables, bounds and an SOC on entries, no equalities
+            (ks = [3, 4], nfree = 1, nbound = 3, nonneg = 2, soc = true, p = 0),
+            # no free variables, only bounds on entries
+            (ks = [5], nfree = 0, nbound = 4, p = 2),
+        ]
+        for (ci, kw) in enumerate(cases)
+            P = mixed_form(; seed = 70 + ci, kw...)
+            sp = C._schur_split(P.Q, P.A, P.cd)
+            @test sp !== nothing && !sp.pure
+            z = interior(P.cd); s = interior(P.cd)
+            F = nt_block(P.cd, z, s); F⁻ᵀ = inv(F)'
+            sq = C.kktsolver_qr(P.Q, P.A, P.G, P.cd)(F, F⁻ᵀ)
+            ss = C.kktsolver_sdpschur(P.Q, P.A, P.G, P.cd)(F, F⁻ᵀ)
+            for _ in 1:2
+                b = (randn(P.n), randn(P.p), randn(P.m))
+                xs = ss(b...); xq = sq(b...)
+                @test resid3(P.Q, P.A, P.G, F, b, xs) <= 1e-11
+                for i in 1:3
+                    @test norm(xs[i] - xq[i]) <= 1e-9 * max(1, norm(xq[i]))
+                end
+            end
+            Iblk = C.Block([Diagonal(ones(d)) for (_, d) in P.cd])
+            s0 = C.kktsolver_sdpschur(P.Q, P.A, P.G, P.cd)(Iblk, Iblk)
+            b = (randn(P.n), randn(P.p), randn(P.m))
+            @test resid3(P.Q, P.A, P.G, Iblk, b, s0(b...)) <= 1e-11
+        end
+    end
+
+    @testset "mixed form: regularization and dependent rows" begin
+        P = mixed_form(; ks = [3], nfree = 2, nbound = 2, soc = true, p = 3, seed = 81)
+        z = interior(P.cd); s = interior(P.cd); F = nt_block(P.cd, z, s); F⁻ᵀ = inv(F)'
+        b = (randn(P.n), randn(P.p), randn(P.m))
+        exact = C.kktsolver_sdpschur(P.Q, P.A, P.G, P.cd)(F, F⁻ᵀ)(b...)
+        regs = C.kktsolver_sdpschur(P.Q, P.A, P.G, P.cd; static_reg = 1e-10)(F, F⁻ᵀ)
+        reg = regs(b...)
+        @test norm(reg[1] - exact[1]) <= 1e-6 * norm(exact[1])
+        @test refined_resid(P.Q, P.A, P.G, F, regs, b)[1] <= 1e-12
+        # A repeated equality row makes the reduced matrix singular; the
+        # retry's shift still solves a consistent right-hand side.
+        G2 = [P.G; P.G[1:1, :]]
+        s2 = C.kktsolver_sdpschur(P.Q, P.A, G2, P.cd)(F, F⁻ᵀ)
+        b2 = (b[1], [b[2]; b[2][1]], b[3])
+        (y, w, v) = s2(b2...)
+        @test norm(G2 * y - b2[2]) <= 1e-6 * norm(b2[2])
+        @test refined_resid(P.Q, P.A, G2, F, s2, b2)[1] <= 1e-10
+    end
+
+    @testset "mixed form: a small row is not a dependent one" begin
+        # The standard-form reproducer with a free variable t: equality rows
+        # on packed coordinates 1 and 3 (the second also on t, the only
+        # place t appears, so H_R = 0) and F = VecCongurance(Diag(1, 1e-4)):
+        # the reduced matrix has entries of order 1 and 1e-16.
+        # Equilibration keeps the small row from being taken for a
+        # dependent one.
+        cd = [("S", 3)]
+        A = sparse(1.0I, 3, 4)
+        G = sparse([1.0 0 0 0; 0 0 1 1]); Q = spzeros(4, 4)
+        F = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))])
+        F⁻ᵀ = C.Block([inv(F[1])'])
+        @test C._schur_split(Q, A, cd).R == [4]
+        b = (zeros(4), [0.0, 1.0], zeros(3))
+        xs = C.kktsolver_sdpschur(Q, A, G, cd)(F, F⁻ᵀ)(b...)
+        xq = C.kktsolver_qr(Q, A, G, cd)(F, F⁻ᵀ)(b...)
+        @test resid3(Q, A, G, F, b, xs) <= 1e-12
+        @test norm(xs[1] - xq[1]) <= 1e-8 * norm(xq[1])
+    end
+
+    @testset "mixed form: routing" begin
+        # Order 8 (36 coordinates), one free variable, two bounds: the
+        # reduced system (1 + 3 + 2 + 1) is far below n/2.
+        P = mixed_form(; ks = [8], nfree = 1, nbound = 2, p = 3, seed = 91)
+        @test C.sdpschur_eligible(P.Q, P.A, P.G, P.cd)
+        @test C.choose_kktsolver(P.Q, P.A, P.G, P.cd) === C.kktsolver_sdpschur
+        # Doubly nonnegative: X ⪰ 0 and X .≥ 0 keeps every entry's row, so
+        # the reduced system is as large as the dense one: declined.
+        k = 6; mk = div(k * (k + 1), 2)
+        A = [sparse(1.0I, mk, mk); sparse(1.0I, mk, mk)]
+        G = sparse(1:k, [div(i * (i + 1), 2) for i in 1:k], ones(k), k, mk)
+        cd = [("S", mk), ("R", mk)]
+        @test C._schur_split(spzeros(mk, mk), A, cd) !== nothing
+        @test !C.sdpschur_eligible(spzeros(mk, mk), A, G, cd)
+        @test C.choose_kktsolver(spzeros(mk, mk), A, G, cd) === C.kktsolver_qr
+        # The reduced matrix is budgeted like the standard-form one.
+        sp = C._schur_split(P.Q, P.A, P.cd)
+        bytes = C._sdpschur_bytes(sp, P.p)
+        @test C._sdpschur_fits(P.Q, P.A, P.G, P.cd, bytes)
+        @test !C._sdpschur_fits(P.Q, P.A, P.G, P.cd, bytes - 1)
+        # (Over budget, the dense rules refuse an SDP outright.)
+        @test_throws ArgumentError C.choose_kktsolver(P.Q, P.A, P.G, P.cd;
+                                                      dense_bytes_max = bytes - 1)
+        # Asked for by name, the solver still takes it.
+        z = interior(cd); s = interior(cd); F = nt_block(cd, z, s)
+        b = (randn(mk), randn(k), randn(2mk))
+        sol = C.kktsolver_sdpschur(spzeros(mk, mk), A, G, cd)(F, inv(F)')(b...)
+        @test resid3(spzeros(mk, mk), A, G, F, b, sol) <= 1e-11
+    end
+
+    # Mixed-form models through MOI, each solved by the default route and by
+    # kktsolver_qr on the same model.
+    saf(terms, c = 0.0) = MOI.ScalarAffineFunction(terms, c)
+    term(c, x) = MOI.ScalarAffineTerm(c, x)
+    psd_variable(model, k) = (X = MOI.add_variables(model, div(k * (k + 1), 2));
+        MOI.add_constraint(model, MOI.VectorOfVariables(X), MOI.PositiveSemidefiniteConeTriangle(k)); X)
+
+    # Lovász theta with a free scalar: ϑ(H) = min t  s.t.  Z ⪰ 0,
+    # Z_ii = t − 1, Z_ij = −1 for the non-adjacent pairs ij ∈ E of H.
+    function theta_free_model(k, E)
+        model = MOI.Utilities.Model{Float64}()
+        Z = psd_variable(model, k)
+        t = MOI.add_variable(model)
+        for i in 1:k
+            MOI.add_constraint(model, saf([term(1.0, Z[tri(i, i)]), term(-1.0, t)]), MOI.EqualTo(-1.0))
+        end
+        for (i, j) in E
+            MOI.add_constraint(model, saf([term(1.0, Z[tri(i, j)])]), MOI.EqualTo(-1.0))
+        end
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(), saf([term(1.0, t)]))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        return model
+    end
+    # The same ϑ(H) in standard form: max ⟨J, X⟩, tr X = 1, X_ij = 0 on
+    # the edges of H (the pairs not in E).
+    function theta_std_model(k, E)
+        model = MOI.Utilities.Model{Float64}()
+        X = psd_variable(model, k)
+        MOI.add_constraint(model, saf([term(1.0, X[tri(i, i)]) for i in 1:k]), MOI.EqualTo(1.0))
+        for j in 1:k, i in 1:j-1
+            (i, j) in E && continue
+            MOI.add_constraint(model, saf([term(1.0, X[tri(i, j)])]), MOI.EqualTo(0.0))
+        end
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+                saf([term(i == j ? 1.0 : 2.0, X[tri(i, j)]) for j in 1:k for i in 1:j]))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+        return model
+    end
+    # Shor relaxation of a box-constrained QP: Y = [1 xᵀ; x X] ⪰ 0, Y₁₁ = 1,
+    # X_ii ≤ x_i, 0 ≤ x ≤ 1 (bounds on entries of the PSD variable).
+    function boxqp_model(k; seed = 3)
+        rng = MersenneTwister(seed)
+        Qb = randn(rng, k, k); Qb = (Qb + Qb') / 2; c = randn(rng, k)
+        model = MOI.Utilities.Model{Float64}()
+        Y = psd_variable(model, k + 1)
+        MOI.add_constraint(model, saf([term(1.0, Y[tri(1, 1)])]), MOI.EqualTo(1.0))
+        for i in 1:k
+            x = Y[tri(1, i + 1)]
+            MOI.add_constraint(model, saf([term(1.0, Y[tri(i + 1, i + 1)]), term(-1.0, x)]), MOI.LessThan(0.0))
+            MOI.add_constraint(model, x, MOI.GreaterThan(0.0))
+            MOI.add_constraint(model, x, MOI.LessThan(1.0))
+        end
+        obj = [term((i == j ? 0.5 : 1.0) * Qb[i, j], Y[tri(i + 1, j + 1)]) for j in 1:k for i in 1:j]
+        append!(obj, [term(c[i], Y[tri(1, i + 1)]) for i in 1:k])
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(), saf(obj))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        return model
+    end
+    # A quadratic objective on free variables: min ⟨L, X⟩/4 + Σ tᵢ²  s.t.
+    # X_ii − tᵢ = 1, X ⪰ 0.
+    function quadfree_model(k)
+        rng = MersenneTwister(4)
+        W = zeros(k, k)
+        for j in 1:k, i in 1:j-1
+            rand(rng) < 0.5 && (W[i, j] = W[j, i] = 1.0)
+        end
+        L = Diagonal(vec(sum(W; dims = 2))) - W
+        model = MOI.Utilities.Model{Float64}()
+        X = psd_variable(model, k)
+        t = MOI.add_variables(model, k)
+        for i in 1:k
+            MOI.add_constraint(model, saf([term(1.0, X[tri(i, i)]), term(-1.0, t[i])]), MOI.EqualTo(1.0))
+        end
+        aff = [term((i == j ? 1.0 : 2.0) * L[i, j] / 4, X[tri(i, j)]) for j in 1:k for i in 1:j if L[i, j] != 0]
+        f = MOI.ScalarQuadraticFunction([MOI.ScalarQuadraticTerm(2.0, ti, ti) for ti in t], aff, 0.0)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}(), f)
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        return model
+    end
+
+    function moi_solve(model, kkt)
+        opt = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(opt, MOI.Silent(), true)
+        MOI.set(opt, MOI.RawOptimizerAttribute("kktsolver"), kkt)
+        MOI.copy_to(opt, model); MOI.optimize!(opt)
+        return opt
+    end
+    function original_residuals_ok(opt)
+        raw = MOI.get(opt, MOI.RawSolver())::ConicIP.Optimizer
+        sol = raw.sol
+        Q = raw.Q_int === nothing ? spzeros(raw.n, raw.n) : raw.Q_int
+        rDu = norm(Q * sol.y + raw.eq_G' * sol.w - raw.ineq_A' * sol.v - raw.c_int) /
+              (1 + norm(raw.c_int))
+        return rDu <= 1e-6 &&
+               norm(raw.eq_G * sol.y - raw.eq_d) <= 1e-6 * (1 + norm(raw.eq_d)) &&
+               C.cone_margin(sol.s, raw.cone_dims) >= -1e-8 &&
+               C.cone_margin(sol.v, raw.cone_dims) >= -1e-8
+    end
+
+    @testset "mixed form through MOI: $name" for (name, build) in (
+            ("theta with a free scalar", () -> theta_free_model(12,
+                [(i, j) for j in 1:12 for i in 1:j-1 if (i + 2j) % 5 == 0])),
+            ("box QP relaxation", () -> boxqp_model(12)),
+            ("quadratic objective on free variables", () -> quadfree_model(8)))
+        model = build()
+        probe = _RouteProbe("")
+        opt = moi_solve(model, probe)
+        @test probe.name == "kktsolver_sdpschur"
+        @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test original_residuals_ok(opt)
+        ref = moi_solve(model, C.kktsolver_qr)
+        @test MOI.get(ref, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test MOI.get(opt, MOI.ObjectiveValue()) ≈ MOI.get(ref, MOI.ObjectiveValue()) rtol = 1e-6
+        if name == "theta with a free scalar"
+            E = [(i, j) for j in 1:12 for i in 1:j-1 if (i + 2j) % 5 == 0]
+            std = moi_solve(theta_std_model(12, E), C.default_kktsolver)
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ MOI.get(std, MOI.ObjectiveValue()) rtol = 1e-6
+        end
     end
 end

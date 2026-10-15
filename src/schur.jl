@@ -330,53 +330,154 @@ end
 #  Standard-form conic programs: the equality Schur complement
 # ──────────────────────────────────────────────────────────────
 
-# A as a scaled permutation: column j has its single nonzero a[j] in row
-# r[j]. `nothing` unless every row and column of A has exactly one nonzero.
-function _scaled_permutation(A)
+# Row classes of the split below.
+const _ROW_P = 0x01   # eliminated together with its variable
+const _ROW_K = 0x02   # kept: its multiplier stays in the reduced system
+const _ROW_O = 0x03   # absorbed into the Hessian of the remaining variables
+
+"""
+    _schur_split(Q, A, cone_dims) -> NamedTuple or nothing
+
+Partition of the variables into *cone variables* `S`, each the coordinate
+of exactly one row of `A` (its *P row*, `A[r, j] = a`, no other variable in
+that row), and the rest `R`; and of the rows of `A` into
+
+- `P` — the rows that make `S` a cone coordinate (`A[P, S]` a scaled
+  permutation, `A[P, R] = 0`);
+- `K` — any other row touching `S` (a bound or a second cone on entries of
+  a PSD variable). A second-order or semidefinite block is classified
+  whole, since its scaling couples its rows; a nonnegative row on its own;
+- `O` — the rows touching only `R`.
+
+A semidefinite block becomes `P` when each of its rows has one nonzero, on
+distinct unclaimed variables with zero `Q` rows and columns; its variables
+may appear in other rows of `A`, which then become `K`. A nonnegative row
+or second-order block becomes `P` only when its variables appear nowhere
+else in `A` (a nonnegative or SOC *variable*), so claiming it never moves
+a row into `K`. `nothing` when no semidefinite block qualifies.
+
+`pure` marks standard form: every row `P` and every variable in `S`.
+"""
+function _schur_split(Q, A, cone_dims)
+  any(cd -> cd[1] == "S", cone_dims) || return nothing
   m, n = size(A)
-  m == n || return nothing
-  As = sparse(A)
-  r = zeros(Int, n); a = zeros(n)
-  seen = falses(m)
-  rv = rowvals(As); nz = nonzeros(As)
-  for j = 1:n
-    found = 0
-    for t in nzrange(As, j)
-      nz[t] == 0 && continue
-      found += 1
-      found > 1 && return nothing
-      r[j] = rv[t]; a[j] = nz[t]
-    end
-    found == 1 || return nothing
-    seen[r[j]] && return nothing
-    seen[r[j]] = true
+  At = sparse(A')                        # column i of Aᵗ is row i of A
+  Qs = sparse(Q)
+  qfree = trues(n)                       # Q[j, :] = Q[:, j] = 0
+  qv = rowvals(Qs); qz = nonzeros(Qs)
+  for j = 1:size(Qs, 2), t in nzrange(Qs, j)
+    qz[t] == 0 && continue
+    qfree[qv[t]] = false; qfree[j] = false
   end
-  return (r = r, a = a)
+  rv = rowvals(At); nz = nonzeros(At)
+  rowcnt = zeros(Int, m); rowcol = zeros(Int, m); rowval = zeros(m)
+  colcnt = zeros(Int, n)
+  for i = 1:m, t in nzrange(At, i)
+    nz[t] == 0 && continue
+    rowcnt[i] += 1; rowcol[i] = rv[t]; rowval[i] = nz[t]
+    colcnt[rv[t]] += 1
+  end
+  claimed = falses(n)
+  kind = zeros(UInt8, m)
+  takes(i, exclusive) = rowcnt[i] == 1 && qfree[rowcol[i]] && !claimed[rowcol[i]] &&
+                        (!exclusive || colcnt[rowcol[i]] == 1)
+  ranges = Tuple{String,UnitRange{Int}}[]
+  off = 0
+  for (bt, dim) in cone_dims
+    push!(ranges, (bt, (off+1):(off+dim))); off += dim
+  end
+
+  # Semidefinite blocks first: they are what the elimination is for.
+  for (bt, I) in ranges
+    bt == "S" || continue
+    all(i -> takes(i, false), I) && allunique(view(rowcol, I)) || continue
+    claimed[view(rowcol, I)] .= true
+    kind[I] .= _ROW_P
+  end
+  any(((bt, I),) -> bt == "S" && !isempty(I) && kind[first(I)] == _ROW_P, ranges) ||
+    return nothing
+  # Nonnegative and second-order variables that appear nowhere else.
+  for (bt, I) in ranges
+    if bt == "R"
+      for i in I
+        takes(i, true) || continue
+        claimed[rowcol[i]] = true; kind[i] = _ROW_P
+      end
+    elseif bt == "Q" && all(i -> takes(i, true), I)
+      claimed[view(rowcol, I)] .= true
+      kind[I] .= _ROW_P
+    end
+  end
+  # Every other row: kept when it touches a cone variable.
+  touches(i) = any(t -> nz[t] != 0 && claimed[rv[t]], nzrange(At, i))
+  for (bt, I) in ranges
+    if bt == "R"
+      for i in I
+        kind[i] == 0 && (kind[i] = touches(i) ? _ROW_K : _ROW_O)
+      end
+    elseif !isempty(I) && kind[first(I)] != _ROW_P
+      kind[I] .= any(touches, I) ? _ROW_K : _ROW_O
+    end
+  end
+  S = findall(claimed); R = findall(!, claimed)
+  return (S = S, R = R, K = findall(==(_ROW_K), kind), kind = kind,
+          rowcol = rowcol, rowval = rowval,
+          pure = isempty(R) && all(==(_ROW_P), kind))
 end
 
 """
-    sdpschur_eligible(Q, A, cone_dims) -> Bool
+    sdpschur_eligible(Q, A, G, cone_dims) -> Bool
 
-Whether [`kktsolver_sdpschur`](@ref) applies: a linear objective (`Q`
-zero), at least one semidefinite cone, and every variable the coordinate
-of exactly one cone entry — `A` a scaled permutation, so `Ay ≥_K b` says
-`y` (up to order and scale) lies in the cone. This is the standard form a
-modelling layer produces for a PSD *variable* (`@variable(X, PSD)`), whose
-`k(k+1)/2` entries would otherwise make the dense KKT path cost O(k⁶).
+Whether the router sends the problem to [`kktsolver_sdpschur`](@ref).
+
+*Standard form* always qualifies: a linear objective (`Q` zero), at least
+one semidefinite cone, and every variable the coordinate of exactly one
+cone entry — `A` a scaled permutation, so `Ay ≥_K b` says `y` (up to order
+and scale) lies in the cone. This is what a modelling layer produces for a
+PSD *variable* (`@variable(X, PSD)`), whose `k(k+1)/2` entries would
+otherwise make the dense KKT path cost O(k⁶).
+
+*Mixed form* — a PSD variable alongside free variables, bounds or a second
+cone on some of its entries, or a quadratic objective on the other
+variables — qualifies when at least one semidefinite block can be
+eliminated with its variables (see the split in `src/schur.jl`) and the
+reduced system is small: `n_R + p + m_K ≤ n/2`, for `n_R` variables left,
+`p` equality rows and `m_K` inequality rows kept. Beyond that bound the
+reduced system is no cheaper than [`kktsolver_qr`](@ref)'s; a doubly
+nonnegative model (`X ⪰ 0` and `X .≥ 0`, `m_K ≈ n`) is the typical
+declined case.
 """
-function sdpschur_eligible(Q, A, cone_dims)
-  any(cd -> cd[1] == "S", cone_dims) || return false
-  iszero(Q) || return false
-  return _scaled_permutation(A) !== nothing
+sdpschur_eligible(Q, A, G, cone_dims) =
+  _split_eligible(_schur_split(Q, A, cone_dims), size(A, 2), size(G, 1))
+
+_split_eligible(sp, n, p) =
+  sp !== nothing && (sp.pure || 2 * (length(sp.R) + p + length(sp.K)) <= n)
+
+# Dense storage of kktsolver_sdpschur for a split: in standard form the
+# p×p Schur matrix (sdpschur_bytes); in mixed form the N×N reduced matrix,
+# its equilibrated copy and Bunch-Kaufman factor, plus the Gram outputs.
+function _sdpschur_bytes(sp, p)
+  sp.pure && return sdpschur_bytes(p)
+  nR = length(sp.R); nu = p + length(sp.K); N = nR + nu
+  return 8 * (3N^2 + nu^2 + nR^2 + nu * nR)
+end
+
+# Eligible, and its dense storage fits `budget`: the default router's test.
+function _sdpschur_fits(Q, A, G, cone_dims, budget)
+  sp = _schur_split(Q, A, cone_dims)
+  _split_eligible(sp, size(A, 2), size(G, 1)) || return false
+  return _sdpschur_bytes(sp, size(G, 1)) <= budget
 end
 
 """
     kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
 
-KKT solver for standard-form conic programs (see
-[`sdpschur_eligible`](@ref)): with `Q = 0` and `A` a scaled permutation,
-the Hessian `H = AᵀF⁻¹F⁻ᵀA` has the explicit inverse `A⁻¹FᵀF A⁻ᵀ`, so the
-3×3 system reduces to the p×p equality Schur complement
+KKT solver for conic programs with PSD *variables* (see
+[`sdpschur_eligible`](@ref)), which eliminates the cone variables exactly.
+
+**Standard form** (`Q = 0`, `A` a scaled permutation). The Hessian
+`H = AᵀF⁻¹F⁻ᵀA` has the explicit inverse `A⁻¹FᵀF A⁻ᵀ`, so the 3×3 system
+reduces to the p×p equality Schur complement
 
     M = G H⁻¹ Gᵀ,   M_ij = tr(Ĝᵢ T Ĝⱼ T) on a semidefinite block,
 
@@ -385,25 +486,57 @@ Cholesky. Per iteration this costs O(p k³ + p² k² + p³) for p equality
 rows instead of the O(k⁶) of a dense factorization in the k(k+1)/2
 variables, and stores O(p² + k²) besides the data.
 
-`M` is equilibrated to unit diagonal, `D M D` with `D = diag(M)^(-1/2)`,
-before it is factored, so rows that are merely small (a constraint along
-a direction the scaling shrinks) are not mistaken for dependent ones.
-`static_reg = δ` regularizes on the dual side and on that scale,
-`M + δ·diag(M)`, instead of the `Q + δI` the other solvers receive: a
-primal shift would destroy the explicit inverse. Either way the
-factorization is a preconditioner whose error `conicIP`'s refinement
-removes. A Cholesky that fails, or has a pivot below `1e-14` on the unit
-diagonal (dependent equality rows), is retried once with a shift of
-`1e-12·diag(M)`, and otherwise raises (an `:Error` status from
-`conicIP`).
+**Mixed form.** Only the cone variables `y_S` of the eliminated blocks
+(rows `P`, `A[P, S]` a scaled permutation) go; the other variables `y_R`,
+the equality multipliers `w` and the multipliers `v_K` of the inequality
+rows `K` that also touch `y_S` stay. With `C = [G; A_K]`, `u = (w, −v_K)`
+and `H_S = A_PSᵀ D_P⁻¹ A_PS` (explicitly invertible as above), the reduced
+system is
+
+    ┌ H_R          C_Rᵀ               ┐ ┌ y_R ┐
+    └ C_R   −(E + C_S H_S⁻¹ C_Sᵀ)     ┘ └  u  ┘,    E = diag(0, D_K),
+
+where `H_R = Q_RR + A_ORᵀ D_O⁻¹ A_OR` collects the rows `O` that touch only
+`y_R` and `D = FᵀF`. Both `E + C_S H_S⁻¹ C_Sᵀ` (one Gram product) and `H_R`
+(another) come from the trace-form kernel. The matrix is symmetric but not
+quasi-definite in general: `H_R` is singular for a free variable that
+enters only equality rows, and `C_S` can lose rank (an equality row on
+`y_R` alone) though `[G; A]` has full rank. It is factored by dense
+Bunch-Kaufman, which needs only nonsingularity, at (n_R + p + m_K)³/3
+flops.
+
+Both matrices are equilibrated to unit diagonal (`D M D`,
+`D = |diag|^(-1/2)`, entries with a zero diagonal left unscaled) before
+they are factored, so rows that are merely small — a constraint along a
+direction the scaling shrinks — are not mistaken for dependent ones.
+`static_reg = δ` regularizes on that scale: on the dual side,
+`M + δ·diag(M)` (and the `u` block alike), and on the remaining variables
+`H_R + δ·diag(H_R)`; a primal shift on `y_S` would destroy the explicit
+inverse. Either way the factorization is a preconditioner whose error
+`conicIP`'s refinement removes. A factorization that fails, or has a
+pivot below `1e-14` on the unit diagonal (dependent rows that rounding let
+through), is retried once with a shift of `1e-12` on that scale (primal
+side positive, dual side negative), and otherwise raises (an `:Error`
+status from `conicIP`).
+
+Called directly, the solver accepts any problem with an eliminable
+semidefinite block, whatever the size of the reduced system; the default
+router applies the size test of [`sdpschur_eligible`](@ref).
 """
 function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
 
-  sdpschur_eligible(Q, A, cone_dims) || throw(ArgumentError(
-    "kktsolver_sdpschur needs Q = 0, a semidefinite cone, and A a scaled " *
-    "permutation (every variable one cone coordinate); see sdpschur_eligible"))
+  sp = _schur_split(Q, A, cone_dims)
+  sp === nothing && throw(ArgumentError(
+    "kktsolver_sdpschur needs a semidefinite block whose rows each hold one " *
+    "variable, on variables with no quadratic objective term (a PSD variable); " *
+    "see sdpschur_eligible"))
+  sp.pure || return _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = static_reg)
   n = size(A, 2); m = size(A, 1); p = size(G, 1)
-  (; r, a) = _scaled_permutation(A)
+  # Column j is the coordinate of row r[j], with coefficient a[j].
+  r = zeros(Int, n); a = zeros(n)
+  for i = 1:m
+    r[sp.rowcol[i]] = i; a[sp.rowcol[i]] = sp.rowval[i]
+  end
   As = sparse(A); Gs = sparse(G)
 
   # Ĝᵀ = A⁻ᵀ Gᵀ (m × p): row r[j] of Ĝᵀ is row j of Gᵀ divided by a[j].
@@ -461,6 +594,142 @@ function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
       y  = p == 0 ? t : t - Hinv(Gs' * w)
       Kinv!(tm, bz - As * y)              # v = K⁻¹(bz − Ay)
       return (y, w, copy(tm))
+    end
+
+    return solve3x3
+
+  end
+
+  return DenseKKTGen(solve3x3gen, nothing)
+
+end
+
+# Smallest eigenvalue magnitude over the 1×1 and 2×2 pivots of a
+# Bunch-Kaufman factorization: how close the factored matrix came to
+# singular.
+function _bk_minpivot(f)
+  D = f.D
+  N = size(D, 1); μ = Inf; i = 1
+  while i <= N
+    if i < N && D.du[i] != 0
+      a = D.d[i]; b = D.du[i]; c = D.d[i+1]
+      ρ = abs((a + c) / 2) + hypot((a - c) / 2, b)    # larger |λ|
+      μ = min(μ, ρ == 0 ? 0.0 : abs(a * c - b * b) / ρ)
+      i += 2
+    else
+      μ = min(μ, abs(D.d[i])); i += 1
+    end
+  end
+  return μ
+end
+
+# Mixed form: eliminate the cone variables y_S only (see kktsolver_sdpschur).
+function _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = 0.0)
+
+  n = size(A, 2); m = size(A, 1); p = size(G, 1)
+  S = sp.S; Rc = sp.R; Kr = sp.K
+  nS = length(S); nR = length(Rc); mK = length(Kr)
+  nu = p + mK; N = nR + nu
+  As = sparse(A); Gs = sparse(G)
+
+  # Eliminated variable S[l] is the coordinate of P row rS[l], coefficient aS[l].
+  rS = zeros(Int, nS); aS = zeros(nS)
+  pos = zeros(Int, n); pos[S] = 1:nS
+  for i = 1:m
+    sp.kind[i] == _ROW_P || continue
+    l = pos[sp.rowcol[i]]; rS[l] = i; aS[l] = sp.rowval[i]
+  end
+
+  # C = [G; A_K], split by columns. Its S part is only applied; its R part
+  # is a constant block of the reduced matrix.
+  Cm  = [Gs; As[Kr, :]]
+  CS  = Cm[:, S]; CSt = sparse(CS')
+  CRd = Matrix(Cm[:, Rc])
+
+  # E + C_S H_S⁻¹ C_Sᵀ = B_uᵀ FᵀF B_u with B_u (cone coordinates × u): the
+  # columns of Ĉᵀ = A_PS⁻ᵀ C_Sᵀ on the P rows and the identity on the K
+  # rows. The two row sets share no cone block (a P block is whole, and a
+  # K row of a nonnegative block is decoupled), so no cross term appears.
+  (Ic, Jc, Vc) = findnz(CS)
+  Bu = sparse([rS[Jc]; Kr], [Ic; p .+ (1:mK)], [Vc ./ aS[Jc]; ones(mK)], m, nu)
+  plan_u = _gram_plan(Bu, cone_dims)
+  # H_R − Q_RR = A_ORᵀ F⁻¹F⁻ᵀ A_OR: the R columns on the O rows only.
+  BR = sparse(Diagonal(Float64.(sp.kind .== _ROW_O))) * As[:, Rc]
+  dropzeros!(BR)
+  plan_R = _gram_plan(BR, cone_dims)
+  QR = Matrix{Float64}(sparse(Q)[Rc, Rc])
+
+  Mu = zeros(nu, nu); HR = zeros(nR, nR); Kred = zeros(N, N)
+  Ks = zeros(N, N); dsc = zeros(N)
+  tm = zeros(m); tm2 = zeros(m); tm3 = zeros(m)
+  iR = 1:nR; iu = nR+1:N
+
+  function solve3x3gen(F, F⁻ᵀ, pt = nothing)
+
+    @phase pt t_kkt_assemble begin
+      _gram!(Mu, plan_u, F)
+      _gram!(HR, plan_R, F⁻ᵀ)
+      HR .+= QR
+      Kred[iR, iR] .= HR
+      Kred[iu, iR] .= CRd
+      Kred[iR, iu] .= CRd'
+      Kred[iu, iu] .= .-Mu
+    end
+    fact = @phase pt t_kkt_factor begin
+      # Equilibrate to unit |diagonal| (see kktsolver_sdpschur), then
+      # factor; the pivot test and the shifts act on that scale.
+      @inbounds for i = 1:N
+        dsc[i] = Kred[i, i] != 0 ? 1 / sqrt(abs(Kred[i, i])) : 1.0
+      end
+      @inbounds for j = 1:N, i = 1:N
+        Ks[i, j] = dsc[i] * Kred[i, j] * dsc[j]
+      end
+      fact = nothing
+      for σ in (static_reg, max(static_reg, 1e-12))
+        # A fresh copy: an earlier solve3x3 may still hold its factors.
+        Kf = copy(Ks)
+        @inbounds for i in iR; Kf[i, i] += σ; end
+        @inbounds for i in iu; Kf[i, i] -= σ; end
+        f = bunchkaufman!(Symmetric(Kf, :U), false; check = false)
+        if issuccess(f) && _bk_minpivot(f) > 1e-14
+          fact = f; break
+        end
+      end
+      fact === nothing && throw(LinearAlgebra.SingularException(0))
+      fact
+    end
+    pt === nothing || (pt.n_kkt_factor += 1)
+    d = copy(dsc)          # this factorization's scaling, kept with it
+
+    # D = FᵀF and D⁻¹ = F⁻¹F⁻ᵀ, on cone vectors.
+    Dmul!(out, x) = (mul!(tm2, F, x); mul_adjoint!(out, F, tm2))
+    Dinv!(out, x) = (mul!(tm2, F⁻ᵀ, x); mul_adjoint!(out, F⁻ᵀ, tm2))
+    # H_S⁻¹ g = A_PS⁻¹ D_P A_PS⁻ᵀ g; the P rows are whole blocks or
+    # decoupled nonnegative rows, so D applied to a vector supported on P
+    # is D_P there.
+    function HSinv(g)
+      fill!(tm3, 0.0)
+      @inbounds for l = 1:nS; tm3[rS[l]] = g[l] / aS[l]; end
+      Dmul!(tm, tm3)
+      return [tm[rS[l]] / aS[l] for l = 1:nS]
+    end
+
+    function solve3x3(bx, by, bz)
+      Dinv!(tm, bz)
+      tm[Kr] .= 0.0                       # D⁻¹bz on the P and O rows
+      g  = bx + As' * tm
+      gS = g[S]
+      hS = HSinv(gS)
+      rhs = [g[Rc]; [by; bz[Kr]] - CS * hS]
+      z  = d .* (fact \ (d .* rhs))
+      u  = z[iu]
+      y  = zeros(n)
+      y[Rc] = z[iR]
+      y[S]  = HSinv(gS - CSt * u)
+      Dinv!(tm, bz - As * y)              # v = D⁻¹(bz − Ay) off K
+      v = copy(tm)
+      v[Kr] = -u[p+1:end]
+      return (y, u[1:p], v)
     end
 
     return solve3x3

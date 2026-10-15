@@ -1571,13 +1571,14 @@ function _conicIP(
   # Route once when the default router is in charge: `default_kktsolver`
   # would repeat this call, and so would the verbose line below, each time
   # paying for a symbolic analysis and an AMD ordering of the KKT pattern.
-  # A standard-form SDP is decided on the unregularized Q: Qᵣ = δI would
-  # hide it, and kktsolver_sdpschur applies δ on the dual side instead.
-  # The default router budgets the Schur matrix as choose_kktsolver does.
-  schur = (kktsolver === default_kktsolver || kktsolver === kktsolver_sdpschur) &&
-          sdpschur_eligible(Q, A, cone_dims) &&
-          (kktsolver === kktsolver_sdpschur ||
-           sdpschur_bytes(p) <= _DENSE_BYTES_MAX)
+  # A PSD-variable SDP is decided on the unregularized Q: Qᵣ = Q + δI would
+  # hide it, and kktsolver_sdpschur applies δ itself (dual side, and on the
+  # variables it keeps). Asked for by name, it needs only an eliminable
+  # block; the default router also wants a small reduced system whose
+  # storage fits the budget, as choose_kktsolver does.
+  schur = kktsolver === kktsolver_sdpschur ? _schur_split(Q, A, cone_dims) !== nothing :
+          kktsolver === default_kktsolver &&
+          _sdpschur_fits(Q, A, G, cone_dims, _DENSE_BYTES_MAX)
   routed = schur ? (kktsolver_sdpschur, nothing) :
            kktsolver === default_kktsolver ?
            _choose_kktsolver(Qᵣ, A, G, cone_dims) : nothing
