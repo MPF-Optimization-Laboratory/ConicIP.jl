@@ -3060,8 +3060,10 @@ end
             spzeros(0, 30_000), [("R", 29_999), ("S", 1)]) === ConicIP.kktsolver_sdpschur
         # Through conicIP the error propagates (ArgumentError is not a
         # KKT_FAILURES member), like kktsolver_qr's own p > n check. (A
-        # nonzero Q keeps the problem off the standard-form route.)
-        ks_tiny = (Q, A, G, cd) -> choose_kktsolver(Q, A, G, cd; dense_bytes_max = 1)(Q, A, G, cd)
+        # nonzero Q keeps the problem off the standard-form route.) The
+        # 100-byte budget holds the standard-form Schur matrix (3·8p² = 24
+        # bytes) but not the dense path (about 300 bytes).
+        ks_tiny = (Q, A, G, cd) -> choose_kktsolver(Q, A, G, cd; dense_bytes_max = 100)(Q, A, G, cd)
         @test_throws ArgumentError conicIP(sparse(0.1I, 3, 3), -[1.0, 0.0, 1.0], sparse(1.0I, 3, 3),
             zeros(3), [("S", 3)], sparse([1.0 0.0 1.0]), [1.0]; kktsolver = ks_tiny, verbose = false)
         @test conicIP(spzeros(3, 3), -[1.0, 0.0, 1.0], sparse(1.0I, 3, 3),
