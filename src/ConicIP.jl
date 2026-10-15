@@ -681,9 +681,10 @@ function dsdc_diag!(x, y, o)
   # Z_ij (λ_i + λ_j)/2 = X_ij, so Z_ij = X_ij / ((λ_i + λ_j)/2) — the √2
   # packing weight cancels, and the packed coordinates divide in place.
   # Only the diagonal of mat(y) is read: its off-diagonals are rounding.
-  # The mean is formed as λ_i/2 + λ_j/2, which cannot overflow, and the
-  # quotient is representable whenever Z_ij is. O(k²) for order k against
-  # lyap's O(k³) Schur factorization, and allocation-free.
+  # The mean is (λ_i + λ_j)/2, exact for subnormal λ (where λ_i/2 + λ_j/2
+  # would round both halves to zero), and λ_i/2 + λ_j/2 only when the sum
+  # overflows. O(k²) for order k against lyap's O(k³) Schur factorization,
+  # and allocation-free.
   n = ord(y)
   dpos(j) = (j - 1)*n - div((j - 1)*(j - 2), 2) + 1   # packed index of (j,j)
   c = 1
@@ -691,7 +692,9 @@ function dsdc_diag!(x, y, o)
     λi = y[c]
     o[c] = x[c] / λi; c += 1
     for j = i+1:n
-      o[c] = x[c] / (λi/2 + y[dpos(j)]/2); c += 1
+      λj = y[dpos(j)]
+      σ = λi + λj
+      o[c] = x[c] / (isfinite(σ) ? σ/2 : λi/2 + λj/2); c += 1
     end
   end
   return o

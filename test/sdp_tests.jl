@@ -174,6 +174,13 @@ end
         @test o == fill(1e308, 3)
         ConicIP.dsdc_diag!(ones(3), ConicIP.vecm([1e308 0; 0 1e308]), o)
         @test o == fill(1e-308, 3)
+        # Subnormal divisors: λᵢ/2 + λⱼ/2 would round both halves to zero
+        # (an Inf entry); the sum is exact and halving it is too.
+        u = nextfloat(0.0)
+        ConicIP.dsdc_diag!(fill(u, 3), [u, 0.0, u], o)
+        @test o == ones(3)
+        ConicIP.dsdc_diag!(fill(3u, 3), [u, 0.0, 5u], o)
+        @test o == [3.0, 1.0, 0.6]
         λ = ConicIP.vecm(Matrix(Diagonal(rand(8) .+ 1))); x = randn(length(λ)); o = similar(x)
         ConicIP.dsdc_diag!(x, λ, o)
         @test (@allocated ConicIP.dsdc_diag!(x, λ, o)) == 0
