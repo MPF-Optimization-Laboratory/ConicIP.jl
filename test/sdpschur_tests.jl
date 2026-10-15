@@ -213,14 +213,31 @@ end
         @test norm(G * y - b[2]) <= 1e-10 * norm(b[2])
     end
 
+    # Iterative refinement on the 3×3 system with a (possibly perturbed)
+    # solve, as conicIP applies it; returns the final relative residual.
+    function refined_resid(Q, A, G, F, solve, b; steps = 3)
+        Fd = Matrix(F)
+        K(x) = (Q * x[1] + G' * x[2] - A' * x[3], G * x[1], A * x[1] + Fd' * (Fd * x[3]))
+        x = solve(b...)
+        for _ in 1:steps
+            r = map(-, b, K(x))
+            dx = solve(r...)
+            x = map(+, x, dx)
+        end
+        return (resid3(Q, A, G, F, b, x), x)
+    end
+
     @testset "dual-side regularization and dependent rows" begin
         cd = [("S", 10)]
         P = standard_form(cd, 3; seed = 41)
         z = interior(cd); s = interior(cd); F = nt_block(cd, z, s); F⁻ᵀ = inv(F)'
         b = (randn(P.m), randn(P.p), randn(P.m))
         exact = C.kktsolver_sdpschur(P.Q, P.A, P.G, cd)(F, F⁻ᵀ)(b...)
-        reg = C.kktsolver_sdpschur(P.Q, P.A, P.G, cd; static_reg = 1e-10)(F, F⁻ᵀ)(b...)
+        regs = C.kktsolver_sdpschur(P.Q, P.A, P.G, cd; static_reg = 1e-10)(F, F⁻ᵀ)
+        reg = regs(b...)
         @test norm(reg[1] - exact[1]) <= 1e-6 * norm(exact[1])
+        # Refinement against the unperturbed system removes the shift.
+        @test refined_resid(P.Q, P.A, P.G, F, regs, b)[1] <= 1e-12
         # A repeated equality row makes M singular; a consistent right-hand
         # side is still solved (the small dual shift picks one multiplier).
         G2 = [P.G; P.G[1:1, :]]
@@ -228,6 +245,24 @@ end
         b2 = (b[1], [b[2]; b[2][1]], b[3])
         (y, w, v) = s2(b2...)
         @test norm(G2 * y - b2[2]) <= 1e-6 * norm(b2[2])
+        @test refined_resid(P.Q, P.A, G2, F, s2, b2)[1] <= 1e-10
+    end
+
+    @testset "a small Schur row is not a dependent one" begin
+        # Review reproducer: equality rows on packed coordinates 1 and 3 of
+        # an order-2 block with F = VecCongurance(Diag(1, 1e-4)), so
+        # M = diag(1, 1e-16) — nonsingular and exact. The unequilibrated
+        # pivot test shifted it by 1e-12, returning y₃ = 1e-4 for 1, and
+        # three refinement steps reached only 4e-4.
+        cd = [("S", 3)]
+        A = sparse(1.0I, 3, 3); G = sparse([1.0 0 0; 0 0 1]); Q = spzeros(3, 3)
+        F = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))])
+        F⁻ᵀ = C.Block([inv(F[1])'])
+        s5 = C.kktsolver_sdpschur(Q, A, G, cd)(F, F⁻ᵀ)
+        b = (zeros(3), [0.0, 1.0], zeros(3))
+        (y, w, v) = s5(b...)
+        @test y[3] ≈ 1 rtol = 1e-10
+        @test resid3(Q, A, G, F, b, (y, w, v)) <= 1e-12
     end
 
     @testset "routing and eligibility" begin

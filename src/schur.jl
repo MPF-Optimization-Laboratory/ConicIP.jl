@@ -385,12 +385,17 @@ Cholesky. Per iteration this costs O(p k³ + p² k² + p³) for p equality
 rows instead of the O(k⁶) of a dense factorization in the k(k+1)/2
 variables, and stores O(p² + k²) besides the data.
 
-`static_reg = δ` regularizes on the dual side, `M + δ·max(1, maxᵢ Mᵢᵢ)·I`,
-instead of the `Q + δI` the other solvers receive: a primal shift would
-destroy the explicit inverse. Either way the factorization is a
-preconditioner whose error `conicIP`'s refinement removes. A Cholesky
-that fails on dependent equality rows is retried once with a small dual
-shift, and otherwise raises (an `:Error` status from `conicIP`).
+`M` is equilibrated to unit diagonal, `D M D` with `D = diag(M)^(-1/2)`,
+before it is factored, so rows that are merely small (a constraint along
+a direction the scaling shrinks) are not mistaken for dependent ones.
+`static_reg = δ` regularizes on the dual side and on that scale,
+`M + δ·diag(M)`, instead of the `Q + δI` the other solvers receive: a
+primal shift would destroy the explicit inverse. Either way the
+factorization is a preconditioner whose error `conicIP`'s refinement
+removes. A Cholesky that fails, or has a pivot below `1e-14` on the unit
+diagonal (dependent equality rows), is retried once with a shift of
+`1e-12·diag(M)`, and otherwise raises (an `:Error` status from
+`conicIP`).
 """
 function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
 
@@ -405,7 +410,7 @@ function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
   (Ig, Jg, Vg) = findnz(Gs)
   Ght = sparse([r[j] for j in Jg], Ig, Vg ./ a[Jg], m, p)
   plan = _gram_plan(Ght, cone_dims)
-  M = zeros(p, p)
+  M = zeros(p, p); Ms = zeros(p, p); dsc = zeros(p)
   tm = zeros(m); tm2 = zeros(m)
 
   # u ↦ A⁻¹u (cone coordinates → variables) and v ↦ A⁻ᵀv.
@@ -415,24 +420,32 @@ function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
   function solve3x3gen(F, F⁻ᵀ, pt = nothing)
 
     @phase pt t_kkt_assemble _gram!(M, plan, F)
-    dM = maximum(diag(M); init = 0.0)
-    dM > 0 || (dM = 1.0)
-    δ = static_reg * max(1.0, dM)
     L = @phase pt t_kkt_factor begin
-      # A pivot below 1e-14·max Mᵢᵢ is a dependent row that rounding let
-      # through, not a factorization to trust: shift and try once more.
+      # Equilibrate first, Mₛ = D M D with D = diag(M)^(-1/2): the rows of
+      # M scale independently with the cone iterate, and a pivot that is
+      # small only because its row is (M = diag(1, 1e-16)) is no
+      # dependence. On the unit diagonal, a pivot below 1e-14 is a
+      # dependent row that rounding let through: shift and try once more.
+      @inbounds for i = 1:p
+        dsc[i] = M[i, i] > 0 ? 1 / sqrt(M[i, i]) : 1.0
+      end
+      @inbounds for j = 1:p, i = 1:p
+        Ms[i, j] = dsc[i] * M[i, j] * dsc[j]
+      end
       fact = nothing
-      for shift in (δ, max(δ, 1e-12 * dM))
-        Ms = shift == 0 ? M : M + shift * I
+      for shift in (static_reg, max(static_reg, 1e-12))
+        shift == 0 || (@inbounds for i = 1:p; Ms[i, i] += shift; end)
         f = cholesky(Symmetric(Ms); check = false)
-        if issuccess(f) && minimum(diag(f.U); init = Inf)^2 > 1e-14 * dM
+        if issuccess(f) && minimum(diag(f.U); init = Inf)^2 > 1e-14
           fact = f; break
         end
+        shift == 0 || (@inbounds for i = 1:p; Ms[i, i] -= shift; end)
       end
       fact === nothing && throw(LinearAlgebra.PosDefException(0))
       fact
     end
     pt === nothing || (pt.n_kkt_factor += 1)
+    d = copy(dsc)          # this factorization's scaling, kept with it
 
     # K = FᵀF and K⁻¹ = F⁻¹F⁻ᵀ, on cone vectors.
     Kmul!(out, x)  = (mul!(tm2, F, x); mul_adjoint!(out, F, tm2))
@@ -444,7 +457,7 @@ function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
       Kinv!(tm, bz)
       h  = bx + As' * tm                  # h = bx + AᵀK⁻¹bz
       t  = Hinv(h)
-      w  = p == 0 ? zeros(0) : L \ (Gs * t - by)
+      w  = p == 0 ? zeros(0) : d .* (L \ (d .* (Gs * t - by)))
       y  = p == 0 ? t : t - Hinv(Gs' * w)
       Kinv!(tm, bz - As * y)              # v = K⁻¹(bz − Ay)
       return (y, w, copy(tm))
