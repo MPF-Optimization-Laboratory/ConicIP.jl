@@ -194,6 +194,25 @@ end
         @test norm(sol[1]) <= 10
     end
 
+    @testset "kktsolver_qr does not densify a large SOC when n − p is small" begin
+        # One order-1 SDP block made every factorization assemble the full
+        # Hessian, densifying the SOC slice of A (dimension × touched
+        # columns, 2 × 160 MB here) although the null space of G is one
+        # direction. The projected product is m × (n − p).
+        d = 200_000; n = 50; p = 49
+        cd = [("Q", d), ("S", 1)]
+        Random.seed!(23)
+        A = [sprandn(d, n, 5 / d); sparse([1], [1], [1.0], 1, n)]
+        G = sparse([Matrix(1.0I, p, p) zeros(p, 1)] .+ [zeros(p, n - 1) randn(p)])
+        z = interior(cd); s = interior(cd); F = nt_block(cd, z, s); F⁻ᵀ = inv(F)'
+        gen = C.kktsolver_qr(spzeros(n, n), A, G, cd)
+        gen(F, F⁻ᵀ)
+        @test (@allocated gen(F, F⁻ᵀ)) < 40 * 2^20
+        b = (randn(n), randn(p), randn(d + 1))
+        (y, w, v) = gen(F, F⁻ᵀ)(b...)
+        @test norm(G * y - b[2]) <= 1e-10 * norm(b[2])
+    end
+
     @testset "dual-side regularization and dependent rows" begin
         cd = [("S", 10)]
         P = standard_form(cd, 3; seed = 41)
