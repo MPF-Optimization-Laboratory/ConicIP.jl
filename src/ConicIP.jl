@@ -1573,8 +1573,11 @@ function _conicIP(
   # paying for a symbolic analysis and an AMD ordering of the KKT pattern.
   # A standard-form SDP is decided on the unregularized Q: Qᵣ = δI would
   # hide it, and kktsolver_sdpschur applies δ on the dual side instead.
+  # The default router budgets the Schur matrix as choose_kktsolver does.
   schur = (kktsolver === default_kktsolver || kktsolver === kktsolver_sdpschur) &&
-          sdpschur_eligible(Q, A, cone_dims)
+          sdpschur_eligible(Q, A, cone_dims) &&
+          (kktsolver === kktsolver_sdpschur ||
+           sdpschur_bytes(p) <= _DENSE_BYTES_MAX)
   routed = schur ? (kktsolver_sdpschur, nothing) :
            kktsolver === default_kktsolver ?
            _choose_kktsolver(Qᵣ, A, G, cone_dims) : nothing

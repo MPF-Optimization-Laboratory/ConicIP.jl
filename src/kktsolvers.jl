@@ -24,6 +24,13 @@ excluded. Peak usage can be a small multiple of this figure.
 """
 dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
 
+# Default dense storage budget of choose_kktsolver (4 GiB).
+const _DENSE_BYTES_MAX = 4 * 2^30
+
+# Persistent and peak dense storage of kktsolver_sdpschur in standard form:
+# the p×p Schur matrix, its equilibrated copy and the Cholesky factor.
+sdpschur_bytes(p) = 8 * 3p^2
+
 """
     dense_kkt_flops(n, m, p; nnzA = 0, nnzQ = 0, iters = 25)
 
@@ -90,7 +97,8 @@ chosen by:
 
 - a standard-form semidefinite program ([`sdpschur_eligible`](@ref):
   `Q = 0` and every variable one cone coordinate, as a PSD variable
-  gives) ⇒ [`kktsolver_sdpschur`](@ref), before any rule below;
+  gives) whose Schur storage `sdpschur_bytes(p)` fits `dense_bytes_max`
+  ⇒ [`kktsolver_sdpschur`](@ref), before any rule below;
 0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
    `dense_bytes_max` ⇒ [`kktsolver_ldl`](@ref), whatever the rules
    below would say — dense QR at that size is an out-of-memory error,
@@ -123,7 +131,7 @@ choose_kktsolver(Q, A, G, cone_dims; kw...) =
   _choose_kktsolver(Q, A, G, cone_dims; kw...)[1]
 
 function _choose_kktsolver(Q, A, G, cone_dims;
-                           size_min = 200, dense_bytes_max = 4 * 2^30,
+                           size_min = 200, dense_bytes_max = _DENSE_BYTES_MAX,
                            ldl_flop_weight = 10.0)
   n = size(Q,1); m = size(A,1); p = size(G,1)
   has_sdp = any(cd -> isequal(cd[1], "S"), cone_dims)
@@ -131,7 +139,12 @@ function _choose_kktsolver(Q, A, G, cone_dims;
   # cone variables exactly and factor only the p×p equality Schur
   # complement; decided before the dense-storage budget, which counts the
   # k(k+1)/2 variables this solver never factors.
-  has_sdp && sdpschur_eligible(Q, A, cone_dims) && return (kktsolver_sdpschur, nothing)
+  # Its own storage is the p×p matrix and its factorization: budgeted
+  # here, and a problem whose Schur matrix does not fit falls through to
+  # the rules below (which refuse it when the dense path does not fit
+  # either).
+  has_sdp && sdpschur_eligible(Q, A, cone_dims) &&
+    sdpschur_bytes(p) <= dense_bytes_max && return (kktsolver_sdpschur, nothing)
   bytes = dense_kkt_bytes(n, m, p)
   if bytes > dense_bytes_max
     if has_sdp

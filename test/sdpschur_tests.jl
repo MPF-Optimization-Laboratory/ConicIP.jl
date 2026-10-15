@@ -249,6 +249,21 @@ end
         @test C.choose_kktsolver(spzeros(mk, mk), sparse(1.0I, mk, mk),
                                  sparse(1:k, 1:k, ones(k), k, mk),
                                  [("S", mk)]; dense_bytes_max = 2^20) === C.kktsolver_sdpschur
+        # …but the Schur matrix is: with a budget below its 3·8p² bytes the
+        # router falls through to the dense rules, which refuse an SDP.
+        @test_throws ArgumentError C.choose_kktsolver(spzeros(mk, mk), sparse(1.0I, mk, mk),
+            sparse(1:k, 1:k, ones(k), k, mk), [("S", mk)]; dense_bytes_max = 2^18)
+        # Review reproducer: n = p = 30 000 with A = G = I needs 21.6 GB for
+        # the Schur matrix and its copies; it used to route to the Schur
+        # solver even with dense_bytes_max = 1. Refused by the router and by
+        # conicIP's direct shortcut alike.
+        N = 30_000; cdN = [("R", N - 1), ("S", 1)]
+        IN = sparse(1.0I, N, N)
+        @test C.sdpschur_bytes(N) > 4 * 2^30
+        @test_throws ArgumentError C.choose_kktsolver(spzeros(N, N), IN, IN, cdN)
+        @test_throws ArgumentError C.choose_kktsolver(spzeros(N, N), IN, IN, cdN; dense_bytes_max = 1)
+        @test_throws ArgumentError conicIP(spzeros(N, N), ones(N), IN, zeros(N), cdN, IN, ones(N);
+                                           verbose = false)
     end
 
     # max ⟨L, X⟩/4  s.t.  X_ii = 1, X ⪰ 0 as a PSD variable through MOI, and
