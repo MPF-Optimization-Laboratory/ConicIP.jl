@@ -127,6 +127,20 @@ end
         end
     end
 
+    @testset "kktsolver_qr with equalities keeps the projected product" begin
+        # Projecting an assembled Hessian onto ker G cancels when it is badly
+        # scaled along range(Gᵀ): here the reduced Hessian is ≈ diag(0.5, 1),
+        # but Q2ᵀHQ2 came out as diag(2e-17, 1) and y ≈ ±4e16.
+        cd = [("S", 3)]
+        A = sparse([1 1 0; 1e-4 0 0; 0 0 1.0]); G = sparse([1 1 0.0]); Q = spzeros(3, 3)
+        F⁻ᵀ = C.Block([C.VecCongurance(Matrix(Diagonal([1e4, 1.0])))])
+        F = C.Block([inv(F⁻ᵀ[1])'])
+        b = ([1.0, -1, 0], [0.0], zeros(3))
+        sol = C.kktsolver_qr(Q, A, G, cd)(F, F⁻ᵀ)(b...)
+        @test resid3(Q, A, G, F, b, sol) <= 1e-12
+        @test norm(sol[1]) <= 10
+    end
+
     @testset "dual-side regularization and dependent rows" begin
         cd = [("S", 10)]
         P = standard_form(cd, 3; seed = 41)

@@ -250,11 +250,16 @@ function kktsolver_qr(Q, A, G, cone_dims)
 
   # With a semidefinite cone, A has k(k+1)/2 rows per order-k block, and
   # the dense W = F⁻ᵀ(AQ2) below is (k(k+1)/2)×(n−p) — the memory wall of
-  # the affine (LMI) form. There the Hessian Q + AᵀF⁻¹F⁻ᵀA is assembled
-  # instead by the trace-form Gram kernel (src/schur.jl) straight from the
-  # sparse columns of A, and projected onto ker G afterwards; the dense
-  # m×(n−p) products are never formed.
-  gram = any(cd -> cd[1] == "S", cone_dims)
+  # the affine (LMI) form. Without equality rows the Hessian
+  # Q + AᵀF⁻¹F⁻ᵀA is assembled instead by the trace-form Gram kernel
+  # (src/schur.jl) straight from the sparse columns of A, and the dense
+  # m×n product is never formed. With equality rows it is not: projecting
+  # an assembled H onto ker G (Q2ᵀHQ2) cancels catastrophically when H is
+  # badly scaled along range(Gᵀ) — a well-conditioned reduced Hessian came
+  # out as diag(1e-17, 1) — while the projected product (F⁻ᵀAQ2)ᵀ(F⁻ᵀAQ2)
+  # never forms the large directions. Assembling only at p = 0 also keeps
+  # the work bounded by the null-space dimension (none at p = n).
+  gram = p == 0 && any(cd -> cd[1] == "S", cone_dims)
 
   # Constants across iterations
   AQ2  = gram ? nothing : A * Q2           # m×(n−p) dense
@@ -271,7 +276,6 @@ function kktsolver_qr(Q, A, G, cone_dims)
       if gram
         _gram!(Hbuf, plan, F⁻ᵀ)             # AᵀF⁻¹F⁻ᵀA = (F⁻ᵀA)ᵀ(F⁻ᵀA)
         Hbuf .+= Q
-        p == 0 ? Hbuf : Matrix(Symmetric(Q2' * Hbuf * Q2))
       else
         W = F⁻ᵀ * AQ2
         S22 + W'W
