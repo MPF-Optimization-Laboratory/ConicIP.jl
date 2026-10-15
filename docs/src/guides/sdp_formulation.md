@@ -43,6 +43,13 @@ triangle.
   ([`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur)), at a cost of
   about `p k³ + p² k² + p³` per iteration. The max-cut model above is in
   this form.
+- **Matrix-variable form with a few extras.** Free variables, bounds or a
+  second cone on some entries of `X`, or a quadratic objective on the
+  other variables: ConicIP still eliminates the matrix entries, and
+  factors a matrix whose size is the number of other variables plus the
+  equality constraints plus the inequality rows that touch entries of `X`
+  (the same solver, its *mixed form*). It does so when that size is at
+  most half the variable count.
 - **Matrix-variable form otherwise.** ConicIP factors a dense matrix in
   all `k(k+1)/2` variables. That costs on the order of `k⁶` per iteration
   and `k⁴` memory, and past roughly `k ≈ 150` the automatic KKT solver
@@ -56,12 +63,17 @@ A model is in **standard form** when:
   (`@variable(model, X, PSD)`, `x[1:n] >= 0` with `x in Nonnegatives`);
 - the remaining constraints are linear equalities.
 
-Things that leave it: a quadratic objective in `X`; a bound or a second
-cone constraint on an entry of `X` (for example `X .>= 0` alongside
-`X ⪰ 0`); a variable shared between two cone constraints; free variables
-alongside the matrix.
+The mixed form also covers free variables alongside the matrix (theta
+with a free scalar, `min t` with `X[i, i] == t - 1`), a few bounds or a
+second cone on entries of `X` (a Shor relaxation `[1 x'; x X] ⪰ 0` with
+`0 ≤ x ≤ 1`), and a quadratic objective in the non-matrix variables.
 
-## Outside standard form: let Dualization.jl hand ConicIP the dual
+What still leaves both: a quadratic objective in `X` itself, and
+constraints on so many entries of `X` that the kept rows rival the
+variable count — a doubly nonnegative relaxation, `X .>= 0` alongside
+`X ⪰ 0`, keeps one row per entry.
+
+## Outside both forms: let Dualization.jl hand ConicIP the dual
 
 [Dualization.jl](https://jump.dev/Dualization.jl/stable/) builds the dual
 of a JuMP model automatically. Wrapping the optimizer leaves the model as

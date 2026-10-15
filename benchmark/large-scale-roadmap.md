@@ -576,11 +576,22 @@ kernel (`src/schur.jl`, four-index / rank-two / dense per column) that also repl
 `kktsolver_qr`'s dense F⁻ᵀAQ₂ for every SDP. Measured (`benchmark/results/sdp-*.csv`):
 PSD-variable max-cut 1.66 → 0.0063 s/iter at k = 100, k = 150/200 now solve in 0.15/0.28 s;
 LMI form 2.5–8.8× per iteration; same iterations and objectives; SDPLIB unchanged on every
-instance that solved, theta2 1.73 → 0.15 s, arch0 4.5 → 1.35 s. Still open: a mixed
-standard form (free variables or bounds alongside the PSD variable; the reduced system is not
-automatically quasi-definite), certificate fallbacks (Q = I, stay on QR), chordal
-decomposition, and families with p = Θ(k²) equalities, where the p×p factorization is the
-wall. **Estimate for the rest:** research-grade, months; milestone-based.
+instance that solved, theta2 1.73 → 0.15 s, arch0 4.5 → 1.35 s. A Codex review of those
+commits led to fixes (2026-10-14): kktsolver_qr assembles by Gram only at p = 0 (projecting
+an assembled H cancelled); trace-form diagonals are checked for cancellation, recomputed as
+‖RᵀGᵢR‖², with a dense (WB)ᵀ(WB) fallback when they disagree; the Schur matrix is budgeted
+before routing; and it is equilibrated before the pivot test and shift. **Mixed form landed
+too:** `kktsolver_sdpschur` now eliminates only the cone variables of PSD blocks whose rows
+are single variables, keeping free variables, inequality rows on matrix entries (`K`) and
+a quadratic objective on the rest; the reduced matrix [H_R C_Rᵀ; C_R −(E + C_S H_S⁻¹ C_Sᵀ)]
+is symmetric indefinite (not quasi-definite: H_R = 0 for a free variable in equalities only,
+and C_S can lose rank), equilibrated and factored by Bunch-Kaufman. Routed when
+n_R + p + m_K ≤ n/2 and its storage fits; doubly nonnegative models (X .≥ 0) decline.
+`sdp_scaling.jl` families `theta-mixed` (theta with a free scalar) and `boxqp-mixed` (Shor
+relaxation with bounds on entries): same iterations and objectives as kktsolver_qr, 1.5 →
+0.0075 and 1.78 → 0.0079 s/iter at k = 100; k = 200 in 0.65 / 0.9 s total. Still open:
+certificate fallbacks (Q = I, stay on QR), chordal decomposition, families with p = Θ(k²)
+equalities (the p×p factorization is the wall) and DNN relaxations (m_K = Θ(k²)). **Estimate for the rest:** research-grade, months; milestone-based.
 
 In this package's notation `A` maps n free variables to m cone coordinates. For an SDP
 block with row range I, the coefficient matrix of variable j is `B_j = mat(A[I, j])`, a

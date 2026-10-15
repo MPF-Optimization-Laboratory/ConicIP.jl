@@ -16,10 +16,11 @@
 # **How it is solved.** A problem with any `"S"` block is routed to a dense
 # method — see the [KKT Solvers](@ref) guide. The Nesterov-Todd scaling block
 # of a semidefinite cone is a dense congruence transform, so the sparse
-# solver has nothing to exploit. A standard-form problem (`Q = 0`, every
-# variable one cone coordinate) goes to
+# solver has nothing to exploit. A problem with a PSD variable — standard
+# form (`Q = 0`, every variable one cone coordinate), or a few other
+# variables and rows besides — goes to
 # [`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur), which factors a
-# matrix the size of the equality block; every other one to
+# matrix the size of the equality block plus those extras; every other one to
 # [`kktsolver_qr`](@ref ConicIP.kktsolver_qr), which factors a matrix the
 # size of the variable count. Both assemble their matrix from the sparse
 # coefficient matrices of each block, in work that grows with the block
@@ -28,11 +29,12 @@
 # what bounds memory.
 #
 # **The formulation matters.** A PSD *variable* (`@variable(model, X, PSD)`)
-# makes every matrix entry a solver variable. In standard form (linear
-# objective, the entries constrained only by the cone and by linear
-# equalities) ConicIP eliminates them and factors an equality-sized system
-# instead ([`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur)); outside
-# it, the dense path grows like `k⁶` in the block order `k`. The
+# makes every matrix entry a solver variable. When the entries are
+# constrained by the cone, linear equalities and only a few other rows
+# (linear objective in the entries), ConicIP eliminates them and factors a
+# system of about the equality count instead
+# ([`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur)); otherwise the
+# dense path grows like `k⁶` in the block order `k`. The
 # [SDP Formulation](@ref "Formulating Semidefinite Programs") guide says
 # which models qualify and how Dualization.jl handles the rest.
 #
@@ -60,9 +62,9 @@
 # **What is not there.**
 #
 # - No chordal decomposition. The reduced matrix is dense and factored by
-#   Cholesky: sparse coefficient matrices make its assembly cheap, not its
-#   factorization, so the number of variables (or of equalities, in
-#   standard form) bounds the problem size.
+#   Cholesky (Bunch-Kaufman in the mixed form): sparse coefficient matrices
+#   make its assembly cheap, not its factorization, so the number of
+#   variables (or of equalities, in standard form) bounds the problem size.
 # - The degenerate instances need a loose tolerance. The `hinf` family lacks
 #   strict complementarity, and `qap6` behaves the same way: once feasibility
 #   reaches roughly `1e-6` the KKT system is ill-conditioned, the Newton step
