@@ -9,9 +9,18 @@
 #   dual    the matrix is affine in a few variables
 #           (`VectorAffineFunction`-in-PSD), so n is the constraint count.
 #
+#   mixed   a PSD variable among other variables and rows (the mixed form of
+#           kktsolver_sdpschur): free scalars, bounds on matrix entries.
+#
 # Families: the max-cut relaxation (p = k diagonal equalities) and the Lovász
 # theta function of a sparse random graph (p = 1 + |E|, |E| ≈ 2k). Both have
 # equal primal and dual optimal values, which the CSV records for comparison.
+# Mixed form: `theta-mixed` is theta with a free scalar,
+# ϑ(H) = min t s.t. Z ⪰ 0, Z_ii = t − 1, Z_ij = −1 on the |E| ≈ 2k
+# non-adjacent pairs of H (H is the complement of the theta graph, so its
+# value differs from theta-primal's); `boxqp-mixed` is the Shor relaxation
+# of a box-constrained QP, Y = [1 xᵀ; x X] ⪰ 0 of order k + 1 with Y₁₁ = 1,
+# X_ii ≤ x_i and 0 ≤ x ≤ 1 (3k inequality rows on entries of Y).
 #
 #   julia --project benchmark/sdp_scaling.jl                 # full set
 #   julia --project benchmark/sdp_scaling.jl --quick         # small subset
@@ -130,8 +139,48 @@ function theta_dual(k)
     return model
 end
 
+# min t  s.t.  Z ⪰ 0,  Z_ii − t = −1,  Z_ij = −1 (ij ∈ E)
+function theta_mixed(k)
+    E = theta_edges(k)
+    model = MOI.Utilities.Model{Float64}()
+    Z = MOI.add_variables(model, div(k * (k + 1), 2))
+    MOI.add_constraint(model, MOI.VectorOfVariables(Z), MOI.PositiveSemidefiniteConeTriangle(k))
+    t = MOI.add_variable(model)
+    for i in 1:k
+        MOI.add_constraint(model, saf([term(1.0, Z[tri(i, i)]), term(-1.0, t)]), MOI.EqualTo(-1.0))
+    end
+    for (i, j) in E
+        MOI.add_constraint(model, saf([term(1.0, Z[tri(i, j)])]), MOI.EqualTo(-1.0))
+    end
+    MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(), saf([term(1.0, t)]))
+    MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    return model
+end
+
+# min ½⟨Q, X⟩ + cᵀx  s.t.  [1 xᵀ; x X] ⪰ 0,  X_ii ≤ x_i,  0 ≤ x ≤ 1
+function boxqp_mixed(k; seed = 1)
+    rng = MersenneTwister(seed)
+    Qb = randn(rng, k, k); Qb = (Qb + Qb') / 2; c = randn(rng, k)
+    model = MOI.Utilities.Model{Float64}()
+    Y = MOI.add_variables(model, div((k + 1) * (k + 2), 2))
+    MOI.add_constraint(model, MOI.VectorOfVariables(Y), MOI.PositiveSemidefiniteConeTriangle(k + 1))
+    MOI.add_constraint(model, saf([term(1.0, Y[tri(1, 1)])]), MOI.EqualTo(1.0))
+    for i in 1:k
+        x = Y[tri(1, i + 1)]
+        MOI.add_constraint(model, saf([term(1.0, Y[tri(i + 1, i + 1)]), term(-1.0, x)]), MOI.LessThan(0.0))
+        MOI.add_constraint(model, x, MOI.GreaterThan(0.0))
+        MOI.add_constraint(model, x, MOI.LessThan(1.0))
+    end
+    obj = [term((i == j ? 0.5 : 1.0) * Qb[i, j], Y[tri(i + 1, j + 1)]) for j in 1:k for i in 1:j]
+    append!(obj, [term(c[i], Y[tri(1, i + 1)]) for i in 1:k])
+    MOI.set(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(), saf(obj))
+    MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    return model
+end
+
 const BUILDERS = Dict(("maxcut", "primal") => maxcut_primal, ("maxcut", "dual") => maxcut_dual,
-                      ("theta", "primal") => theta_primal, ("theta", "dual") => theta_dual)
+                      ("theta", "primal") => theta_primal, ("theta", "dual") => theta_dual,
+                      ("theta", "mixed") => theta_mixed, ("boxqp", "mixed") => boxqp_mixed)
 
 # ──────────────────────────────────────────────────────────────
 #  Instance registry
@@ -142,12 +191,16 @@ const SDP_SIZES = Dict(
     ("maxcut", "dual")   => (50, 100, 150, 200, 300),
     ("theta", "primal")  => (50, 70, 100, 150),
     ("theta", "dual")    => (50, 100, 150, 200),
+    ("theta", "mixed")   => (50, 70, 100, 150, 200),
+    ("boxqp", "mixed")   => (50, 70, 100, 150, 200),
 )
 const SDP_QUICK = (50, 70)
 
 function sdp_instances()
     insts = Instance[]
-    for fam in ("maxcut", "theta"), form in ("primal", "dual"), k in SDP_SIZES[(fam, form)]
+    for (fam, form) in (("maxcut", "primal"), ("maxcut", "dual"), ("theta", "primal"),
+                        ("theta", "dual"), ("theta", "mixed"), ("boxqp", "mixed")),
+        k in SDP_SIZES[(fam, form)]
         name = "$fam-$form-$k"
         push!(insts, Instance(name, :sdp, "$fam-$form", k in SDP_QUICK,
                               () -> BUILDERS[(fam, form)](k), nothing))
@@ -156,7 +209,7 @@ function sdp_instances()
 end
 const SDP_INSTANCES = sdp_instances()
 
-parse_inst(name) = (m = match(r"^(\w+)-(primal|dual)-(\d+)$", name);
+parse_inst(name) = (m = match(r"^(\w+)-(primal|dual|mixed)-(\d+)$", name);
                     (fam = m[1], form = m[2], k = parse(Int, m[3])))
 
 # ──────────────────────────────────────────────────────────────
