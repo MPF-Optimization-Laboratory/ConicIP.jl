@@ -349,6 +349,7 @@ end
             dopt = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
             MOI.set(dopt, MOI.Silent(), true)
             MOI.copy_to(dopt, dm); MOI.optimize!(dopt)
+            @test MOI.get(dopt, MOI.TerminationStatus()) == MOI.OPTIMAL
             @test MOI.get(opt, MOI.ObjectiveValue()) ≈ MOI.get(dopt, MOI.ObjectiveValue()) rtol = 1e-6
             raw = MOI.get(opt, MOI.RawSolver())::ConicIP.Optimizer
             sol = raw.sol
@@ -358,6 +359,8 @@ end
                   (1 + norm(raw.c_int))
             @test rDu <= 1e-6
             @test norm(raw.eq_G * sol.y - raw.eq_d) <= 1e-6 * (1 + norm(raw.eq_d))
+            @test norm(raw.ineq_A * sol.y - raw.ineq_b - sol.s) <= 1e-6 * (1 + norm(raw.ineq_b))
+            @test abs(dot(sol.s, sol.v)) <= 1e-6 * (1 + abs(MOI.get(opt, MOI.ObjectiveValue())))
             @test C.cone_margin(sol.s, raw.cone_dims) >= -1e-8
             @test C.cone_margin(sol.v, raw.cone_dims) >= -1e-8
         end
@@ -371,9 +374,21 @@ end
         @test C.choose_kktsolver(Q, A, G, cd) === C.kktsolver_sdpschur
         sol = conicIP(Q, c, A, b, cd, G, d; verbose = false)
         @test sol.status == :Infeasible
+        # The Farkas ray, checked here rather than by the solver's own
+        # validator: Gᵀw = Aᵀv, v ⪰ 0, bᵀv − dᵀw > 0.
+        sep = dot(b, sol.v) - dot(d, sol.w)
+        @test sep > 0
+        @test norm(G' * sol.w - A' * sol.v) <= 1e-8 * sep
+        @test eigmin(Symmetric(C.mat(sol.v))) >= -1e-8 * sep
         # Unbounded: min −X₁₁ s.t. X₂₂ = 1.
         G = sparse([0 0 1.0]); d = [1.0]; c = [1.0, 0, 0]
         sol = conicIP(Q, c, A, b, cd, G, d; verbose = false)
         @test sol.status == :DualInfeasible
+        # The recession ray: Gy = 0, Ay ⪰ 0, and cᵀy > 0 (the objective
+        # ½yᵀQy − cᵀy decreases along it; Q = 0).
+        slope = dot(c, sol.y)
+        @test slope > 0
+        @test norm(G * sol.y) <= 1e-8 * slope
+        @test eigmin(Symmetric(C.mat(A * sol.y))) >= -1e-8 * slope
     end
 end
