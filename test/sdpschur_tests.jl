@@ -103,6 +103,59 @@ end
         Fd = Matrix(F)
         @test M ≈ Gt' * (Fd' * Fd) * Gt rtol = 1e-12
         @test M == M'
+        @test all(>(0), plan.sdp[1].stats[1:3])     # each branch was taken
+    end
+
+    @testset "trace-form cancellation is caught" begin
+        # Review reproducer: R with a leading block [1 0; 1 1e-4] and the
+        # column vecm(J), J = [1 −1; −1 1] there. The four-index sum came out
+        # 0 against a true 1e-16.
+        R = Matrix(1.0I, 4, 4); R[1:2, 1:2] = [1 0; 1 1e-4]
+        J = zeros(4, 4); J[1:2, 1:2] = [1 -1; -1 1]
+        cd = [("S", 10)]
+        B = sparse(reshape(C.vecm(J), :, 1))
+        plan = C._gram_plan(B, cd)
+        M = zeros(1, 1); C._gram!(M, plan, C.Block([C.VecCongurance(R)]))
+        wb = C.VecCongurance(R) * C.vecm(J)
+        @test M[1] ≈ dot(wb, wb) rtol = 1e-10
+        @test plan.sdp[1].stats[1] == 1 && plan.sdp[1].stats[5] == 1
+        @test plan.fallback[1] == 1
+        # The same through a real Nesterov-Todd scaling's inverse (1e-20).
+        Rz = [1 0 0 0; 1 1e-5 0 0; 0 0 1 0; 0 0 0 1.0]
+        F = C.nestod_sdc(C.vecm(Rz * Rz'), C.vecm(inv(Rz)' * inv(Rz)))
+        W = inv(F)'
+        M = zeros(1, 1); C._gram!(M, C._gram_plan(B, cd), C.Block([W]))
+        wb = W * C.vecm(J)
+        @test M[1] ≈ dot(wb, wb) rtol = 1e-10
+
+        # Stress: ill-conditioned scalings (κ(T) up to 1e12) against
+        # columns of every branch, including ones aligned with the small
+        # eigen-directions. Compared on the diagonally scaled matrix, which
+        # is what the factorization sees.
+        Random.seed!(17)
+        for k in (6, 12), κ in (1e2, 1e6, 1e12)
+            m = div(k * (k + 1), 2); cd = [("S", m)]
+            U = Matrix(qr(randn(k, k)).Q)
+            R = U * Diagonal(exp10.(range(0, -log10(sqrt(κ)), length = k)))
+            W = C.VecCongurance(R)
+            cols = Vector{Float64}[]
+            for _ in 1:3                       # sparse: two or three entries
+                v = zeros(m); v[rand(1:m, 3)] .= randn(3); push!(cols, v)
+            end
+            u1, u2 = U[:, end], U[:, end-1]    # small directions of T
+            push!(cols, C.vecm(u1 * u2' + u2 * u1'))
+            push!(cols, C.vecm(u1 * u1'))
+            push!(cols, C.vecm(Symmetric(randn(k, k))))
+            e = zeros(k, k); e[1, 1] = 1; e[2, 2] = -1; push!(cols, C.vecm(U * e * U'))
+            B = sparse(reduce(hcat, cols)); B = dropzeros!(B)
+            plan = C._gram_plan(B, cd)
+            M = zeros(size(B, 2), size(B, 2)); C._gram!(M, plan, C.Block([W]))
+            Y = reduce(hcat, [W * Vector(B[:, j]) for j in 1:size(B, 2)])
+            Md = Y' * Y
+            D = Diagonal(1 ./ sqrt.(diag(Md)))
+            @test opnorm(D * (M - Md) * D) <= 1e-6
+            @test all(>(0), diag(M))
+        end
     end
 
     @testset "kktsolver_qr assembles the SDP Hessian by the trace form" begin

@@ -41,13 +41,25 @@ struct _GramSDP
   Wb::Matrix{Float64}   # T Gᵢ T
   Gb::Matrix{Float64}   # mat(bᵢ)
   tmp::Matrix{Float64}
+  Rt::Matrix{Float64}   # Rᵀ, for the stable diagonal RᵀGᵢR
+  Z::Matrix{Float64}    # RᵀGᵢR
+  # Columns taken by each branch (four-index, rank-two, dense), diagonals
+  # recomputed stably, and those whose trace-form value failed the check;
+  # cumulative over calls (diagnostics and tests).
+  stats::Vector{Int}
 end
 
 struct GramPlan
   ncol::Int
   blocks::Vector{_GramBlock}
   sdp::Vector{Union{Nothing,_GramSDP}}
+  B::SparseMatrixCSC{Float64,Int}   # for the dense fallback
+  suspect::Vector{Int}              # [1]: failed diagonals in the last _gram!
+  fallback::Vector{Int}             # [1]: dense fallbacks taken, cumulative
 end
+
+# Largest dense W·B (bytes) the fallback of _gram! forms.
+const _GRAM_FALLBACK_BYTES = 2^30
 
 # Packed (vecm) coordinate c of an order-k block ↦ (a, b), a ≤ b: row-major
 # upper triangle, the order `vecm` writes.
@@ -84,12 +96,13 @@ function _gram_plan(B::SparseMatrixCSC, cone_dims)
     if btype == "S"
       k = ord(1:dim)
       (ia, ib) = _packed_pairs(k)
-      push!(sdp, _GramSDP(k, ia, ib, zeros(k, k), zeros(k, k), zeros(k, k), zeros(k, k)))
+      push!(sdp, _GramSDP(k, ia, ib, zeros(k, k), zeros(k, k), zeros(k, k), zeros(k, k),
+                          zeros(k, k), zeros(k, k), zeros(Int, 5)))
     else
       push!(sdp, nothing)
     end
   end
-  return GramPlan(size(B, 2), blocks, sdp)
+  return GramPlan(size(B, 2), blocks, sdp, B, [0], [0])
 end
 
 """
@@ -98,8 +111,32 @@ end
 Overwrite the dense `M` (ncol × ncol) with Bᵀ Wᵀ W B for the `B` of
 `plan`. Only the upper triangle is accumulated; it is mirrored at the end,
 so `M` is exactly symmetric.
+
+The trace form expands each semidefinite entry into products of entries of
+T = RRᵀ, which can cancel catastrophically when the scaling is badly
+conditioned (a true 1e-16 came out as 0, or as −7e-16 with Nesterov-Todd
+scalings). Every diagonal entry whose terms cancel beyond what rounding
+allows is recomputed stably as ‖RᵀGᵢR‖²; if that disagrees with the trace
+form, the off-diagonals of its row cannot be trusted either, and `M` is
+recomputed as the dense (WB)ᵀ(WB) when W·B fits in
+`_GRAM_FALLBACK_BYTES` (otherwise the stable diagonals are kept).
 """
 function _gram!(M::Matrix{Float64}, plan::GramPlan, W::Block)
+  plan.suspect[1] = 0
+  _gram_trace!(M, plan, W)
+  if plan.suspect[1] > 0 && 8 * size(plan.B, 1) * plan.ncol <= _GRAM_FALLBACK_BYTES
+    Y = W * Matrix(plan.B)
+    mul!(M, Y', Y)
+    n = size(M, 1)
+    @inbounds for j = 1:n, i = j+1:n          # exact symmetry
+      M[i, j] = M[j, i]
+    end
+    plan.fallback[1] += 1
+  end
+  return M
+end
+
+function _gram_trace!(M::Matrix{Float64}, plan::GramPlan, W::Block)
   fill!(M, 0.0)
   for (bi, gb) in enumerate(plan.blocks)
     isempty(gb.cols) && continue
@@ -107,7 +144,7 @@ function _gram!(M::Matrix{Float64}, plan::GramPlan, W::Block)
     if Blk isa DiagBlock
       _gram_diag!(M, gb, Blk.diag)
     elseif Blk isa VecCongurance
-      _gram_sdp!(M, gb, plan.sdp[bi], Blk.R)
+      plan.suspect[1] += _gram_sdp!(M, gb, plan.sdp[bi], Blk.R)
     else
       _gram_dense!(M, gb, Blk)
     end
@@ -155,10 +192,16 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
   @inbounds for j = 1:k, i = j+1:k          # exact symmetry
     T[i, j] = T[j, i]
   end
+  copyto!(ws.Rt, R')
+  nT2 = sum(abs2, T)                        # ‖T‖_F², for the dense-branch check
   Bs = gb.Bs; rv = rowvals(Bs); nz = nonzeros(Bs); cols = gb.cols
   nc = length(cols)
   nB = nnz(Bs)
   s2 = sqrt(2.0); is2 = 1/s2
+  # A diagonal whose terms add up to less than τ times their magnitude may
+  # have lost more than ~1e-6 of its value to rounding.
+  τ = 1e6 * eps()
+  nsuspect = 0
   for il = 1:nc
     rng = nzrange(Bs, il)
     q = length(rng)
@@ -169,25 +212,33 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
     c_rank  = 4.0 * q * k^2 + 2.0 * nB
     c_dense = 0.5 * k^3 + k^2 + 2.0 * nB
     if c_f3 <= min(c_rank, c_dense)
+      ws.stats[1] += 1
       # Four-index formula: with mat(e_c) = β_c (e_a e_bᵀ + e_b e_aᵀ),
       # β = 1/2 on the diagonal and 1/√2 off it,
       #   tr(mat(e_s) T mat(e_t) T) = 2β_sβ_t (T_{b_s c_t} T_{d_t a_s} + T_{b_s d_t} T_{c_t a_s}).
       for jl = il:nc
-        acc = 0.0
+        acc = 0.0; mag = 0.0
         for s in rng
           cs = rv[s]; as = ia[cs]; bs = ib[cs]
           gs = nz[s] * (as == bs ? 0.5 : is2)
           for t in nzrange(Bs, jl)
             ct = rv[t]; at = ia[ct]; bt = ib[ct]
             gt = nz[t] * (at == bt ? 0.5 : is2)
-            acc += 2 * gs * gt * (T[bs, at] * T[bt, as] + T[bs, bt] * T[at, as])
+            u = T[bs, at] * T[bt, as]; v = T[bs, bt] * T[at, as]
+            acc += 2 * gs * gt * (u + v)
+            jl == il && (mag += 2 * abs(gs * gt) * (abs(u) + abs(v)))
           end
+        end
+        if jl == il && acc <= τ * mag
+          (acc, bad) = _gram_sdp_diag(ws, Bs, rng, acc)
+          nsuspect += bad
         end
         M[cols[il], cols[jl]] += acc
       end
       continue
     end
     if c_rank <= c_dense
+      ws.stats[2] += 1
       # Wb = Σ_s g_s β_s (T_a T_bᵀ + T_b T_aᵀ)
       fill!(Wb, 0.0)
       for s in rng
@@ -196,7 +247,17 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
         BLAS.ger!(g, view(T, :, a), view(T, :, b), Wb)
         BLAS.ger!(g, view(T, :, b), view(T, :, a), Wb)
       end
+      # Magnitude of the diagonal's terms: the four-index sum in absolute
+      # values, O(q²) against the O(q k²) above.
+      mag = 0.0
+      for s in rng, t in rng
+        cs = rv[s]; as = ia[cs]; bs = ib[cs]
+        ct = rv[t]; at = ia[ct]; bt = ib[ct]
+        gs = nz[s] * (as == bs ? 0.5 : is2); gt = nz[t] * (at == bt ? 0.5 : is2)
+        mag += 2 * abs(gs * gt) * (abs(T[bs, at] * T[bt, as]) + abs(T[bs, bt] * T[at, as]))
+      end
     else
+      ws.stats[3] += 1
       fill!(Gb, 0.0)
       for s in rng
         cs = rv[s]; a = ia[cs]; b = ib[cs]
@@ -208,6 +269,8 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
       end
       mul!(ws.tmp, T, Gb)
       mul!(Wb, ws.tmp, T)
+      # |tr(GTGT)| ≤ ‖T‖²‖G‖², and ‖G‖_F = ‖bᵢ‖.
+      mag = nT2 * sum(abs2, view(nz, rng))
     end
     # ⟨vecm(Wb), b_j⟩ over the nonzeros of each later column.
     for jl = il:nc
@@ -216,10 +279,51 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
         ct = rv[t]; a = ia[ct]; b = ib[ct]
         acc += nz[t] * (a == b ? Wb[a, a] : s2 * Wb[a, b])
       end
+      if jl == il && acc <= τ * mag
+        (acc, bad) = _gram_sdp_diag(ws, Bs, rng, acc)
+        nsuspect += bad
+      end
       M[cols[il], cols[jl]] += acc
     end
   end
-  return M
+  return nsuspect
+end
+
+# The diagonal contribution ‖RᵀGᵢR‖_F² of a column (vecm is an isometry),
+# computed without T: as a sum of rank-two terms in the rows of R when the
+# column is sparse, by two products otherwise. Returns it and whether the
+# trace-form value `d` disagrees with it beyond 1e-6 relative.
+function _gram_sdp_diag(ws::_GramSDP, Bs, rng, d)
+  k = ws.k; Z = ws.Z; Rt = ws.Rt; ia = ws.ia; ib = ws.ib
+  rv = rowvals(Bs); nz = nonzeros(Bs)
+  is2 = 1/sqrt(2.0)
+  if 4 * length(rng) <= k
+    fill!(Z, 0.0)
+    for s in rng
+      c = rv[s]; a = ia[c]; b = ib[c]
+      g = nz[s] * (a == b ? 0.5 : is2)
+      BLAS.ger!(g, view(Rt, :, a), view(Rt, :, b), Z)
+      BLAS.ger!(g, view(Rt, :, b), view(Rt, :, a), Z)
+    end
+  else
+    Gb = ws.Gb
+    fill!(Gb, 0.0)
+    for s in rng
+      c = rv[s]; a = ia[c]; b = ib[c]
+      if a == b
+        Gb[a, a] = nz[s]
+      else
+        Gb[a, b] = Gb[b, a] = nz[s] * is2
+      end
+    end
+    mul!(ws.tmp, Rt, Gb)                  # RᵀG
+    mul!(Z, ws.tmp, Rt')                  # RᵀGR
+  end
+  ds = sum(abs2, Z)
+  ws.stats[4] += 1
+  bad = abs(d - ds) > 1e-6 * ds
+  ws.stats[5] += bad
+  return (ds, Int(bad))
 end
 
 # ──────────────────────────────────────────────────────────────
