@@ -681,13 +681,14 @@ function dsdc_diag!(x, y, o)
   # Z_ij (λ_i + λ_j)/2 = X_ij, so Z_ij = X_ij / ((λ_i + λ_j)/2) — the √2
   # packing weight cancels, and the packed coordinates divide in place.
   # Only the diagonal of mat(y) is read: its off-diagonals are rounding.
-  # The quotient X_ij / ((λ_i + λ_j)/2) is evaluated by the range of the
-  # sum σ = λ_i + λ_j. Normal σ ≥ 2·floatmin: σ/2 is exact, one division
-  # (a subnormal numerator such as u/1 stays exact). Smaller σ: σ is an
-  # exact sum of subnormals whose half would round (u + 2u = 3u, half 1.5u
-  # rounds to 2u), so 2·(X_ij/σ), whose doubling is exact. σ overflowing:
-  # the mean λ_i/2 + λ_j/2. O(k²) for order k against lyap's O(k³) Schur
-  # factorization, and allocation-free.
+  # The quotient X_ij / ((λ_i + λ_j)/2) is one division by σ/2 when the
+  # sum σ = λ_i + λ_j is normal (σ/2 is then exact) and the result is
+  # normal too. Otherwise — σ subnormal or overflowing, or a result that
+  # underflows, where the single rounding of σ can flip a subnormal result
+  # (prevfloat(2) + 2 rounds to 4, and u/2 is a tie that rounds to 0 for
+  # the correct u) — it is computed exactly and rounded once, in extended
+  # precision (_dsdc_exact). O(k²) for order k against lyap's O(k³) Schur
+  # factorization, and allocation-free off those exceptional entries.
   n = ord(y)
   dpos(j) = (j - 1)*n - div((j - 1)*(j - 2), 2) + 1   # packed index of (j,j)
   c = 1
@@ -697,14 +698,26 @@ function dsdc_diag!(x, y, o)
     for j = i+1:n
       λj = y[dpos(j)]
       σ = λi + λj
-      o[c] = !isfinite(σ)           ? x[c] / (λi/2 + λj/2) :
-             σ >= 2 * floatmin(σ)   ? x[c] / (σ/2) :
-                                      2 * (x[c] / σ)
+      q = isfinite(σ) && σ >= 2 * floatmin(σ) ? x[c] / (σ/2) : 0.0
+      if (q == 0 || !(abs(q) >= floatmin(q))) && x[c] != 0
+        q = _dsdc_exact(x[c], λi, λj)
+      end
+      o[c] = q
       c += 1
     end
   end
   return o
 
+end
+
+# X_ij / ((λ_i + λ_j)/2) correctly rounded, for dsdc_diag!'s exceptional
+# entries (subnormal or overflowing sums, underflowing results). The sum and
+# halving are exact in 2100-bit arithmetic, and the quotient is rounded
+# once to Float64.
+function _dsdc_exact(x, λi, λj)
+  setprecision(BigFloat, 2100) do
+    Float64(big(x) / ((big(λi) + big(λj)) / 2))
+  end
 end
 
 function xsdc!(x, y, o)
