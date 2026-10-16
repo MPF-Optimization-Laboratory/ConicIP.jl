@@ -27,9 +27,9 @@ dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
 # Default dense storage budget of choose_kktsolver (4 GiB).
 const _DENSE_BYTES_MAX = 4 * 2^30
 
-# Persistent and peak dense storage of kktsolver_sdpschur in standard form
-# (the mixed form's is `_sdpschur_bytes`):
-# the p×p Schur matrix, its equilibrated copy and the Cholesky factor.
+# Dense storage of kktsolver_sdpschur's p×p Schur matrix in standard form:
+# the matrix, its equilibrated copy and the Cholesky factor. The router's
+# full estimate (`_sdpschur_bytes` in schur.jl) adds the Gram workspaces.
 sdpschur_bytes(p) = 8 * 3p^2
 
 """
@@ -341,7 +341,13 @@ end
 mutable struct DenseKKTGen{G}
   gen::G
   timing::Union{Nothing,PhaseTimes}
+  # kktsolver_sdpschur's counters, cumulative over the solve: [1] internal
+  # refinement corrections, [2] factorizations handed to kktsolver_qr,
+  # [3] solves that missed the residual target with no fallback available.
+  # Empty for kktsolver_qr.
+  stats::Vector{Int}
 end
+DenseKKTGen(gen::G, timing) where {G} = DenseKKTGen{G}(gen, timing, Int[])
 (g::DenseKKTGen)(F, F⁻ᵀ) = g.gen(F, F⁻ᵀ, g.timing)
 kkt_attach_timing!(g::DenseKKTGen, pt::PhaseTimes) = (g.timing = pt; nothing)
 

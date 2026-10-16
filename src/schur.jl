@@ -22,7 +22,11 @@
 # as a sum of rank-two updates when bᵢ has few nonzeros, or not at all
 # when both columns are sparse enough for the four-index formula below.
 # Diagonal blocks contribute Bᵀ diag(w²) B sparsely and any other block
-# (second-order cone, dense) through a dense W_B B_B.
+# (second-order cone, dense) through dense W_B B_B products formed a few
+# columns at a time. Every dense temporary is bounded by
+# `_GRAM_WORKSPACE_BYTES` (columns are streamed in chunks that fit), so the
+# kernel's storage beyond its output is known in advance and budgeted by
+# the router.
 
 # Per-block slice of B, fixed at setup: the columns of B with a nonzero in
 # the block's rows, and B[I, cols] with local row numbering.
@@ -52,14 +56,32 @@ end
 struct GramPlan
   ncol::Int
   blocks::Vector{_GramBlock}
-  sdp::Vector{Union{Nothing,_GramSDP}}
-  B::SparseMatrixCSC{Float64,Int}   # for the dense fallback
-  suspect::Vector{Int}              # [1]: failed diagonals in the last _gram!
-  fallback::Vector{Int}             # [1]: dense fallbacks taken, cumulative
+  sdp::Vector{Union{Nothing,_GramSDP}}  # nothing for other blocks and unused ones
+  B::SparseMatrixCSC{Float64,Int}   # for the stable row recomputation
+  suspect::Vector{Int}              # columns recomputed in the last _gram!
+  fallback::Vector{Int}             # [1]: _gram! calls that recomputed rows, cumulative
 end
 
-# Largest dense W·B (bytes) the fallback of _gram! forms.
-const _GRAM_FALLBACK_BYTES = 2^30
+# Bound on the dense temporaries the kernel streams through (bytes): the
+# chunks of W_B B_B for second-order-cone and dense blocks, and of W·B for
+# the stable recomputation of suspect rows. A Ref so that tests can force
+# several chunks on small problems.
+const _GRAM_WORKSPACE_BYTES = Ref(2^28)
+
+# Columns per chunk when `nbuf` dense buffers of `rows` rows must fit the
+# workspace (at least one column, whatever the workspace).
+_gram_chunk(rows, nbuf) = max(1, _GRAM_WORKSPACE_BYTES[] ÷ (8 * nbuf * max(rows, 1)))
+
+# Storage the kernel needs beyond its output and the data: the six order-k
+# workspaces of each semidefinite block (an upper bound: unused blocks
+# allocate none), the sparse product of a diagonal block (at most ncol²
+# entries), and the streamed chunks, which never exceed the workspace (or
+# one column of the largest row count, when that alone is larger).
+function _gram_bytes(m, ncol, cone_dims)
+  ws = 8 * 6 * sum((ord(1:d)^2 for (t, d) in cone_dims if t == "S"); init = 0)
+  stream = min(32 * m * ncol, max(_GRAM_WORKSPACE_BYTES[], 32 * m))
+  return ws + 16 * ncol^2 + stream
+end
 
 # Packed (vecm) coordinate c of an order-k block ↦ (a, b), a ≤ b: row-major
 # upper triangle, the order `vecm` writes.
@@ -93,7 +115,7 @@ function _gram_plan(B::SparseMatrixCSC, cone_dims)
     end
     cols = findall(touched)
     push!(blocks, _GramBlock(I, cols, B[I, cols]))
-    if btype == "S"
+    if btype == "S" && !isempty(cols)
       k = ord(1:dim)
       (ia, ib) = _packed_pairs(k)
       push!(sdp, _GramSDP(k, ia, ib, zeros(k, k), zeros(k, k), zeros(k, k), zeros(k, k),
@@ -102,7 +124,7 @@ function _gram_plan(B::SparseMatrixCSC, cone_dims)
       push!(sdp, nothing)
     end
   end
-  return GramPlan(size(B, 2), blocks, sdp, B, [0], [0])
+  return GramPlan(size(B, 2), blocks, sdp, B, Int[], [0])
 end
 
 """
@@ -115,23 +137,47 @@ so `M` is exactly symmetric.
 The trace form expands each semidefinite entry into products of entries of
 T = RRᵀ, which can cancel catastrophically when the scaling is badly
 conditioned (a true 1e-16 came out as 0, or as −7e-16 with Nesterov-Todd
-scalings). Every diagonal entry whose terms cancel beyond what rounding
-allows is recomputed stably as ‖RᵀGᵢR‖²; if that disagrees with the trace
-form, the off-diagonals of its row cannot be trusted either, and `M` is
-recomputed as the dense (WB)ᵀ(WB) when W·B fits in
-`_GRAM_FALLBACK_BYTES` (otherwise the stable diagonals are kept).
+scalings), and can overflow to a non-finite value where the product itself
+is representable (R = 1e100 against a coefficient 1e-200). Every diagonal
+entry whose terms cancel beyond what rounding allows, or that is not
+finite, is recomputed stably as ‖RᵀGᵢR‖²; if that disagrees with the trace
+form, the off-diagonals of its row cannot be trusted either. Those rows,
+and those of any column with a non-finite entry, are then recomputed as
+(WBᵢ)ᵀ(WB) from the scaled products themselves, streamed a chunk of
+columns at a time within `_GRAM_WORKSPACE_BYTES`. The row and column
+lists of the last call are in `plan.suspect`.
 """
 function _gram!(M::Matrix{Float64}, plan::GramPlan, W::Block)
-  plan.suspect[1] = 0
+  sus = plan.suspect
+  empty!(sus)
   _gram_trace!(M, plan, W)
-  if plan.suspect[1] > 0 && 8 * size(plan.B, 1) * plan.ncol <= _GRAM_FALLBACK_BYTES
-    Y = W * Matrix(plan.B)
-    mul!(M, Y', Y)
-    n = size(M, 1)
-    @inbounds for j = 1:n, i = j+1:n          # exact symmetry
-      M[i, j] = M[j, i]
-    end
+  n = size(M, 1)
+  @inbounds for j = 1:n, i = 1:j
+    isfinite(M[i, j]) || (push!(sus, i); push!(sus, j))
+  end
+  if !isempty(sus)
+    unique!(sort!(sus))
+    _gram_rows!(M, plan, W, sus)
     plan.fallback[1] += 1
+  end
+  return M
+end
+
+# Overwrite rows and columns `rows` of M with (W B[:, i])ᵀ (W B[:, j]),
+# formed from dense chunks of W·B within the workspace (four buffers of
+# size(B, 1) rows each).
+function _gram_rows!(M, plan::GramPlan, W::Block, rows)
+  B = plan.B
+  c = _gram_chunk(size(B, 1), 4)
+  for I in Iterators.partition(rows, c)
+    YI = W * Matrix(B[:, I])
+    for J in Iterators.partition(1:plan.ncol, c)
+      YJ = W * Matrix(B[:, J])
+      S = YI' * YJ
+      @inbounds for (jj, j) in enumerate(J), (ii, i) in enumerate(I)
+        M[i, j] = S[ii, jj]; M[j, i] = S[ii, jj]
+      end
+    end
   end
   return M
 end
@@ -144,7 +190,7 @@ function _gram_trace!(M::Matrix{Float64}, plan::GramPlan, W::Block)
     if Blk isa DiagBlock
       _gram_diag!(M, gb, Blk.diag)
     elseif Blk isa VecCongurance
-      plan.suspect[1] += _gram_sdp!(M, gb, plan.sdp[bi], Blk.R)
+      _gram_sdp!(M, gb, plan.sdp[bi], Blk.R, plan.suspect)
     else
       _gram_dense!(M, gb, Blk)
     end
@@ -169,23 +215,49 @@ function _gram_diag!(M, gb::_GramBlock, w)
 end
 
 # Any other block (second-order cone SymWoodbury, dense Matrix): Y = W_B B_B
-# densely, then YᵀY.
+# and YᵀY, a chunk of c columns at a time with three dense buffers of c
+# columns (Y for the row chunk, Y and one column of B_B for the other)
+# allocated once, so that they stay within the workspace even for a cone of
+# millions of rows touching many columns. Each pair of chunks recomputes the
+# second chunk's Y: O(nc/c) applications of W_B per column instead of one.
 function _gram_dense!(M, gb::_GramBlock, Blk)
-  X = Matrix(gb.Bs)
-  Y = similar(X)
-  for j in axes(X, 2)
-    _blk_mul!(view(Y, :, j), Blk, view(X, :, j), false)
-  end
-  S = Y' * Y
-  cols = gb.cols
-  @inbounds for jl in axes(S, 2), il = 1:jl
-    M[cols[il], cols[jl]] += S[il, jl]
+  cols = gb.cols; nc = length(cols); d = length(gb.I); Bs = gb.Bs
+  c = min(nc, _gram_chunk(d, 3))
+  YI = zeros(d, c); YJ = zeros(d, c); x = zeros(d); S = zeros(c, c)
+  for I0 = 1:c:nc
+    ni = min(c, nc - I0 + 1)
+    _gram_apply!(YI, x, Blk, Bs, I0, ni)
+    for J0 = I0:c:nc
+      nj = min(c, nc - J0 + 1)
+      J0 == I0 || _gram_apply!(YJ, x, Blk, Bs, J0, nj)
+      Yj = J0 == I0 ? YI : YJ
+      Sv = view(S, 1:ni, 1:nj)
+      mul!(Sv, view(YI, :, 1:ni)', view(Yj, :, 1:nj))
+      @inbounds for jj = 1:nj, ii = 1:ni
+        il = I0 + ii - 1; jl = J0 + jj - 1
+        il <= jl && (M[cols[il], cols[jl]] += Sv[ii, jj])
+      end
+    end
   end
   return M
 end
 
-# Semidefinite block, W: X ↦ RᵀXR, T = RRᵀ.
-function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
+# Y[:, 1:nj] = W_B B_B[:, J0:J0+nj−1], one column at a time through `x`.
+function _gram_apply!(Y, x, Blk, Bs, J0, nj)
+  rv = rowvals(Bs); nz = nonzeros(Bs)
+  for jj = 1:nj
+    fill!(x, 0.0)
+    @inbounds for t in nzrange(Bs, J0 + jj - 1)
+      x[rv[t]] = nz[t]
+    end
+    _blk_mul!(view(Y, :, jj), Blk, x, false)
+  end
+  return Y
+end
+
+# Semidefinite block, W: X ↦ RᵀXR, T = RRᵀ. Columns whose diagonal fails
+# the cancellation check are pushed onto `sus`.
+function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R, sus)
   k = ws.k; T = ws.T; Wb = ws.Wb; Gb = ws.Gb
   ia = ws.ia; ib = ws.ib
   mul!(T, R, R')
@@ -201,7 +273,6 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
   # A diagonal whose terms add up to less than τ times their magnitude may
   # have lost more than ~1e-6 of its value to rounding.
   τ = 1e6 * eps()
-  nsuspect = 0
   for il = 1:nc
     rng = nzrange(Bs, il)
     q = length(rng)
@@ -229,9 +300,10 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
             jl == il && (mag += 2 * abs(gs * gt) * (abs(u) + abs(v)))
           end
         end
-        if jl == il && acc <= τ * mag
+        # (Written as a negation so that a NaN accumulation is caught.)
+        if jl == il && !(acc > τ * mag)
           (acc, bad) = _gram_sdp_diag(ws, Bs, rng, acc)
-          nsuspect += bad
+          bad && push!(sus, cols[il])
         end
         M[cols[il], cols[jl]] += acc
       end
@@ -279,14 +351,14 @@ function _gram_sdp!(M, gb::_GramBlock, ws::_GramSDP, R)
         ct = rv[t]; a = ia[ct]; b = ib[ct]
         acc += nz[t] * (a == b ? Wb[a, a] : s2 * Wb[a, b])
       end
-      if jl == il && acc <= τ * mag
+      if jl == il && !(acc > τ * mag)
         (acc, bad) = _gram_sdp_diag(ws, Bs, rng, acc)
-        nsuspect += bad
+        bad && push!(sus, cols[il])
       end
       M[cols[il], cols[jl]] += acc
     end
   end
-  return nsuspect
+  return M
 end
 
 # The diagonal contribution ‖RᵀGᵢR‖_F² of a column (vecm is an isometry),
@@ -321,9 +393,9 @@ function _gram_sdp_diag(ws::_GramSDP, Bs, rng, d)
   end
   ds = sum(abs2, Z)
   ws.stats[4] += 1
-  bad = abs(d - ds) > 1e-6 * ds
+  bad = !(abs(d - ds) <= 1e-6 * ds)       # NaN or Inf on either side: bad
   ws.stats[5] += bad
-  return (ds, Int(bad))
+  return (ds, bad)
 end
 
 # ──────────────────────────────────────────────────────────────
@@ -453,24 +525,32 @@ sdpschur_eligible(Q, A, G, cone_dims) =
 _split_eligible(sp, n, p) =
   sp !== nothing && (sp.pure || 2 * (length(sp.R) + p + length(sp.K)) <= n)
 
-# Dense storage of kktsolver_sdpschur for a split: in standard form the
-# p×p Schur matrix (sdpschur_bytes); in mixed form the N×N reduced matrix,
-# its equilibrated copy and Bunch-Kaufman factor, plus the Gram outputs.
-function _sdpschur_bytes(sp, p)
-  sp.pure && return sdpschur_bytes(p)
+# Peak dense storage of kktsolver_sdpschur for a split, m cone rows and p
+# equality rows. Standard form: the p×p Schur matrix with its equilibrated
+# copy and Cholesky factor (sdpschur_bytes) and one Gram plan's workspace
+# (_gram_bytes). Mixed form: the N×N reduced matrix, its equilibrated copy
+# and Bunch-Kaufman factor, the two Gram outputs, the dense constant blocks
+# C_R and Q_RR, and two Gram plans' workspaces (one active at a time for
+# the streamed chunks, both holding their order-k buffers). The residual
+# fallback to kktsolver_qr is taken only when the dense path fits the same
+# budget on its own, and is not counted here.
+function _sdpschur_bytes(sp, p, m, cone_dims)
+  sp.pure && return sdpschur_bytes(p) + _gram_bytes(m, p, cone_dims)
   nR = length(sp.R); nu = p + length(sp.K); N = nR + nu
-  return 8 * (3N^2 + nu^2 + nR^2 + nu * nR)
+  ws = _gram_bytes(m, max(nu, nR), cone_dims)
+  return 8 * (3N^2 + nu^2 + 2nR^2 + nu * nR) + ws + _gram_bytes(0, 0, cone_dims)
 end
 
 # Eligible, and its dense storage fits `budget`: the default router's test.
 function _sdpschur_fits(Q, A, G, cone_dims, budget)
   sp = _schur_split(Q, A, cone_dims)
   _split_eligible(sp, size(A, 2), size(G, 1)) || return false
-  return _sdpschur_bytes(sp, size(G, 1)) <= budget
+  return _sdpschur_bytes(sp, size(G, 1), size(A, 1), cone_dims) <= budget
 end
 
 """
-    kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
+    kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0,
+                       dense_bytes_max = 4 * 2^30)
 
 KKT solver for conic programs with PSD *variables* (see
 [`sdpschur_eligible`](@ref)), which eliminates the cone variables exactly.
@@ -505,32 +585,56 @@ enters only equality rows, and `C_S` can lose rank (an equality row on
 Bunch-Kaufman, which needs only nonsingularity, at (n_R + p + m_K)³/3
 flops.
 
-Both matrices are equilibrated to unit diagonal (`D M D`,
-`D = |diag|^(-1/2)`, entries with a zero diagonal left unscaled) before
-they are factored, so rows that are merely small — a constraint along a
-direction the scaling shrinks — are not mistaken for dependent ones.
-`static_reg = δ` regularizes on that scale: on the dual side,
-`M + δ·diag(M)` (and the `u` block alike), and on the remaining variables
-`H_R + δ·diag(H_R)`; a primal shift on `y_S` would destroy the explicit
-inverse. Either way the factorization is a preconditioner whose error
-`conicIP`'s refinement removes. A factorization that fails, or has a
-pivot below `1e-14` on the unit diagonal (dependent rows that rounding let
-through), is retried once with a shift of `1e-12` on that scale (primal
-side positive, dual side negative), and otherwise raises (an `:Error`
-status from `conicIP`).
+Both matrices are equilibrated before they are factored, so rows that are
+merely small — a constraint along a direction the scaling shrinks — are not
+mistaken for dependent ones: the positive definite standard-form `M` to
+unit diagonal (`D M D`, `D = diag(M)^(-1/2)`), the indefinite mixed-form
+matrix to unit max-norm rows by symmetric Ruiz sweeps, which also scales a
+row with a zero diagonal by its couplings. `static_reg = δ` is
+dimensionless and regularizes on that scale: on the dual side,
+`M + δ·(scale)` (and the `u` block alike), and on the remaining variables;
+a primal shift on `y_S` would destroy the explicit inverse. A factorization
+that fails, or has a pivot below `1e-14` on that scale (dependent rows that
+rounding let through), is retried once with a shift of `1e-12` (primal side
+positive, dual side negative).
+
+Forming the reduced matrix squares the scaling's conditioning, and some
+losses no shift recovers (two independent equality rows whose Schur rows
+agree to 1e-16 collapse to one). So every solve is checked against the
+original 3×3 system: its residual must be below `1e-9` relative to the
+right-hand side, the measure `conicIP`'s refinement uses. A miss is refined with the Schur
+factorization up to twice; if it still misses, or the factorization
+failed, that factorization is handed to [`kktsolver_qr`](@ref) on the same
+data, provided the dense path fits `dense_bytes_max` on its own (and
+`p ≤ n`). Without that fallback the best Schur solve is returned (or the
+factorization failure raised, an `:Error` status from `conicIP`), and
+`conicIP`'s own refinement and termination tests judge it. The returned
+generator counts internal refinements, dense fallbacks, and unresolved
+solves in its `stats` field.
 
 Called directly, the solver accepts any problem with an eliminable
 semidefinite block, whatever the size of the reduced system; the default
 router applies the size test of [`sdpschur_eligible`](@ref).
 """
-function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
+function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0,
+                            dense_bytes_max = _DENSE_BYTES_MAX)
 
   sp = _schur_split(Q, A, cone_dims)
   sp === nothing && throw(ArgumentError(
     "kktsolver_sdpschur needs a semidefinite block whose rows each hold one " *
     "variable, on variables with no quadratic objective term (a PSD variable); " *
     "see sdpschur_eligible"))
-  sp.pure || return _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = static_reg)
+  gen = sp.pure ? _sdpschur_pure(Q, A, G, cone_dims, sp; static_reg = static_reg) :
+                  _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = static_reg)
+  return _schur_checked(gen, Q, A, G, cone_dims; static_reg = static_reg,
+                        dense_bytes_max = dense_bytes_max)
+
+end
+
+# Standard form: the p×p equality Schur complement (see kktsolver_sdpschur).
+# Returns the raw solve3x3gen(F, F⁻ᵀ, pt).
+function _sdpschur_pure(Q, A, G, cone_dims, sp; static_reg = 0.0)
+
   n = size(A, 2); m = size(A, 1); p = size(G, 1)
   # Column j is the coordinate of row r[j], with coefficient a[j].
   r = zeros(Int, n); a = zeros(n)
@@ -600,7 +704,7 @@ function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0)
 
   end
 
-  return DenseKKTGen(solve3x3gen, nothing)
+  return solve3x3gen
 
 end
 
@@ -612,15 +716,40 @@ function _bk_minpivot(f)
   N = size(D, 1); μ = Inf; i = 1
   while i <= N
     if i < N && D.du[i] != 0
-      a = D.d[i]; b = D.du[i]; c = D.d[i+1]
+      # On the block scaled to unit max entry, so that det = ac − b² can
+      # neither overflow nor underflow; the result is scaled back.
+      s = max(abs(D.d[i]), abs(D.du[i]), abs(D.d[i+1]))
+      a = D.d[i] / s; b = D.du[i] / s; c = D.d[i+1] / s
       ρ = abs((a + c) / 2) + hypot((a - c) / 2, b)    # larger |λ|
-      μ = min(μ, ρ == 0 ? 0.0 : abs(a * c - b * b) / ρ)
+      μ = min(μ, ρ == 0 ? 0.0 : s * (abs(a * c - b * b) / ρ))
       i += 2
     else
       μ = min(μ, abs(D.d[i])); i += 1
     end
   end
   return μ
+end
+
+# Symmetric equilibration of K in the max norm (Ruiz): d such that every
+# nonzero row of Diag(d) K Diag(d) has its largest |entry| within 10 % of 1.
+# Each sweep divides dᵢ by the square root of row i's current maximum,
+# which halves that maximum's exponent, so an imbalance of 10ᵖ needs
+# about log₂ p sweeps; zero rows keep dᵢ = 1. `r` is a work vector.
+function _ruiz_sym!(d, r, K; sweeps = 30, tol = 0.1)
+  N = size(K, 1)
+  fill!(d, 1.0)
+  for _ = 1:sweeps
+    fill!(r, 0.0)
+    @inbounds for j = 1:N, i = 1:N
+      v = abs(d[i] * K[i, j] * d[j])
+      v > r[i] && (r[i] = v)
+    end
+    all(x -> x == 0 || abs(x - 1) <= tol, r) && break
+    @inbounds for i = 1:N
+      r[i] > 0 && isfinite(r[i]) && (d[i] /= sqrt(r[i]))
+    end
+  end
+  return d
 end
 
 # Mixed form: eliminate the cone variables y_S only (see kktsolver_sdpschur).
@@ -660,7 +789,7 @@ function _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = 0.0)
   QR = Matrix{Float64}(sparse(Q)[Rc, Rc])
 
   Mu = zeros(nu, nu); HR = zeros(nR, nR); Kred = zeros(N, N)
-  Ks = zeros(N, N); dsc = zeros(N)
+  Ks = zeros(N, N); dsc = zeros(N); rsc = zeros(N)
   tm = zeros(m); tm2 = zeros(m); tm3 = zeros(m)
   iR = 1:nR; iu = nR+1:N
 
@@ -676,11 +805,13 @@ function _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = 0.0)
       Kred[iu, iu] .= .-Mu
     end
     fact = @phase pt t_kkt_factor begin
-      # Equilibrate to unit |diagonal| (see kktsolver_sdpschur), then
-      # factor; the pivot test and the shifts act on that scale.
-      @inbounds for i = 1:N
-        dsc[i] = Kred[i, i] != 0 ? 1 / sqrt(abs(Kred[i, i])) : 1.0
-      end
+      # Equilibrate symmetrically to unit max-norm rows (Ruiz), then
+      # factor; the pivot test and the shifts act on that scale. A row
+      # with a zero diagonal (an equality on the remaining variables alone)
+      # is scaled by its couplings, which a diagonal scaling cannot do:
+      # [1e16 1; 1 0] scaled by its diagonal is [1 1e-8; 1e-8 0], whose
+      # small pivot is no dependence.
+      _ruiz_sym!(dsc, rsc, Kred)
       @inbounds for j = 1:N, i = 1:N
         Ks[i, j] = dsc[i] * Kred[i, j] * dsc[j]
       end
@@ -736,6 +867,109 @@ function _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = 0.0)
 
   end
 
-  return DenseKKTGen(solve3x3gen, nothing)
+  return solve3x3gen
+
+end
+
+# ──────────────────────────────────────────────────────────────
+#  Residual check and dense fallback
+# ──────────────────────────────────────────────────────────────
+
+# Target for the 3×3 residual of a Schur solve, relative to the size of the
+# terms it balances (see _schur_checked).
+const _SCHUR_RESID_TOL = 1e-9
+
+# Residual of (y, w, v) in the 3×3 system
+#   [Q Gᵀ −Aᵀ; G 0 0; A 0 FᵀF] (y, w, v) = (bx, by, bz),
+# relative to the right-hand side — the measure conicIP's refinement uses.
+# (Not relative to the norms of the terms: a wrong solve with huge,
+# cancelling multipliers inflates those and passes. Two equality rows whose
+# Schur rows agree to 1e-16 gave w ~ 1e12 and a residual of 0.7, which is
+# 4e-13 of the terms but 0.7 of the right-hand side.) Returns the residual
+# blocks too; a zero right-hand side is met only exactly.
+function _kkt3_resid(Q, A, At, G, Gt, F, bx, by, bz, y, w, v, t1, t2)
+  mul!(t2, F, v); mul_adjoint!(t1, F, t2)              # FᵀF v
+  r1 = Q * y + Gt * w - At * v - bx
+  r2 = G * y - by
+  r3 = A * y + t1 - bz
+  res = sqrt(sum(abs2, r1) + sum(abs2, r2) + sum(abs2, r3))
+  nb = sqrt(sum(abs2, bx) + sum(abs2, by) + sum(abs2, bz))
+  return (nb > 0 ? res / nb : (res == 0 ? 0.0 : Inf), r1, r2, r3)
+end
+
+# Wrap a Schur solve3x3gen with an accuracy guarantee on the original 3×3
+# system. Eliminating the cone variables squares the scaling's conditioning
+# in the reduced matrix, and some losses no shift or refinement recovers:
+# two independent equality rows whose Schur rows differ by 1e-16 relative
+# (correlated directions) collapse to one, or a regularized row stops
+# constraining. So every solve is checked against the original system
+# (_kkt3_resid ≤ _SCHUR_RESID_TOL) and refined with the Schur factorization
+# up to twice, keeping the best iterate; if it still misses, or the Schur
+# factorization fails outright, that factorization is handed to
+# kktsolver_qr on the same data — when the dense path fits
+# `dense_bytes_max` on its own (and p ≤ n). Otherwise the best Schur solve
+# is returned and counted, and conicIP's own refinement and termination
+# tests see its residual. Counters in `stats` (see DenseKKTGen).
+function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
+                        dense_bytes_max = _DENSE_BYTES_MAX)
+  n = size(A, 2); m = size(A, 1); p = size(G, 1)
+  Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
+  At = sparse(As'); Gt = sparse(Gs')
+  qr_ok = p <= n && dense_kkt_bytes(n, m, p) <= dense_bytes_max
+  qrgen = Ref{Any}(nothing)
+  stats = zeros(Int, 3)
+  t1 = zeros(m); t2 = zeros(m)
+
+  # kktsolver_qr on the same data, built on first need; static_reg is
+  # absolute there, as conicIP applies it to the other solvers.
+  function qr_gen()
+    if qrgen[] === nothing
+      δ = static_reg * (1 + norm(Qs, Inf))
+      qrgen[] = kktsolver_qr(δ == 0 ? Qs : Qs + δ * I, As, Gs, cone_dims)
+    end
+    return qrgen[]
+  end
+
+  function solve3x3gen(F, F⁻ᵀ, pt = nothing)
+    s3 = try
+      gen(F, F⁻ᵀ, pt)
+    catch err
+      (err isa KKT_FAILURES && qr_ok) || rethrow()
+      nothing
+    end
+    qs = Ref{Any}(nothing)           # this factorization's dense fallback
+    function dense()
+      if qs[] === nothing
+        stats[2] += 1
+        qs[] = qr_gen().gen(F, F⁻ᵀ, pt)
+      end
+      return qs[]
+    end
+    s3 === nothing && dense()
+
+    function solve3x3(bx, by, bz)
+      qs[] === nothing || return qs[](bx, by, bz)
+      (y, w, v) = s3(bx, by, bz)
+      (ρ, r1, r2, r3) = _kkt3_resid(Qs, As, At, Gs, Gt, F, bx, by, bz, y, w, v, t1, t2)
+      for _ = 1:2
+        ρ <= _SCHUR_RESID_TOL && return (y, w, v)
+        stats[1] += 1
+        (dy, dw, dv) = s3(r1, r2, r3)
+        (y2, w2, v2) = (y - dy, w - dw, v - dv)
+        (ρ2, q1, q2, q3) = _kkt3_resid(Qs, As, At, Gs, Gt, F, bx, by, bz, y2, w2, v2, t1, t2)
+        ρ2 < ρ || break                  # no progress: keep the best
+        (y, w, v, ρ, r1, r2, r3) = (y2, w2, v2, ρ2, q1, q2, q3)
+      end
+      ρ <= _SCHUR_RESID_TOL && return (y, w, v)
+      qr_ok && return dense()(bx, by, bz)
+      stats[3] += 1
+      return (y, w, v)
+    end
+
+    return solve3x3
+
+  end
+
+  return DenseKKTGen(solve3x3gen, nothing, stats)
 
 end
