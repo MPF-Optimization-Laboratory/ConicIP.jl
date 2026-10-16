@@ -882,11 +882,21 @@ end
         F = C.Block([C.VecCongurance(100 * Matrix(1.0I, 2, 2)), Diagonal([1.0])])
         Fi = C.Block([inv(F[1])', Diagonal([1.0])])
         b = ([1.0, 2, 3, 0], zeros(0), [0.01, 0.1, 0.3, 0])
-        g = C.kktsolver_sdpschur(Q, A, G, cd; static_reg = 1e-8)
-        sol = g(F, Fi)(b...)
         ref = C.kktsolver_qr(Q, A, G, cd)(F, Fi)(b...)        # unregularized
-        @test sol[1] ≈ ref[1] rtol = 1e-6
-        @test resid3(Q, A, G, F, b, sol) <= 1e-6
+        # A zero target forces the dense comparison on every solve.
+        saved = C._SCHUR_RESID_TOL[]
+        try
+            C._SCHUR_RESID_TOL[] = 0.0
+            g = C.kktsolver_sdpschur(Q, A, G, cd; static_reg = 1e-8)
+            sol = g(F, Fi)(b...)
+            @test g.stats[2] == 1                             # the dense path ran
+            @test sol[1] ≈ ref[1] rtol = 1e-6                  # …and lost
+            @test resid3(Q, A, G, F, b, sol) <= 1e-6
+            dense = C.kktsolver_qr(Q + 1e-8 * (1 + 1e12) * I, A, G, cd)(F, Fi)(b...)
+            @test resid3(Q, A, G, F, b, dense) > 0.1            # (it was much worse)
+        finally
+            C._SCHUR_RESID_TOL[] = saved
+        end
     end
 
     @testset "third review: a large legitimate solution is accepted" begin
@@ -953,5 +963,117 @@ end
         @test bytes <= C._gram_bytes(m, nc, cd)
         Y = W * Matrix(B)
         @test M ≈ Y' * Y rtol = 1e-12
+    end
+
+    # ── Fourth review pass (2026-10-16) ─────────────────────────────────
+
+    @testset "fourth review: one bad attempt does not disable later recovery" begin
+        # Correlated equality rows. A forced, non-improving dense attempt in
+        # one factorization used to switch the fallback off for good, so a
+        # later scaling that needed it got 1.5e-4 for 1.
+        A = sparse(1.0I, 3, 3); Q = spzeros(3, 3); G = sparse([1.0 0 0; 1 0 1]); cd = [("S", 3)]
+        g = C.kktsolver_sdpschur(Q, A, G, cd)
+        Fh = C.Block([C.VecCongurance(Matrix(1.0I, 2, 2))])
+        saved = C._SCHUR_RESID_TOL[]
+        try
+            C._SCHUR_RESID_TOL[] = 0.0
+            s1 = g(Fh, Fh)
+            s1(randn(3), randn(2), randn(3)); s1(randn(3), randn(2), randn(3))
+        finally
+            C._SCHUR_RESID_TOL[] = saved
+        end
+        @test g.stats[2] == 1 && g.stats[4] == 1          # tried once, not retried
+        F2 = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))])
+        sol = g(F2, inv(F2)')(zeros(3), [0.0, 1.0], zeros(3))
+        @test sol[1] ≈ [0.0, 0.0, 1.0] atol = 1e-12
+        @test g.stats[2] == 2
+        # After _SCHUR_DENSE_TRIES non-improving factorizations it stays off.
+        # (A forced target of 0 rejects a dense attempt unless the Schur
+        # residual is exactly 0, which identity scaling sometimes gives, so
+        # loop until enough rejections have been counted.)
+        try
+            C._SCHUR_RESID_TOL[] = 0.0
+            tries = 0
+            while g.stats[4] < C._SCHUR_DENSE_TRIES && tries < 100
+                g(Fh, Fh)(randn(3), randn(2), randn(3)); tries += 1
+            end
+        finally
+            C._SCHUR_RESID_TOL[] = saved
+        end
+        @test g.stats[4] == C._SCHUR_DENSE_TRIES
+        n2 = g.stats[2]
+        g(F2, inv(F2)')(zeros(3), [0.0, 1.0], zeros(3))
+        @test g.stats[2] == n2
+    end
+
+    @testset "fourth review: the residual is overflow-safe at 1e308" begin
+        # A sum of safe norms overflowed to Inf and the ratio read as 0: a
+        # solve 1e-8 off (staticReg) was accepted without refinement.
+        A1 = sparse(reshape([1.0], 1, 1)); cd1 = [("S", 1)]
+        F1 = C.Block([C.VecCongurance(fill(1.0, 1, 1))])
+        g = C.kktsolver_sdpschur(spzeros(1, 1), A1, A1, cd1; static_reg = 1e-8)
+        sol = g(F1, F1)(zeros(1), [1e308], zeros(1))
+        @test sol[1][1] ≈ 1e308 rtol = 1e-12
+        @test g.stats[1] >= 1                              # it was refined
+    end
+
+    @testset "fourth review: cancellation in G y is not a failure" begin
+        # G = [1 √2 0] against a 1e8 solution: ‖G y‖ is small after
+        # cancellation, ‖|G||y|‖ is not. Judged by the operands, the Schur
+        # solve is accepted and no dense factorization is built.
+        A = sparse(1.0I, 3, 3); Q = spzeros(3, 3); G = sparse([1.0 sqrt(2.0) 0]); cd = [("S", 3)]
+        F = C.Block([C.VecCongurance(100 * Matrix(1.0I, 2, 2))]); Fi = C.Block([inv(F[1])'])
+        b = ([1.0, -1 / sqrt(2.0), 0], [1.0], zeros(3))
+        g = C.kktsolver_sdpschur(Q, A, G, cd)
+        sol = g(F, Fi)(b...)
+        @test g.stats[2] == 0 && g.stats[3] == 0
+        ref = C.kktsolver_qr(Q, A, G, cd)(F, Fi)(b...)
+        @test sol[1] ≈ ref[1] rtol = 1e-8
+    end
+
+    @testset "fourth review: PSD recovery stays within its estimate" begin
+        # An order-80 block with the leading-block cancellation: recovery
+        # applies the congruence column by column, with mat(x), RᵀX and RᵀXR
+        # live beside the resident workspaces.
+        k = 80; m = div(k * (k + 1), 2); cd = [("S", m)]
+        R = Matrix(1.0I, k, k); R[1:2, 1:2] = [1 0; 1 1e-4]
+        J = zeros(k, k); J[1:2, 1:2] = [1 -1; -1 1]
+        B = sparse(reshape(C.vecm(J), :, 1))
+        W = C.Block([C.VecCongurance(R)])
+        plan = C._gram_plan(B, cd); M = zeros(1, 1)
+        C._gram!(M, plan, W)
+        bytes = @allocated C._gram!(M, plan, W)
+        @test plan.suspect == [1]
+        @test bytes <= C._gram_bytes(m, 1, cd)
+        wb = W * C.vecm(J)
+        @test M[1] ≈ dot(wb, wb) rtol = 1e-10
+    end
+
+    @testset "fourth review: subnormal results are correctly rounded" begin
+        u = nextfloat(0.0); o = zeros(3)
+        exact(x, a, b) = Float64(big(x) / ((big(a) + big(b)) / 2))
+        for (x, a, b) in ((u, prevfloat(2.0), 2.0), (u, 1.0, 1.0), (u, u, 2u),
+                          (2.0^-52, prevfloat(2.0^1023), 2.0^1023), (3u, 1.5, 1.5),
+                          (1.0, 3.0, 5.0), (floatmax(), 0.5, 0.5))
+            C.dsdc_diag!([0.0, x, 0.0], [a, 0.0, b], o)
+            @test o[2] === exact(x, a, b)
+        end
+        λ = C.vecm(Matrix(Diagonal(rand(8) .+ 1))); xv = randn(length(λ)); ov = similar(xv)
+        C.dsdc_diag!(xv, λ, ov)
+        @test (@allocated C.dsdc_diag!(xv, λ, ov)) == 0
+    end
+
+    @testset "fourth review: misses of dense directions are counted" begin
+        # The Schur assembly overflows (R = 1e80), so the dense path alone
+        # solves; its direction is checked and a miss counted like any other.
+        A1 = sparse(reshape([1.0], 1, 1)); cd1 = [("S", 1)]
+        F = C.Block([C.VecCongurance(fill(1e80, 1, 1))]); Fi = C.Block([inv(F[1])'])
+        g = C.kktsolver_sdpschur(spzeros(1, 1), A1, A1, cd1)
+        sol = g(F, Fi)(zeros(1), [1.0], zeros(1))
+        @test sol[1][1] ≈ 1.0 rtol = 1e-12
+        @test g.stats[2] == 1
+        ρ = C._kkt3_resid(spzeros(1, 1), A1, A1, A1, A1, spzeros(1, 1), A1, A1, A1, A1, F,
+                          zeros(1), [1.0], zeros(1), sol..., zeros(1), zeros(1))[1]
+        @test g.stats[3] == (ρ <= C._SCHUR_RESID_TOL[] ? 0 : 1)
     end
 end
