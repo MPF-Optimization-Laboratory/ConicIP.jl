@@ -2,8 +2,17 @@ name: CI
 on:
   push:
     branches: [master]
+    paths-ignore: ['docs/**', 'README.md', '**/*.md', 'LICENSE', '.github/ISSUE_TEMPLATE/**']
   pull_request:
     branches: [master]
+    paths-ignore: ['docs/**', 'README.md', '**/*.md', 'LICENSE', '.github/ISSUE_TEMPLATE/**']
+
+# Cancel superseded runs on branches and PRs; let master runs finish so every
+# merge commit keeps its own status.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
