@@ -164,22 +164,42 @@ function _gram!(M::Matrix{Float64}, plan::GramPlan, W::Block)
 end
 
 # Overwrite rows and columns `rows` of M with (W B[:, i])ᵀ (W B[:, j]),
-# formed from dense chunks of W·B within the workspace (four buffers of
-# size(B, 1) rows each).
+# formed from chunks of W·B within the workspace: two dense buffers of
+# size(B, 1) rows and c columns, allocated once, filled one column at a
+# time by the in-place block product (allocation-free on diagonal and
+# second-order-cone blocks, O(k²) temporaries on a semidefinite one).
 function _gram_rows!(M, plan::GramPlan, W::Block, rows)
-  B = plan.B
-  c = _gram_chunk(size(B, 1), 4)
+  B = plan.B; m = size(B, 1); n = plan.ncol
+  c = min(max(length(rows), 1), _gram_chunk(m, 3))
+  YI = zeros(m, c); YJ = zeros(m, c); x = zeros(m); S = zeros(c, c)
   for I in Iterators.partition(rows, c)
-    YI = W * Matrix(B[:, I])
-    for J in Iterators.partition(1:plan.ncol, c)
-      YJ = W * Matrix(B[:, J])
-      S = YI' * YJ
-      @inbounds for (jj, j) in enumerate(J), (ii, i) in enumerate(I)
-        M[i, j] = S[ii, jj]; M[j, i] = S[ii, jj]
+    ni = length(I)
+    _gram_wcols!(YI, x, W, B, I)
+    for J0 = 1:c:n
+      nj = min(c, n - J0 + 1)
+      _gram_wcols!(YJ, x, W, B, J0:J0+nj-1)
+      Sv = view(S, 1:ni, 1:nj)
+      mul!(Sv, view(YI, :, 1:ni)', view(YJ, :, 1:nj))
+      @inbounds for jj = 1:nj, (ii, i) in enumerate(I)
+        j = J0 + jj - 1
+        M[i, j] = Sv[ii, jj]; M[j, i] = Sv[ii, jj]
       end
     end
   end
   return M
+end
+
+# Y[:, jj] = W B[:, J[jj]], through the dense column `x`.
+function _gram_wcols!(Y, x, W::Block, B, J)
+  rv = rowvals(B); nz = nonzeros(B)
+  for (jj, j) in enumerate(J)
+    fill!(x, 0.0)
+    @inbounds for t in nzrange(B, j)
+      x[rv[t]] = nz[t]
+    end
+    mul!(view(Y, :, jj), W, x)
+  end
+  return Y
 end
 
 function _gram_trace!(M::Matrix{Float64}, plan::GramPlan, W::Block)
@@ -601,16 +621,21 @@ positive, dual side negative).
 Forming the reduced matrix squares the scaling's conditioning, and some
 losses no shift recovers (two independent equality rows whose Schur rows
 agree to 1e-16 collapse to one). So every solve is checked against the
-original 3×3 system: its residual must be below `1e-9` relative to the
-right-hand side, the measure `conicIP`'s refinement uses. A miss is refined with the Schur
-factorization up to twice; if it still misses, or the factorization
-failed, that factorization is handed to [`kktsolver_qr`](@ref) on the same
-data, provided the dense path fits `dense_bytes_max` on its own (and
-`p ≤ n`). Without that fallback the best Schur solve is returned (or the
+original 3×3 system by its block-wise backward error (each row block's
+residual against the norms of that block's own terms, below `1e-10`),
+which a backward-stable solve meets however large its solution and a
+collapsed equality cannot hide behind large multipliers. A miss is refined
+with the Schur factorization up to twice; if it still misses, or the
+factorization failed, the right-hand side is also solved by
+[`kktsolver_qr`](@ref) on the same data — provided the dense path and the
+Schur storage fit `dense_bytes_max` together (and `p ≤ n`) — and the
+better of the two directions is returned. A dense attempt that fails or
+does not improve the residual tenfold switches the fallback off for the
+rest of the solve. Without it the best Schur solve is returned (or the
 factorization failure raised, an `:Error` status from `conicIP`), and
 `conicIP`'s own refinement and termination tests judge it. The returned
-generator counts internal refinements, dense fallbacks, and unresolved
-solves in its `stats` field.
+generator counts internal refinements, dense factorizations, unresolved
+solves, and rejected dense attempts in its `stats` field.
 
 Called directly, the solver accepts any problem with an eliminable
 semidefinite block, whatever the size of the reduced system; the default
@@ -627,7 +652,8 @@ function kktsolver_sdpschur(Q, A, G, cone_dims; static_reg = 0.0,
   gen = sp.pure ? _sdpschur_pure(Q, A, G, cone_dims, sp; static_reg = static_reg) :
                   _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = static_reg)
   return _schur_checked(gen, Q, A, G, cone_dims; static_reg = static_reg,
-                        dense_bytes_max = dense_bytes_max)
+                        dense_bytes_max = dense_bytes_max,
+                        schur_bytes = _sdpschur_bytes(sp, size(G, 1), size(A, 1), cone_dims))
 
 end
 
@@ -875,49 +901,68 @@ end
 #  Residual check and dense fallback
 # ──────────────────────────────────────────────────────────────
 
-# Target for the 3×3 residual of a Schur solve, relative to the size of the
-# terms it balances (see _schur_checked).
-const _SCHUR_RESID_TOL = 1e-9
+# Target for the block-wise backward error of a Schur solve (see
+# _kkt3_resid): about 5e5 ulps, far above what a backward-stable solve
+# leaves and far below the 1e-1..1 of the failures it exists to catch.
+const _SCHUR_RESID_TOL = 1e-10
 
-# Residual of (y, w, v) in the 3×3 system
-#   [Q Gᵀ −Aᵀ; G 0 0; A 0 FᵀF] (y, w, v) = (bx, by, bz),
-# relative to the right-hand side — the measure conicIP's refinement uses.
-# (Not relative to the norms of the terms: a wrong solve with huge,
-# cancelling multipliers inflates those and passes. Two equality rows whose
-# Schur rows agree to 1e-16 gave w ~ 1e12 and a residual of 0.7, which is
-# 4e-13 of the terms but 0.7 of the right-hand side.) Returns the residual
-# blocks too; a zero right-hand side is met only exactly.
+# Block-wise backward error of (y, w, v) in the 3×3 system
+#
+#   Q y + Gᵀw − Aᵀv = bx,   G y = by,   A y + FᵀF v = bz,
+#
+# the largest over the three row blocks of ‖rₖ‖ divided by the sum of the
+# norms of block k's own terms. A solve below it is the exact solution of
+# that system with each block row perturbed by that relative amount, which
+# is the most a backward-stable solver promises, whatever the conditioning
+# and however large the solution legitimately is. Normalizing by the whole
+# right-hand side instead forced fallbacks on such solves (a legitimate
+# 1e8 solution left 1e-8 of it after cancellation), and normalizing by the
+# terms of the whole system accepted wrong ones: a solve whose multipliers
+# blew up to 1e12 hid an equality violation of 0.7 behind their size. Per
+# block, the violated block is judged by its own terms. Norms are the
+# overflow- and underflow-safe `norm`, so scaling the system by 1e±170
+# does not change the verdict. Returns the residual blocks too.
 function _kkt3_resid(Q, A, At, G, Gt, F, bx, by, bz, y, w, v, t1, t2)
   mul!(t2, F, v); mul_adjoint!(t1, F, t2)              # FᵀF v
-  r1 = Q * y + Gt * w - At * v - bx
-  r2 = G * y - by
-  r3 = A * y + t1 - bz
-  res = sqrt(sum(abs2, r1) + sum(abs2, r2) + sum(abs2, r3))
-  nb = sqrt(sum(abs2, bx) + sum(abs2, by) + sum(abs2, bz))
-  return (nb > 0 ? res / nb : (res == 0 ? 0.0 : Inf), r1, r2, r3)
+  Qy = Q * y; Gw = Gt * w; Av = At * v
+  Gy = G * y; Ay = A * y
+  r1 = Qy + Gw - Av - bx
+  r2 = Gy - by
+  r3 = Ay + t1 - bz
+  ρ = max(_blk_ratio(norm(r1), norm(Qy) + norm(Gw) + norm(Av) + norm(bx)),
+          _blk_ratio(norm(r2), norm(Gy) + norm(by)),
+          _blk_ratio(norm(r3), norm(Ay) + norm(t1) + norm(bz)))
+  return (ρ, r1, r2, r3)
 end
 
-# Wrap a Schur solve3x3gen with an accuracy guarantee on the original 3×3
+# ‖r‖/scale, with a zero scale accepting only a zero residual and a
+# non-finite residual never accepted.
+_blk_ratio(r, s) = !isfinite(r) ? Inf : s > 0 ? r / s : (r == 0 ? 0.0 : Inf)
+
+# Wrap a Schur solve3x3gen with an accuracy check on the original 3×3
 # system. Eliminating the cone variables squares the scaling's conditioning
 # in the reduced matrix, and some losses no shift or refinement recovers:
-# two independent equality rows whose Schur rows differ by 1e-16 relative
-# (correlated directions) collapse to one, or a regularized row stops
-# constraining. So every solve is checked against the original system
-# (_kkt3_resid ≤ _SCHUR_RESID_TOL) and refined with the Schur factorization
-# up to twice, keeping the best iterate; if it still misses, or the Schur
-# factorization fails outright, that factorization is handed to
-# kktsolver_qr on the same data — when the dense path fits
-# `dense_bytes_max` on its own (and p ≤ n). Otherwise the best Schur solve
-# is returned and counted, and conicIP's own refinement and termination
-# tests see its residual. Counters in `stats` (see DenseKKTGen).
+# two independent equality rows whose Schur rows agree to 1e-16 relative
+# collapse to one. So every solve is checked (_kkt3_resid ≤
+# _SCHUR_RESID_TOL) and refined with the Schur factorization up to twice,
+# keeping the best iterate. If it still misses, or the Schur factorization
+# fails outright, the same right-hand side is solved by kktsolver_qr on the
+# same data, built and factored lazily for this factorization — when the
+# dense path and the Schur storage fit `dense_bytes_max` together. That
+# solve is checked too, and the better of the two directions is returned:
+# with a regularized, ill-scaled Hessian the dense solve can be far worse
+# (its absolute δ·I lands on every primal coordinate). A dense attempt that
+# fails or does not improve the residual tenfold turns the fallback off for
+# the rest of the solve, so a hopeless one is not paid for every
+# iteration. Counters in `stats` (see DenseKKTGen).
 function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
-                        dense_bytes_max = _DENSE_BYTES_MAX)
+                        dense_bytes_max = _DENSE_BYTES_MAX, schur_bytes = 0)
   n = size(A, 2); m = size(A, 1); p = size(G, 1)
   Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
   At = sparse(As'); Gt = sparse(Gs')
-  qr_ok = p <= n && dense_kkt_bytes(n, m, p) <= dense_bytes_max
+  qr_ok = Ref(p <= n && dense_kkt_bytes(n, m, p) + schur_bytes <= dense_bytes_max)
   qrgen = Ref{Any}(nothing)
-  stats = zeros(Int, 3)
+  stats = zeros(Int, 4)
   t1 = zeros(m); t2 = zeros(m)
 
   # kktsolver_qr on the same data, built on first need; static_reg is
@@ -929,15 +974,17 @@ function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
     end
     return qrgen[]
   end
+  resid(F, bx, by, bz, y, w, v) =
+    _kkt3_resid(Qs, As, At, Gs, Gt, F, bx, by, bz, y, w, v, t1, t2)
 
   function solve3x3gen(F, F⁻ᵀ, pt = nothing)
     s3 = try
       gen(F, F⁻ᵀ, pt)
     catch err
-      (err isa KKT_FAILURES && qr_ok) || rethrow()
+      (err isa KKT_FAILURES && qr_ok[]) || rethrow()
       nothing
     end
-    qs = Ref{Any}(nothing)           # this factorization's dense fallback
+    qs = Ref{Any}(nothing)           # this factorization's dense solve
     function dense()
       if qs[] === nothing
         stats[2] += 1
@@ -945,23 +992,37 @@ function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
       end
       return qs[]
     end
-    s3 === nothing && dense()
+    s3 === nothing && dense()        # raises if the dense path fails too
 
     function solve3x3(bx, by, bz)
-      qs[] === nothing || return qs[](bx, by, bz)
+      s3 === nothing && return qs[](bx, by, bz)
       (y, w, v) = s3(bx, by, bz)
-      (ρ, r1, r2, r3) = _kkt3_resid(Qs, As, At, Gs, Gt, F, bx, by, bz, y, w, v, t1, t2)
+      (ρ, r1, r2, r3) = resid(F, bx, by, bz, y, w, v)
       for _ = 1:2
         ρ <= _SCHUR_RESID_TOL && return (y, w, v)
         stats[1] += 1
         (dy, dw, dv) = s3(r1, r2, r3)
         (y2, w2, v2) = (y - dy, w - dw, v - dv)
-        (ρ2, q1, q2, q3) = _kkt3_resid(Qs, As, At, Gs, Gt, F, bx, by, bz, y2, w2, v2, t1, t2)
+        (ρ2, q1, q2, q3) = resid(F, bx, by, bz, y2, w2, v2)
         ρ2 < ρ || break                  # no progress: keep the best
         (y, w, v, ρ, r1, r2, r3) = (y2, w2, v2, ρ2, q1, q2, q3)
       end
       ρ <= _SCHUR_RESID_TOL && return (y, w, v)
-      qr_ok && return dense()(bx, by, bz)
+      if qr_ok[]
+        xd = try
+          dense()(bx, by, bz)
+        catch err
+          err isa KKT_FAILURES || rethrow()
+          nothing
+        end
+        ρd = xd === nothing ? Inf : resid(F, bx, by, bz, xd...)[1]
+        if ρd < ρ / 10
+          return xd
+        end
+        # The dense path does not help here: stop paying for it.
+        stats[4] += 1
+        qr_ok[] = false
+      end
       stats[3] += 1
       return (y, w, v)
     end

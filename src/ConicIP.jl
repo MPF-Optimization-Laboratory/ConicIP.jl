@@ -681,12 +681,13 @@ function dsdc_diag!(x, y, o)
   # Z_ij (λ_i + λ_j)/2 = X_ij, so Z_ij = X_ij / ((λ_i + λ_j)/2) — the √2
   # packing weight cancels, and the packed coordinates divide in place.
   # Only the diagonal of mat(y) is read: its off-diagonals are rounding.
-  # The quotient is formed as 2·(X_ij / (λ_i + λ_j)): the sum is exact for
-  # subnormal λ, where halving it first (or halving each term) would round
-  # (λ_i = u, λ_j = 2u gives 2u for 1.5u), and doubling the quotient is
-  # exact. Only when the sum overflows is the mean λ_i/2 + λ_j/2 used.
-  # O(k²) for order k against lyap's O(k³) Schur factorization, and
-  # allocation-free.
+  # The quotient X_ij / ((λ_i + λ_j)/2) is evaluated by the range of the
+  # sum σ = λ_i + λ_j. Normal σ ≥ 2·floatmin: σ/2 is exact, one division
+  # (a subnormal numerator such as u/1 stays exact). Smaller σ: σ is an
+  # exact sum of subnormals whose half would round (u + 2u = 3u, half 1.5u
+  # rounds to 2u), so 2·(X_ij/σ), whose doubling is exact. σ overflowing:
+  # the mean λ_i/2 + λ_j/2. O(k²) for order k against lyap's O(k³) Schur
+  # factorization, and allocation-free.
   n = ord(y)
   dpos(j) = (j - 1)*n - div((j - 1)*(j - 2), 2) + 1   # packed index of (j,j)
   c = 1
@@ -696,7 +697,10 @@ function dsdc_diag!(x, y, o)
     for j = i+1:n
       λj = y[dpos(j)]
       σ = λi + λj
-      o[c] = isfinite(σ) ? 2 * (x[c] / σ) : x[c] / (λi/2 + λj/2); c += 1
+      o[c] = !isfinite(σ)           ? x[c] / (λi/2 + λj/2) :
+             σ >= 2 * floatmin(σ)   ? x[c] / (σ/2) :
+                                      2 * (x[c] / σ)
+      c += 1
     end
   end
   return o

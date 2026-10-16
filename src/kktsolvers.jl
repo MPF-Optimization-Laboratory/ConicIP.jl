@@ -342,8 +342,9 @@ mutable struct DenseKKTGen{G}
   gen::G
   timing::Union{Nothing,PhaseTimes}
   # kktsolver_sdpschur's counters, cumulative over the solve: [1] internal
-  # refinement corrections, [2] factorizations handed to kktsolver_qr,
-  # [3] solves that missed the residual target with no fallback available.
+  # refinement corrections, [2] dense factorizations by kktsolver_qr,
+  # [3] solves returned above the residual target, [4] dense attempts
+  # rejected (failed or not tenfold better; the fallback is then off).
   # Empty for kktsolver_qr.
   stats::Vector{Int}
 end

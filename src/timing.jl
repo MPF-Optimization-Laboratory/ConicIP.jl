@@ -35,7 +35,9 @@
 #   t_kkt_assemble (forming the reduced matrix from the scaling blocks) and
 #   t_kkt_factor (its Cholesky, or the QR fallback), with n_kkt_factor
 #   counting the factorizations. They are children of t_kktupdate, except
-#   that the initial-point factorization is charged to t_init.
+#   that the initial-point factorization is charged to t_init, and a
+#   kktsolver_sdpschur dense fallback, factored lazily during a direction
+#   solve, is charged to t_direction.
 # * Counts: n_passes = loop passes including the final convergence check,
 #   n_steps = completed iterate updates, n_kktupdate = factorizations
 #   (initial one included), n_solve = calls to the 4×4 solve (initial point,
