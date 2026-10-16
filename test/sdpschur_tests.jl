@@ -10,6 +10,14 @@
 
 import MathOptInterface as MOI
 
+# Keeps the generator the default router builds for the main solve.
+mutable struct _GenProbe; g::Any; end
+function (p::_GenProbe)(Q, A, G, cd)
+    g = ConicIP.default_kktsolver(Q, A, G, cd)
+    p.g === nothing && (p.g = g)
+    return g
+end
+
 # Records which backend the router picks for the main solve.
 mutable struct _RouteProbe; name::String; end
 function (r::_RouteProbe)(Q, A, G, cd)
@@ -884,9 +892,9 @@ end
         b = ([1.0, 2, 3, 0], zeros(0), [0.01, 0.1, 0.3, 0])
         ref = C.kktsolver_qr(Q, A, G, cd)(F, Fi)(b...)        # unregularized
         # A zero target forces the dense comparison on every solve.
-        saved = C._SCHUR_RESID_TOL[]
+        saved = C._SCHUR_RESID_TOL[]; saved_d = C._SCHUR_DENSE_TOL[]
         try
-            C._SCHUR_RESID_TOL[] = 0.0
+            C._SCHUR_RESID_TOL[] = 0.0; C._SCHUR_DENSE_TOL[] = 0.0
             g = C.kktsolver_sdpschur(Q, A, G, cd; static_reg = 1e-8)
             sol = g(F, Fi)(b...)
             @test g.stats[2] == 1                             # the dense path ran
@@ -895,7 +903,7 @@ end
             dense = C.kktsolver_qr(Q + 1e-8 * (1 + 1e12) * I, A, G, cd)(F, Fi)(b...)
             @test resid3(Q, A, G, F, b, dense) > 0.1            # (it was much worse)
         finally
-            C._SCHUR_RESID_TOL[] = saved
+            C._SCHUR_RESID_TOL[] = saved; C._SCHUR_DENSE_TOL[] = saved_d
         end
     end
 
@@ -974,13 +982,13 @@ end
         A = sparse(1.0I, 3, 3); Q = spzeros(3, 3); G = sparse([1.0 0 0; 1 0 1]); cd = [("S", 3)]
         g = C.kktsolver_sdpschur(Q, A, G, cd)
         Fh = C.Block([C.VecCongurance(Matrix(1.0I, 2, 2))])
-        saved = C._SCHUR_RESID_TOL[]
+        saved = C._SCHUR_RESID_TOL[]; saved_d = C._SCHUR_DENSE_TOL[]
         try
-            C._SCHUR_RESID_TOL[] = 0.0
+            C._SCHUR_RESID_TOL[] = 0.0; C._SCHUR_DENSE_TOL[] = 0.0
             s1 = g(Fh, Fh)
             s1(randn(3), randn(2), randn(3)); s1(randn(3), randn(2), randn(3))
         finally
-            C._SCHUR_RESID_TOL[] = saved
+            C._SCHUR_RESID_TOL[] = saved; C._SCHUR_DENSE_TOL[] = saved_d
         end
         @test g.stats[2] == 1 && g.stats[4] == 1          # tried once, not retried
         F2 = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))])
@@ -992,13 +1000,13 @@ end
         # residual is exactly 0, which identity scaling sometimes gives, so
         # loop until enough rejections have been counted.)
         try
-            C._SCHUR_RESID_TOL[] = 0.0
+            C._SCHUR_RESID_TOL[] = 0.0; C._SCHUR_DENSE_TOL[] = 0.0
             tries = 0
             while g.stats[4] < C._SCHUR_DENSE_TRIES && tries < 100
                 g(Fh, Fh)(randn(3), randn(2), randn(3)); tries += 1
             end
         finally
-            C._SCHUR_RESID_TOL[] = saved
+            C._SCHUR_RESID_TOL[] = saved; C._SCHUR_DENSE_TOL[] = saved_d
         end
         @test g.stats[4] == C._SCHUR_DENSE_TRIES
         n2 = g.stats[2]
@@ -1072,8 +1080,41 @@ end
         sol = g(F, Fi)(zeros(1), [1.0], zeros(1))
         @test sol[1][1] ≈ 1.0 rtol = 1e-12
         @test g.stats[2] == 1
-        ρ = C._kkt3_resid(spzeros(1, 1), A1, A1, A1, A1, spzeros(1, 1), A1, A1, A1, A1, F,
+        ρ = C._kkt3_resid(spzeros(1, 1), A1, A1, A1, A1, 0.0, 1.0, 1.0, F,
                           zeros(1), [1.0], zeros(1), sol..., zeros(1), zeros(1))[1]
         @test g.stats[3] == (ρ <= C._SCHUR_RESID_TOL[] ? 0 : 1)
+    end
+
+    # ── Fifth review pass and harness (2026-10-16) ──────────────────────
+
+    @testset "fifth: healthy solves never pay for the dense path" begin
+        # Max-cut directions keep X_ii fixed: Δy_ii is at rounding level and
+        # G y is pure rounding. The operand-wise measure (|G||y|) divided
+        # rounding by rounding, every equality row "failed", and order 100
+        # took 39 s instead of 0.065 s through eight dense factorizations
+        # that were no more accurate. Normwise, nothing is dense.
+        (pm, _) = maxcut_models(25)
+        probe = _GenProbe(nothing)
+        opt = MOI.instantiate(ConicIP.Optimizer; with_bridge_type = Float64)
+        MOI.set(opt, MOI.Silent(), true)
+        MOI.set(opt, MOI.RawOptimizerAttribute("kktsolver"), probe)
+        MOI.copy_to(opt, pm); MOI.optimize!(opt)
+        @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test probe.g isa C.DenseKKTGen
+        @test probe.g.stats[2] == 0
+    end
+
+    @testset "fifth: per-block scaling at the ends of the range" begin
+        A1 = sparse(reshape([1.0], 1, 1)); E = spzeros(0, 1); cd1 = [("S", 1)]
+        F1 = C.Block([C.VecCongurance(fill(1.0, 1, 1))])
+        # Uniformly subnormal, exact: 2^(−exponent) overflowed to Inf.
+        z = 1e-308
+        ρ = C._kkt3_resid(spzeros(1, 1), A1, A1, E, sparse(E'), 0.0, 1.0, 0.0, F1,
+                          [z], zeros(0), [0.0], [z], zeros(0), [-z], zeros(1), zeros(1))[1]
+        @test ρ == 0
+        # One block at 1e308 must not erase another's 1e-100 violation.
+        ρ = C._kkt3_resid(spzeros(1, 1), A1, A1, A1, A1, 0.0, 1.0, 1.0, F1,
+                          [0.0], [1e-100], [1e308], [0.0], [1e308], [1e308], zeros(1), zeros(1))[1]
+        @test ρ >= 0.5
     end
 end
