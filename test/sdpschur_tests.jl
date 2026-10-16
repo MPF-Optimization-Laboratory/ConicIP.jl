@@ -824,7 +824,7 @@ end
         Fg = nt_block([("S", 10)], z, s)
         gg = C.kktsolver_sdpschur(P.Q, P.A, P.G, [("S", 10)])
         gg(Fg, inv(Fg)')(randn(P.m), randn(P.p), randn(P.m))
-        @test gg.stats == [0, 0, 0]
+        @test gg.stats == [0, 0, 0, 0]
     end
 
     @testset "second review: a large SOC is streamed and budgeted" begin
@@ -859,5 +859,99 @@ end
         finally
             C._GRAM_WORKSPACE_BYTES[] = saved
         end
+    end
+
+    # ── Third review pass (2026-10-16) ──────────────────────────────────
+
+    @testset "third review: a tiny numerator over a normal mean" begin
+        # 2·(x/σ) underflowed u/2 to zero before doubling; x/(σ/2) is exact.
+        u = nextfloat(0.0); o = zeros(3)
+        C.dsdc_diag!([0.0, u, 0.0], [1.0, 0.0, 1.0], o)
+        @test o[2] == u
+        C.dsdc_diag!(fill(u, 3), [u, 0.0, 2u], o)          # still 2/3
+        @test o[2] == Float64(2 * big(u) / (3 * big(u)))
+    end
+
+    @testset "third review: the dense fallback never replaces a better solve" begin
+        # A 1e12 quadratic term on the free variable and staticReg = 1e-8:
+        # the dense path's absolute δ ≈ 1e4 lands on every primal
+        # coordinate and its solve is wrong (residual ≈ 1), while the Schur
+        # solve is accurate. The better one must come back.
+        A = sparse(1.0I, 4, 4); Q = spdiagm([0, 0, 0, 1e12]); G = spzeros(0, 4)
+        cd = [("S", 3), ("R", 1)]
+        F = C.Block([C.VecCongurance(100 * Matrix(1.0I, 2, 2)), Diagonal([1.0])])
+        Fi = C.Block([inv(F[1])', Diagonal([1.0])])
+        b = ([1.0, 2, 3, 0], zeros(0), [0.01, 0.1, 0.3, 0])
+        g = C.kktsolver_sdpschur(Q, A, G, cd; static_reg = 1e-8)
+        sol = g(F, Fi)(b...)
+        ref = C.kktsolver_qr(Q, A, G, cd)(F, Fi)(b...)        # unregularized
+        @test sol[1] ≈ ref[1] rtol = 1e-6
+        @test resid3(Q, A, G, F, b, sol) <= 1e-6
+    end
+
+    @testset "third review: a large legitimate solution is accepted" begin
+        # Q = 0, A = I, no equalities, F = 100·I: the solution is ~1e8 for an
+        # order-one right-hand side and cancellation leaves ~1e-8 of it in
+        # the residual. That is backward-stable; no dense attempt is made.
+        A = sparse(1.0I, 3, 3); Q = spzeros(3, 3); G = spzeros(0, 3); cd = [("S", 3)]
+        F = C.Block([C.VecCongurance(100 * Matrix(1.0I, 2, 2))]); Fi = C.Block([inv(F[1])'])
+        g = C.kktsolver_sdpschur(Q, A, G, cd)
+        g(F, Fi)([1.0, 2, 3], zeros(0), [0.01, 0.1, 0.3])
+        @test g.stats == [0, 0, 0, 0]
+    end
+
+    @testset "third review: the residual check is scale-invariant" begin
+        # The correlated-rows reproducer with its right-hand side scaled by
+        # 1e±170 (squared norms underflowed to a residual of 0 and accepted
+        # a wrong solve), and a scalar system with by = 1e155 under
+        # staticReg (the squared norm overflowed).
+        A = sparse(1.0I, 3, 3); Q = spzeros(3, 3); G = sparse([1.0 0 0; 1 0 1]); cd = [("S", 3)]
+        F = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))]); Fi = C.Block([inv(F[1])'])
+        for sc in (1e-170, 1.0, 1e170)
+            g = C.kktsolver_sdpschur(Q, A, G, cd)
+            sol = g(F, Fi)(zeros(3), [0.0, sc], zeros(3))
+            @test sol[1] ≈ [0.0, 0.0, sc] atol = 1e-12 * sc
+            @test g.stats[2] == 1
+        end
+        A1 = sparse(reshape([1.0], 1, 1)); cd1 = [("S", 1)]
+        F1 = C.Block([C.VecCongurance(fill(1.0, 1, 1))])
+        for by in (1e-155, 1.0, 1e155)
+            g = C.kktsolver_sdpschur(spzeros(1, 1), A1, A1, cd1; static_reg = 1e-8)
+            sol = g(F1, F1)(zeros(1), [by], zeros(1))
+            @test sol[1][1] ≈ by rtol = 1e-12
+        end
+    end
+
+    @testset "third review: a failing dense fallback keeps the Schur solve" begin
+        # The correlated rows plus a repeated (consistent) row: the dense
+        # path's QR of Gᵀ is singular. The Schur solve is returned, the
+        # fallback is switched off and counted, nothing is raised.
+        A = sparse(1.0I, 3, 3); Q = spzeros(3, 3)
+        G = sparse([1.0 0 0; 1 0 1; 1 0 1]); cd = [("S", 3)]
+        F = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))]); Fi = C.Block([inv(F[1])'])
+        g = C.kktsolver_sdpschur(Q, A, G, cd)
+        sol = g(F, Fi)(zeros(3), [0.0, 1.0, 1.0], zeros(3))
+        @test all(isfinite, sol[1])
+        @test g.stats[4] == 1 && g.stats[3] == 1
+        g(F, Fi)(zeros(3), [0.0, 1.0, 1.0], zeros(3))      # not retried
+        @test g.stats[2] <= 1 && g.stats[4] == 1
+    end
+
+    @testset "third review: stable row recomputation stays within its estimate" begin
+        # Suspect rows of a plan with a 100 000-row SOC: the products went
+        # through allocating block multiplications (six live SOC-sized
+        # arrays). Now two preallocated chunk buffers.
+        Random.seed!(11)
+        k = 8; mS = div(k * (k + 1), 2); d = 100_000; nc = 32
+        cd = [("S", mS), ("Q", d)]; m = mS + d
+        B = [sprandn(mS, nc, 0.3); sprandn(d, nc, 1e-4)]
+        z = interior(cd); s = interior(cd); W = nt_block(cd, z, s)
+        plan = C._gram_plan(B, cd)
+        M = zeros(nc, nc)
+        C._gram_rows!(M, plan, W, collect(1:nc))
+        bytes = @allocated C._gram_rows!(M, plan, W, collect(1:nc))
+        @test bytes <= C._gram_bytes(m, nc, cd)
+        Y = W * Matrix(B)
+        @test M ≈ Y' * Y rtol = 1e-12
     end
 end
