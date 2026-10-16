@@ -1,7 +1,9 @@
 # Resuming the large-scale work (private)
 
 Read this first when picking the project up again, then the status paragraphs of
-`large-scale-roadmap.md` (Tranches 0–3) and §7 of `hsd-design.md`. Everything under
+`large-scale-roadmap.md` (Tranches 0–3), §7 of `hsd-design.md`, and
+`next-level-research.md` (2026-09-20: what lies beyond parity, with the measured
+verdicts on Krylov solves, BLAS-3 factorization, and finite termination). Everything under
 `benchmark/` except `profile.jl`, `report.md`, `regressions.jl`, `sdplib.jl` and
 `issue10.jl` is private development material and never goes upstream.
 
@@ -45,9 +47,12 @@ benchmark/phases.jl           per-phase timing driver (ConicIP and Clarabel thro
 benchmark/compare_phases.jl   joins two phase CSVs: per-instance Δ per phase, shares, counts
 benchmark/alloc_phases.jl     allocation sites per phase (Profile.Allocs)
 benchmark/setup_diag.jl       attribution of t_setup on the direct instances
+benchmark/sdp_scaling.jl      SDP order-k scaling, PSD-variable vs LMI form (includes suite.jl)
 benchmark/Project.toml        env for baselines (Clarabel, ECOS); Manifest gitignored
 benchmark/large-scale-roadmap.md
 benchmark/hsd-design.md
+benchmark/next-level-research.md   research phase after v0.6.0: directions, measurements, ranked lanes
+benchmark/research/           its full subagent reports, scripts, results (see its README)
 benchmark/RESUME.md           this file
 benchmark/strip-release.sh
 test/review_benchmark.jl      includes suite.jl
