@@ -279,12 +279,19 @@ end
         @test C.sdpschur_eligible(Q, [A; sparse([1], [1], [1.0], 1, m)], G, [("S", 6), ("R", 1)])
         @test C.choose_kktsolver(sparse(1.0I, m, m), A, G, cd) === C.kktsolver_qr
         @test_throws ArgumentError C.kktsolver_sdpschur(sparse(1.0I, m, m), A, G, cd)
-        # The storage budget does not apply: the k(k+1)/2 variables are never
-        # factored, so an order-150 block routes here rather than being refused.
+        # The dense path's storage estimate does not apply: the k(k+1)/2
+        # variables are never factored, so an order-150 block routes here
+        # under a budget far below the dense estimate — its own (the Schur
+        # matrix and the Gram workspaces) is what must fit.
         k = 150; mk = div(k * (k + 1), 2)
-        @test C.choose_kktsolver(spzeros(mk, mk), sparse(1.0I, mk, mk),
-                                 sparse(1:k, 1:k, ones(k), k, mk),
-                                 [("S", mk)]; dense_bytes_max = 2^20) === C.kktsolver_sdpschur
+        Gk = sparse(1:k, 1:k, ones(k), k, mk); cdk = [("S", mk)]
+        own = C._sdpschur_bytes(C._schur_split(spzeros(mk, mk), sparse(1.0I, mk, mk), cdk),
+                                k, mk, cdk)
+        @test own < C.dense_kkt_bytes(mk, mk, k) / 100
+        @test C.choose_kktsolver(spzeros(mk, mk), sparse(1.0I, mk, mk), Gk, cdk;
+                                 dense_bytes_max = own) === C.kktsolver_sdpschur
+        @test_throws ArgumentError C.choose_kktsolver(spzeros(mk, mk), sparse(1.0I, mk, mk),
+                                                      Gk, cdk; dense_bytes_max = own - 1)
         # …but the Schur matrix is: with a budget below its 3·8p² bytes the
         # router falls through to the dense rules, which refuse an SDP.
         @test_throws ArgumentError C.choose_kktsolver(spzeros(mk, mk), sparse(1.0I, mk, mk),
@@ -562,7 +569,7 @@ end
         @test C.choose_kktsolver(spzeros(mk, mk), A, G, cd) === C.kktsolver_qr
         # The reduced matrix is budgeted like the standard-form one.
         sp = C._schur_split(P.Q, P.A, P.cd)
-        bytes = C._sdpschur_bytes(sp, P.p)
+        bytes = C._sdpschur_bytes(sp, P.p, size(P.A, 1), P.cd)
         @test C._sdpschur_fits(P.Q, P.A, P.G, P.cd, bytes)
         @test !C._sdpschur_fits(P.Q, P.A, P.G, P.cd, bytes - 1)
         # (Over budget, the dense rules refuse an SDP outright.)
@@ -668,7 +675,10 @@ end
         Q = raw.Q_int === nothing ? spzeros(raw.n, raw.n) : raw.Q_int
         rDu = norm(Q * sol.y + raw.eq_G' * sol.w - raw.ineq_A' * sol.v - raw.c_int) /
               (1 + norm(raw.c_int))
-        return rDu <= 1e-6 &&
+        rPr = norm(raw.ineq_A * sol.y - sol.s - raw.ineq_b) / (1 + norm(raw.ineq_b))
+        pobj = 0.5 * dot(sol.y, Q * sol.y) - dot(raw.c_int, sol.y)
+        gap = abs(dot(sol.v, sol.s)) / (1 + abs(pobj))
+        return rDu <= 1e-6 && rPr <= 1e-6 && gap <= 1e-6 &&
                norm(raw.eq_G * sol.y - raw.eq_d) <= 1e-6 * (1 + norm(raw.eq_d)) &&
                C.cone_margin(sol.s, raw.cone_dims) >= -1e-8 &&
                C.cone_margin(sol.v, raw.cone_dims) >= -1e-8
@@ -692,6 +702,162 @@ end
             E = [(i, j) for j in 1:12 for i in 1:j-1 if (i + 2j) % 5 == 0]
             std = moi_solve(theta_std_model(12, E), C.default_kktsolver)
             @test MOI.get(opt, MOI.ObjectiveValue()) ≈ MOI.get(std, MOI.ObjectiveValue()) rtol = 1e-6
+        end
+    end
+
+    # ── Second review pass (2026-10-16) ─────────────────────────────────
+    # Reproducers from the adversarial review of the first round of fixes;
+    # each failed before the change it pins.
+
+    @testset "second review: adjacent subnormal divisors" begin
+        # 2·(x/(λᵢ+λⱼ)): the sum 3u is exact, halving it first rounded the
+        # denominator to 2u and gave 1/2 for 2/3.
+        u = nextfloat(0.0); o = zeros(3)
+        C.dsdc_diag!(fill(u, 3), [u, 0.0, 2u], o)
+        ref = Float64(2 * big(u) / (big(u) + 2 * big(u)))
+        @test o[2] == ref
+        @test o[1] == 1.0 && o[3] == 0.5
+    end
+
+    @testset "second review: staticReg is dimensionless on the Schur route" begin
+        # A quadratic term of scale 1e12 on a free variable beside a PSD
+        # variable. conicIP's absolute δ = staticReg·(1 + ‖Q‖) applied as a
+        # relative shift on the equilibrated matrix was a shift of 1e4:
+        # Abandoned with y₄ ≈ 0.015, where kktsolver_qr solves it.
+        A = sparse([1.0 0 0 0; 0 1 0 0; 0 0 1 0]); Q = spdiagm([0, 0, 0, 1e12])
+        c = [-1.0, 0, -1, 1e12]; cd = [("S", 3)]
+        @test C.choose_kktsolver(Q, A, spzeros(0, 4), cd) === C.kktsolver_sdpschur
+        for ks in (C.default_kktsolver, C.kktsolver_qr)
+            s = conicIP(Q, c, A, zeros(3), cd; staticReg = 1e-8, equilibrate = false,
+                        maxIters = 40, verbose = false, kktsolver = ks)
+            @test s.status == :Optimal
+            @test s.y[4] ≈ 1.0 atol = 1e-6
+        end
+    end
+
+    @testset "second review: a non-finite trace form is recomputed" begin
+        # T = RRᵀ = 1e200 overflows in the four-index products although
+        # RᵀGR = 1: the diagonal came out NaN and passed the check.
+        plan = C._gram_plan(sparse(reshape([1e-200], 1, 1)), [("S", 1)])
+        M = zeros(1, 1)
+        C._gram!(M, plan, C.Block([C.VecCongurance(fill(1e100, 1, 1))]))
+        @test M[1] ≈ 1.0 rtol = 1e-12
+        @test plan.suspect == [1]
+    end
+
+    @testset "second review: suspect rows recomputed in bounded chunks" begin
+        # Two columns that cancel in the trace form (R's leading block
+        # [1 0; 1 1e-4], J₁ = [1 −1; −1 1] there, J₂ = J₁ + 1e-8 e₃e₃ᵀ) next
+        # to unrelated ones. The diagonals were repaired but the
+        # off-diagonal M₁₂ = 1e-16 stayed 0 whenever the dense W·B exceeded
+        # its 1 GiB cap. Now the suspect rows are recomputed from W·B
+        # streamed in chunks; a one-column workspace forces many.
+        k = 6; m = div(k * (k + 1), 2); cd = [("S", m)]
+        R = Matrix(1.0I, k, k); R[1:2, 1:2] = [1 0; 1 1e-4]
+        J1 = zeros(k, k); J1[1:2, 1:2] = [1 -1; -1 1]
+        J2 = copy(J1); J2[3, 3] = 1e-8
+        cols = [C.vecm(J1), C.vecm(J2)]
+        for (i, j) in ((4, 4), (4, 5), (5, 6), (6, 6))
+            E = zeros(k, k); E[i, j] = E[j, i] = 1.0; push!(cols, C.vecm(E))
+        end
+        B = sparse(reduce(hcat, cols))
+        W = C.VecCongurance(R)
+        Y = reduce(hcat, [W * Vector(B[:, j]) for j in 1:size(B, 2)])
+        Md = Y' * Y
+        saved = C._GRAM_WORKSPACE_BYTES[]
+        try
+            C._GRAM_WORKSPACE_BYTES[] = 8 * 4 * m           # one column per chunk
+            plan = C._gram_plan(B, cd)
+            M = zeros(size(B, 2), size(B, 2)); C._gram!(M, plan, C.Block([W]))
+            @test plan.suspect == [1, 2]
+            @test plan.fallback[1] == 1
+            @test M[1:2, 1:2] ≈ Md[1:2, 1:2] rtol = 1e-8
+            @test M[1, 2] > 0.5e-16
+            D = Diagonal(1 ./ sqrt.(diag(Md)))
+            @test opnorm(D * (M - Md) * D) <= 1e-8
+        finally
+            C._GRAM_WORKSPACE_BYTES[] = saved
+        end
+    end
+
+    @testset "second review: zero-diagonal equality in the mixed form" begin
+        # An equality on a remaining variable whose Hessian entry the
+        # scaling makes 1e16: diagonal equilibration left [1 1e-8; 1e-8 0],
+        # the small pivot triggered the shift, and y₄ came out 1e-4 for 1.
+        # Ruiz balancing scales the zero-diagonal row by its coupling; no
+        # dense fallback is needed.
+        A = sparse(1.0I, 4, 4); Q = spdiagm([0, 0, 0, 1.0]); G = sparse([0 0 0 1.0])
+        cd = [("S", 3), ("R", 1)]
+        @test C.choose_kktsolver(Q, A, G, cd) === C.kktsolver_sdpschur
+        F = C.Block([C.VecCongurance(Matrix(1.0I, 2, 2)), Diagonal([1e-8])])
+        Fi = C.Block([inv(F[1])', Diagonal([1e8])])
+        g = C.kktsolver_sdpschur(Q, A, G, cd)
+        b = (zeros(4), [1.0], zeros(4))
+        sol = g(F, Fi)(b...)
+        @test sol[1][4] ≈ 1.0 rtol = 1e-12
+        @test resid3(Q, A, G, F, b, sol) <= 1e-12
+        @test g.stats[2] == 0
+    end
+
+    @testset "second review: correlated equality rows fall back to kktsolver_qr" begin
+        # Independent, well-conditioned equality rows whose Schur rows agree
+        # to 1e-16 under the scaling: forming M loses the difference and the
+        # retry shift overwhelms it (residual 0.7). The residual check hands
+        # the factorization to kktsolver_qr, which solves it exactly.
+        A = sparse(1.0I, 3, 3); Q = spzeros(3, 3); G = sparse([1.0 0 0; 1 0 1]); cd = [("S", 3)]
+        F = C.Block([C.VecCongurance(Matrix(Diagonal([1, 1e-4])))]); Fi = C.Block([inv(F[1])'])
+        b = (zeros(3), [0.0, 1.0], zeros(3))
+        g = C.kktsolver_sdpschur(Q, A, G, cd)
+        sol = g(F, Fi)(b...)
+        @test sol[1] ≈ [0.0, 0.0, 1.0] atol = 1e-12
+        @test resid3(Q, A, G, F, b, sol) <= 1e-12
+        @test g.stats[2] == 1
+        # Without room for the dense path the best Schur solve is returned
+        # and counted, not raised.
+        g0 = C.kktsolver_sdpschur(Q, A, G, cd; dense_bytes_max = 0)
+        sol0 = g0(F, Fi)(b...)
+        @test all(isfinite, sol0[1])
+        @test g0.stats[2] == 0 && g0.stats[3] == 1
+        # A well-conditioned solve is accepted as it is.
+        P = standard_form([("S", 10)], 3; seed = 7)
+        z = interior([("S", 10)]); s = interior([("S", 10)])
+        Fg = nt_block([("S", 10)], z, s)
+        gg = C.kktsolver_sdpschur(P.Q, P.A, P.G, [("S", 10)])
+        gg(Fg, inv(Fg)')(randn(P.m), randn(P.p), randn(P.m))
+        @test gg.stats == [0, 0, 0]
+    end
+
+    @testset "second review: a large SOC is streamed and budgeted" begin
+        # A PSD variable of order 14 beside 50 remaining variables (Q_RR = I)
+        # that touch a second-order cone of 200 000 rows. The reduced system
+        # is 50×50, but the SOC's dense products W_B B_B (two 200 000 × 50
+        # buffers, 160 MB) were neither bounded nor budgeted: the router
+        # estimated 80 kB. They now stream within the Gram workspace, and
+        # the estimate covers what a factorization allocates.
+        Random.seed!(3)
+        k = 14; mS = div(k * (k + 1), 2); nR = 50; d = 200_000
+        n = mS + nR; cd = [("S", mS), ("Q", d)]
+        As = sparse(1:mS, 1:mS, ones(mS), mS, n)
+        rows = [1; rand(2:d, 4nR)]; colsR = [mS + 1; mS .+ rand(1:nR, 4nR)]
+        Aq = sparse(rows, colsR, randn(length(rows)), d, n)
+        A = [As; Aq]; Q = blockdiag(spzeros(mS, mS), sparse(1.0I, nR, nR))
+        G = spzeros(0, n)
+        sp = C._schur_split(Q, A, cd)
+        @test sp !== nothing && !sp.pure && length(sp.R) == nR
+        z = interior(cd); s = interior(cd); F = nt_block(cd, z, s); Fi = inv(F)'
+        saved = C._GRAM_WORKSPACE_BYTES[]
+        try
+            C._GRAM_WORKSPACE_BYTES[] = 2^25                 # 32 MiB: 6-column chunks
+            est = C._sdpschur_bytes(sp, 0, size(A, 1), cd)
+            g = C.kktsolver_sdpschur(Q, A, G, cd)
+            g(F, Fi); g(F, Fi)                               # warm up
+            bytes = @allocated g(F, Fi)
+            @test bytes <= est
+            @test bytes < 40 * 2^20
+            @test C._sdpschur_fits(Q, A, G, cd, est)
+            @test !C._sdpschur_fits(Q, A, G, cd, est - 1)
+        finally
+            C._GRAM_WORKSPACE_BYTES[] = saved
         end
     end
 end
