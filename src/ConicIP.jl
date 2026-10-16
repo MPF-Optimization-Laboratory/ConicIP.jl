@@ -681,10 +681,12 @@ function dsdc_diag!(x, y, o)
   # Z_ij (λ_i + λ_j)/2 = X_ij, so Z_ij = X_ij / ((λ_i + λ_j)/2) — the √2
   # packing weight cancels, and the packed coordinates divide in place.
   # Only the diagonal of mat(y) is read: its off-diagonals are rounding.
-  # The mean is (λ_i + λ_j)/2, exact for subnormal λ (where λ_i/2 + λ_j/2
-  # would round both halves to zero), and λ_i/2 + λ_j/2 only when the sum
-  # overflows. O(k²) for order k against lyap's O(k³) Schur factorization,
-  # and allocation-free.
+  # The quotient is formed as 2·(X_ij / (λ_i + λ_j)): the sum is exact for
+  # subnormal λ, where halving it first (or halving each term) would round
+  # (λ_i = u, λ_j = 2u gives 2u for 1.5u), and doubling the quotient is
+  # exact. Only when the sum overflows is the mean λ_i/2 + λ_j/2 used.
+  # O(k²) for order k against lyap's O(k³) Schur factorization, and
+  # allocation-free.
   n = ord(y)
   dpos(j) = (j - 1)*n - div((j - 1)*(j - 2), 2) + 1   # packed index of (j,j)
   c = 1
@@ -694,7 +696,7 @@ function dsdc_diag!(x, y, o)
     for j = i+1:n
       λj = y[dpos(j)]
       σ = λi + λj
-      o[c] = x[c] / (isfinite(σ) ? σ/2 : λi/2 + λj/2); c += 1
+      o[c] = isfinite(σ) ? 2 * (x[c] / σ) : x[c] / (λi/2 + λj/2); c += 1
     end
   end
   return o
@@ -1572,8 +1574,11 @@ function _conicIP(
   # would repeat this call, and so would the verbose line below, each time
   # paying for a symbolic analysis and an AMD ordering of the KKT pattern.
   # A PSD-variable SDP is decided on the unregularized Q: Qᵣ = Q + δI would
-  # hide it, and kktsolver_sdpschur applies δ itself (dual side, and on the
-  # variables it keeps). Asked for by name, it needs only an eliminable
+  # hide it, and kktsolver_sdpschur regularizes itself (dual side, and on
+  # the variables it keeps). It receives the dimensionless staticReg, not
+  # δ: its shift is relative to a unit diagonal, where the (1 + ‖Q‖) factor
+  # that turns staticReg into an absolute shift would apply the objective's
+  # scale a second time. Asked for by name, it needs only an eliminable
   # block; the default router also wants a small reduced system whose
   # storage fits the budget, as choose_kktsolver does.
   schur = kktsolver === kktsolver_sdpschur ? _schur_split(Q, A, cone_dims) !== nothing :
@@ -1592,7 +1597,7 @@ function _conicIP(
     if routed === nothing
       kktsolver(Qᵣ,A,G,cone_dims)
     elseif routed[1] === kktsolver_sdpschur
-      kktsolver_sdpschur(Q,A,G,cone_dims; static_reg = δ)
+      kktsolver_sdpschur(Q,A,G,cone_dims; static_reg = staticReg)
     elseif routed[2] === nothing
       routed[1](Qᵣ,A,G,cone_dims)
     else
