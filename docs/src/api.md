@@ -165,4 +165,7 @@ ConicIP.spectral_map!
 ConicIP.clip_spectral!
 ConicIP.centrality_correction!
 ConicIP._psd_vecm_to_moi
+ConicIP._schur_split
+ConicIP._gram_plan
+ConicIP._gram!
 ```
