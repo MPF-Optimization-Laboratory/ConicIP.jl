@@ -50,14 +50,14 @@
 #
 # | Instances | `optTol` | Outcome |
 # |:---|:---|:---|
-# | `control1`, `truss1`–`truss4`, `theta1`, `theta2`, `mcp100`, `mcp124-1`, `qap5`, `arch0` | `1e-8` | `OPTIMAL`, relative error `1e-7` … `1e-10` |
-# | `control2`, `control3`, `gpp100`, `hinf2` | `1e-6` (default) | `OPTIMAL`, relative error `2e-7` … `2e-5` |
-# | `hinf1`, `hinf3`, `qap6` | `1e-4` | `OPTIMAL`, relative error `3e-4` … `1e-3` |
+# | `control1`, `control2`, `truss1`–`truss4`, `theta1`, `theta2`, `mcp100`, `mcp124-1`, `qap5`, `arch0` | `1e-8` | `OPTIMAL`, relative error `7e-11` … `4e-7` |
+# | `control3`, `gpp100`, `hinf2`, `qap6` | `1e-6` (default) | `OPTIMAL`, relative error `3e-8` … `2e-5` |
+# | `hinf1`, `hinf3` | `1e-6` (default) | `OPTIMAL`, relative error `2e-4` … `8e-4` |
 #
-# Each row gives a tolerance that solves those instances; `optTol = 1e-4`
-# solves every instance in the table. Solve times are modest:
-# `theta1` (order 50) takes about 0.1 s, `theta2` (order 100) about 1.7 s,
-# and `arch0` (order 335) about 8 s.
+# Each row gives a tolerance that solves those instances; the default
+# `optTol = 1e-6` solves every instance in the table. Solve times
+# are modest: `theta1` (order 50) takes about 0.04 s, `theta2` (order 100)
+# about 0.15 s, and `arch0` (order 335) about 1.3 s.
 #
 # **What is not there.**
 #
@@ -65,16 +65,16 @@
 #   Cholesky (Bunch-Kaufman in the mixed form): sparse coefficient matrices
 #   make its assembly cheap, not its factorization, so the number of
 #   variables (or of equalities, in standard form) bounds the problem size.
-# - The degenerate instances need a loose tolerance. The `hinf` family lacks
-#   strict complementarity, and `qap6` behaves the same way: once feasibility
-#   reaches roughly `1e-6` the KKT system is ill-conditioned, the Newton step
-#   loses accuracy, and the iteration stagnates. At the default `optTol =
-#   1e-6`, `hinf1` and `qap6` return `ITERATION_LIMIT` and `hinf3` returns
-#   `NUMERICAL_ERROR`. Set `optTol = 1e-4` for these.
-# - Tighter is not always better. `control2`, `control3`, `gpp100` and
-#   `hinf2` give six correct digits at the default tolerance, but at
-#   `optTol = 1e-8` they stagnate in the same way and come back as
-#   `ITERATION_LIMIT` or `NUMERICAL_ERROR`. Loosen before tightening.
+# - The degenerate instances are solved less accurately. The `hinf` family
+#   lacks strict complementarity, and `qap6` behaves the same way: once
+#   feasibility reaches roughly `1e-6` the KKT system is ill-conditioned and
+#   the Newton step loses accuracy. At the default tolerance `hinf1` and
+#   `hinf3` stop with three or four correct digits, and `qap6` needs 91
+#   iterations (19 at `optTol = 1e-4`).
+# - Tighter is not always better. `control3`, `gpp100`, `qap6`, `hinf1` and
+#   `hinf3` solve at the default tolerance, but at `optTol = 1e-8` they
+#   stagnate and come back as `ITERATION_LIMIT` or `NUMERICAL_ERROR`.
+#   Loosen before tightening.
 #
 # **Failures are statuses, not exceptions.** Every factorization and cone
 # line search that can fail on a boundary iterate is guarded. A failure ends

@@ -62,8 +62,9 @@ uses [Semantic Versioning](https://semver.org/).
 - PSD-variable SDPs no longer factor a dense matrix in the `k(k+1)/2`
   matrix entries: per iteration O(p k³ + p² k² + p³) for `p` equality rows
   instead of O(k⁶), and O(p² + k²) storage instead of O(k⁴). On the max-cut
-  relaxation, order 100 drops from 1.66 to 0.006 s per iteration, and orders
-  150 and 200, which the dense-storage guard refused, solve in under 0.3 s.
+  relaxation, order 100 drops from 1.66 to about 0.01 s per iteration, and
+  orders 150 and 200, which the dense-storage guard refused, solve in under
+  half a second.
 - `kktsolver_qr` assembles the SDP Hessian `AᵀF⁻¹F⁻ᵀA` of an affine
   (linear-matrix-inequality) model without equality rows directly from the
   sparse coefficient matrices (trace form, one dense, rank-two or
