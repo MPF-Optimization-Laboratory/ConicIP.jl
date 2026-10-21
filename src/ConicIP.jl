@@ -922,7 +922,10 @@ structurally_zero_cols(M::Diagonal) = iszero.(M.diag)
   refineAbsTol = 1e-12,
   timeLimit = Inf,
   centralityCorrectors = 0,
-  timing = nothing)
+  timing = nothing,
+  log_style = :auto,
+  log_io = stdout,
+  trace = nothing)
 
 Interior point solver for the system
 
@@ -1016,6 +1019,25 @@ Selected keyword arguments:
 - `timing` — a [`PhaseTimes`](@ref) object to accumulate per-phase wall
   times, allocation bytes, and counts into (see `src/timing.jl` for the
   contract); `nothing` (default) leaves the solver uninstrumented.
+- `verbose` — print the iteration log (default `true`).
+- `log_style` — `:auto` (default), `:classic` or `:rich`. `:classic` is the
+  fixed-width ASCII table; `:rich` is a Unicode table with colour, a
+  per-row progress bar toward `optTol`, and an exit card with sparklines
+  of the residuals. `:auto` prints `:rich` on an interactive terminal and
+  `:classic` anywhere else (files, pipes, notebooks, CI), and can be
+  overridden with `ENV["CONICIP_LOG_STYLE"]`. Colour follows `log_io`'s
+  `:color` property and is off when `ENV["NO_COLOR"]` is set.
+- `log_io` — where the log is printed (default `stdout`).
+- `trace` — the iteration history as data, independent of `verbose`: a
+  [`SolverTrace`](@ref), a function called with one `NamedTuple` per
+  event, or a path to append JSON Lines to. When `nothing` (default),
+  `ENV["CONICIP_TRACE"]` names a file if set. See [`SolverTrace`](@ref)
+  for the record schema.
+
+Developer diagnostics for rare internal events (KKT routing and
+regularization, refinement roll-backs, line-search back-offs, certificate
+screening, postsolve rejections) are emitted with `@debug` and shown with
+`ENV["JULIA_DEBUG"] = "ConicIP"`.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows

@@ -40,10 +40,39 @@ const TRACE_SCHEMA = "conicip-trace/1"
 
 In-memory collector for the solver trace: pass `trace = tr` to
 [`conicIP`](@ref), [`preprocess_conicIP`](@ref) or the MOI option
-`"trace"`, and `tr.events` receives one `NamedTuple` per event (`header`,
-`iter`, `note`, `exit`, `final`; the schema is documented in
-`src/trace.jl` and in AGENTS.md). [`iterations`](@ref) extracts the
-iteration records and [`write_jsonl`](@ref) saves the whole trace.
+`"trace"`, and `tr.events` receives one `NamedTuple` per event.
+[`ConicIP.iterations`](@ref) extracts the iteration records and
+[`write_jsonl`](@ref) saves the whole trace.
+
+Every record has `event`, `depth` (0 for the top-level solve) and `t`
+(seconds since the call started). The events, in order, are
+
+- `note` — `source` (`:presolve`, `:equilibrate`, `:stall`, `:fallback`)
+  and `msg`;
+- `header` — once per solve: `schema` (`"conicip-trace/1"`), `version`,
+  sizes `n`, `m`, `p`, `nnzQ`, `nnzA`, `nnzG`, a `cones` summary, `nR`,
+  `nQ`, `nS`, `kktsolver`, `routed`, `nnz_per_col`, `staticReg`,
+  `equilibrated`, `optTol`, `infeasTol`, `maxIters`,
+  `centralityCorrectors`, `timeLimit`;
+- `iter` — one per iteration: the stopping-test residuals `rPr`, `rDu`,
+  `rCp`, `rEq`, `rGap`, `rPrRow`, `rEqRow` and their maximum
+  `optMeasure`, `pobj`, `dobj`, `mu`, the infeasibility screens `icertp`
+  and `icertd` (`NaN` when the ray's sign test fails), and for the step
+  that produced the iterate `alpha`, `sigma` (`NaN` at iteration 1),
+  `refine`, `rnorm` (relative KKT residual after refinement),
+  `kkt_repaired`, `kkt_refactors` (`-1` when the KKT solver reports no
+  diagnostics), `cc_acc`, `cc_try` (`-1` when correctors are off), the
+  running `kkt_solves`, `best` (the iterate became the returned best one)
+  and `refine_warn`;
+- `exit` — how the iteration ended: `kind`, `status`, `detail`;
+- `final` — once, from the entry point the caller called: the returned
+  `status`, `message`, `iters`, `time`, `pobj`, `dobj`, `prFeas`,
+  `duFeas`, `muFeas`, `rGap`, `has_certificate`, `kkt_solves`,
+  `kkt_repaired`, `kkt_refactors`, `changed_from` (the solver's status
+  when postsolve changed it, else `nothing`) and `phases` (seconds per
+  phase when `timing` was given, else `nothing`).
+
+In JSON, `NaN` and `±Inf` are written as `null`.
 
 ```julia
 tr = ConicIP.SolverTrace()

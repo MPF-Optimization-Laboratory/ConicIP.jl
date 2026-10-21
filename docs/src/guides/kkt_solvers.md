@@ -64,7 +64,8 @@ type of the inputs:
 
 `kktsolver_sparse` is never selected automatically any more; it remains
 available by name. With `verbose = true` the solver prints the choice it
-made. Passing `kktsolver` explicitly always overrides the heuristic.
+made, and `JULIA_DEBUG=ConicIP` also logs the cost estimates behind it.
+Passing `kktsolver` explicitly always overrides the heuristic.
 
 ## Built-in Solvers
 
@@ -284,7 +285,9 @@ What `conicIP` guarantees to a custom solver, and what it expects back:
   reasonably accurate for the *unregularized* system; the refinement
   recovers the rest only while it contracts. A solver that returns a
   poor solve every time shows as `maxRefinementSteps` refinements per
-  step in the verbose `refine` column and a red row.
+  step in the log's `refine` column, flagged in red (the whole row in
+  the classic table, the cell in the rich one), and in the `refine` and
+  `rnorm` fields of the trace.
 - **Diagnostics (optional).** `conicIP` calls
   `ConicIP.kkt_diagnostics(solve3x3)` on the object level 2 returned.
   The default method answers `nothing` and nothing more happens. A
@@ -292,8 +295,9 @@ What `conicIP` guarantees to a custom solver, and what it expects back:
   `ConicIP.kkt_diagnostics(::YourSolve3x3Type)`, returning any object
   with integer fields `repaired` and `refactors` (for the current
   factorization) and `repaired_total` and `refactors_total` (summed over
-  the solve). The first pair is printed in the verbose `kkt` column as
-  `repaired/refactors`; the second pair is stored in
+  the solve). The first pair is printed in the log's `kkt` column as
+  `repaired/refactors` (and recorded in the trace as `kkt_repaired` and
+  `kkt_refactors`); the second pair is stored in
   `Solution.kkt_repaired` and `Solution.kkt_refactors`. `kktsolver_ldl`
   returns an `LDLSolve3x3` (callable like the closure it replaces) whose
   `LDLDiagnostics` record also carries the shifts in effect, the

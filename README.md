@@ -100,6 +100,8 @@ sol = conicIP(Q, c, A, b, K, verbose=true);
 
 `sol` holds the status (`sol.status`), primal variables (`sol.y`), dual variables (`sol.v`, `sol.w`), objective values (`sol.pobj`, `sol.dobj`), and convergence residuals (`sol.prFeas`, `sol.duFeas`, `sol.muFeas`).
 
+In a terminal the log is a Unicode table with colour, a progress bar toward the tolerance, and a summary card with sparklines of the residuals; elsewhere (files, CI, notebooks) it is the classic ASCII table. Choose with `log_style = :rich` or `:classic`. The same iteration history is available as data with `trace = SolverTrace()` (or a JSON Lines file), and `JULIA_DEBUG=ConicIP` turns on developer diagnostics.
+
 ## Documentation
 
 The [stable documentation](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/) (or the [development version](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)) covers

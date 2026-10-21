@@ -324,16 +324,14 @@ end
 const _SPARK = ('▁', '▂', '▃', '▄', '▅', '▆', '▇', '█')
 const _EIGHTHS = ('▏', '▎', '▍', '▌', '▋', '▊', '▉', '█')
 
-"""
-    _sparkline(xs; width = 40, scale = :log, floor = 0.0) -> String
-
-One glyph `▁…█` per value of `xs` (downsampled to `width` by taking the
-largest value of each bucket), scaled between the smallest and largest
-finite value on a log₁₀ (`scale = :log`) or linear (`:lin`, clamped to
-[0, 1]) axis. On the log axis, values below `floor` are drawn at the
-floor, which is then the bottom of the axis: residuals at rounding level
-read as `▁` rather than as noise. Nonfinite values are drawn as `·`.
-"""
+# _sparkline(xs; width = 40, scale = :log, floor = 0.0) -> String
+#
+# One glyph `▁…█` per value of `xs` (downsampled to `width` by taking the
+# largest value of each bucket), scaled between the smallest and largest
+# finite value on a log₁₀ (`scale = :log`) or linear (`:lin`, clamped to
+# [0, 1]) axis. On the log axis, values below `floor` are drawn at the
+# floor, which is then the bottom of the axis: residuals at rounding level
+# read as `▁` rather than as noise. Nonfinite values are drawn as `·`.
 function _sparkline(xs::AbstractVector{<:Real}; width::Int = 40, scale::Symbol = :log,
                     floor::Real = 0.0)
   isempty(xs) && return ""
@@ -505,7 +503,7 @@ function _rich_final(log::SolverLog, sol, timing)
   print(io, log.header !== nothing && isempty(h.m) ? " " : "\n ")
   _put(log, "$mark $title"; color = col, bold = true)
   _put(log, "  $iters iteration$(iters == 1 ? "" : "s") · $(_dur(time() - log.t0)) · " *
-            "$(sol.kkt_solves) KKT solves\n"; dim = true)
+            "$(sol.kkt_solves) KKT solve$(sol.kkt_solves == 1 ? "" : "s")\n"; dim = true)
   lab(s) = _put(log, "   " * rpad(s, 12); dim = true)
   tol = log.header === nothing ? 1e-6 : log.header.optTol
   itol = log.header === nothing ? 1e-7 : log.header.infeasTol
@@ -560,7 +558,9 @@ function _rich_final(log::SolverLog, sol, timing)
     _spark_value(log, "μ", h.mu); print(io, "   ")
     steps = filter(!isnan, h.alpha)
     if !isempty(steps)
-      print(io, "step ", _sparkline(steps; scale = :lin), " min ", @sprintf("%.2g", minimum(steps)), "   ")
+      print(io, "step ")
+      _put(log, _sparkline(steps; scale = :lin); color = :cyan)
+      print(io, " min ", @sprintf("%.2g", minimum(steps)), "   ")
     end
     print(io, "refine $(h.refine)")
     log.has_kkt && print(io, " · repaired $(sol.kkt_repaired) · refactors $(sol.kkt_refactors)")
