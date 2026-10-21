@@ -1362,6 +1362,8 @@ function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
       end
       return qs[]
     end
+    s3 === nothing &&
+      @debug "sdpschur: Schur factorization failed, dense kktsolver_qr fallback" _group = :kkt
     s3 === nothing && dense()        # raises if the dense path fails too
 
     function solve3x3(bx, by, bz)

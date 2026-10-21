@@ -7,6 +7,7 @@ include("logging_cases.jl")
 
 import MathOptInterface as MOI
 import JSON
+using Logging
 
 @testset "Solver log" begin
 
@@ -242,6 +243,29 @@ import JSON
         MOI.optimize!(opt, src)
         @test !isempty(ConicIP.iterations(tr))
         @test tr.events[end].event === :final && tr.events[end].status === :Optimal
+    end
+
+    @testset "debug diagnostics" begin
+        P = LOG_QP
+        dbg(f) = @test_logs (:debug, r"KKT routing") match_mode = :any min_level = Logging.Debug f()
+        dbg(() -> conicIP(P.Q, P.c, P.A, P.b, P.K; verbose = false))
+        @test_logs (:debug, r"Farkas ray nominated") match_mode = :any min_level = Logging.Debug conicIP(
+            zeros(1, 1), [0.0], sparse(reshape([1.0, -1.0], 2, 1)), [1.0, 0.0], [("R", 2)];
+            verbose = false)
+        # An LP with Q = 0, no static shift and the natural ordering: LDLᵀ
+        # repairs zero pivots, and with retry on bumps the shifts (see the
+        # deflation test in tranche3_tests.jl)
+        n = 6
+        ksr = (Q, A, G, cd) -> ConicIP.kktsolver_ldl(Q, A, G, cd; static_reg = 0.0,
+                  dynamic_delta = 1e-2, retry_max = 2,
+                  pattern = ConicIP._ldl_pattern(Q, A, G, cd;
+                              perm_hint = collect(1:(size(Q, 1) + size(A, 1) + size(G, 1)))))
+        lp() = conicIP(spzeros(n, n), ones(n), sparse(1.0I, n, n), zeros(n), [("R", n)];
+                       verbose = false, kktsolver = ksr, equilibrate = false)
+        @test_logs (:debug, r"dynamic regularization") match_mode = :any min_level = Logging.Debug lp()
+        @test_logs (:debug, r"static shifts bumped") match_mode = :any min_level = Logging.Debug lp()
+        # nothing at Info and above: the solve path never warns on its own
+        @test_logs conicIP(P.Q, P.c, P.A, P.b, P.K; verbose = false)
     end
 
     @testset "final verdict line" begin

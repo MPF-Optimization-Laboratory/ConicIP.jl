@@ -2065,6 +2065,7 @@ function _conicIP(
         (pchk, w̄, v̄) = validate_infeasibility_certificate(
                           Q, c, A, b, cone_dims, G, d, z.w, z.v;
                           abstol = infeasAbsTol, reltol = infeasTol)
+        @debug "Farkas ray nominated by the screen" _group = :certificate Iter screen = p_infeas pchk
         if pchk.valid; claim = :Infeasible; end
       end
 
@@ -2101,6 +2102,7 @@ function _conicIP(
         (dchk, ȳ) = validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, z.y;
                        abstol = infeasAbsTol, reltol = infeasTol)
+        @debug "recession ray nominated by the screen" _group = :certificate Iter screen = d_infeas dchk
         if dchk.valid; claim = :DualInfeasible; end
       end
 
@@ -2232,11 +2234,14 @@ function _conicIP(
         timing === nothing || (timing.n_refine_resid += 1)
         rnew = @phase timing t_dir_refine_resid step_residual!(Δz, r)
         if !(rnew < rres)               # also catches a NaN residual
+          @debug "refinement correction rolled back: residual grew" _group = :refine stage rres rnew
           copy4!(Δz, _Δz_keep)
           break
         end
         rres = rnew
       end
+      k == maxRefinementSteps && rres > rtol &&
+        @debug "refinement budget spent above tolerance" _group = :refine stage rres rtol
       _it.nref += k                     # iteration total, for the log row
       _it.rnorm = rres / (1 + nr)
       true
@@ -2402,6 +2407,7 @@ function _conicIP(
     # exactly and back off geometrically before accepting it.
     @phase timing t_linesearch b_linesearch begin
     ok = false
+    nhalf = 0
     for _ in 1:30
       _trial_v .= z.v .- α .* Δz.v
       _trial_s .= z.s .- α .* Δz.s
@@ -2410,7 +2416,9 @@ function _conicIP(
         break
       end
       α /= 2
+      nhalf += 1
     end
+    nhalf > 0 && @debug "line search: interiority back-off" _group = :linesearch Iter nhalf α
     if !ok
       sol.status = :Error
       sol.message = "no interior point along the search direction (line search, iteration $Iter)"
@@ -2489,6 +2497,7 @@ function _conicIP(
   # evidence that no interior optimum exists.
   μ_diverged = length(μ_history) > 1 && (!isfinite(μ_history[end]) ||
                 μ_history[end] >= 1e3*minimum(μ_history))
+  @debug "loop exhausted: best iterate re-screened" _group = :certificate best = sol.Iter primal = pchk.valid dual = dchk.valid primal_100x = pchk100.valid dual_100x = dchk100.valid μ_collapsed μ_diverged
   end # @phase t_final
 
   # ── WP5 fallback: recover a ray by an auxiliary min-norm QP ──
