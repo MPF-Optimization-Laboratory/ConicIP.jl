@@ -4,7 +4,7 @@
 [![codecov](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/MPF-Optimization-Laboratory/ConicIP.jl)
 [![Documentation (stable)](https://img.shields.io/badge/docs-stable-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/stable/)
 [![Documentation (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://MPF-Optimization-Laboratory.github.io/ConicIP.jl/dev/)
-[![Version](https://juliahub.com/docs/General/ConicIP/stable/version.svg)](https://juliahub.com/ui/Packages/General/ConicIP)
+[![Version](https://img.shields.io/github/v/tag/MPF-Optimization-Laboratory/ConicIP.jl?sort=semver&label=version)](https://juliahub.com/ui/Packages/General/ConicIP)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/blob/master/LICENSE.md)
 
 [ConicIP.jl](https://github.com/MPF-Optimization-Laboratory/ConicIP.jl) (Conic **I**nterior **P**oint) is a pure-Julia interior-point solver for quadratic programs with linear equality constraints and polyhedral, second-order cone, and semidefinite cone constraints. It solves
