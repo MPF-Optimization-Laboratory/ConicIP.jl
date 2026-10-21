@@ -1,8 +1,8 @@
 > INTERIOR POINT PREPROCESSOR
 - Fixing # variable(s) from singleton equality rows
 - Removing # redundant primal constraints
-> KKT solver: kktsolver_qr (auto, # nnz/col)
 > INTERIOR POINT SOLVER (ConicIP v#)
+> KKT solver: kktsolver_qr (auto, # nnz/col)
 Optimality Objective Infeasibility
 Iter │ prFeas duFeas muFeas │ pobj dobj │ icertp icertd │ refine kkt cc
 # │ # # # │ # # │ # # │ #

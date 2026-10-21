@@ -54,6 +54,11 @@ const LOG_CASES = Pair{String,Function}[
                                            sparse([1.0 0.0 0.0; 0.0 1.0 1.0; 0.0 2.0 2.0]),
                                            [1.0, 1.0, 2.0];
                                            verbose = true, rank_check = :always),
+  # Inconsistent equalities y₁ + y₂ = 1, y₁ + y₂ = 2: a presolve verdict
+  "preprocess_infeasible" => () -> preprocess_conicIP(Matrix(1.0I, 2, 2), ones(2),
+                                     sparse(1.0I, 2, 2), zeros(2), [("R", 2)],
+                                     sparse([1.0 1.0; 1.0 1.0]), [1.0, 2.0];
+                                     verbose = true, rank_check = :always),
 ]
 
 # Captured stdout of `f()`.

@@ -23,4 +23,21 @@ include("logging_cases.jl")
         end
     end
 
+    @testset "final verdict line" begin
+        # The owner adds a line only when postsolve changed the verdict the
+        # solver announced, or when no solve announced one.
+        sol = conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K; verbose = false)
+        final(exit_kind) = begin
+            io = IOBuffer()
+            log = ConicIP.SolverLog(true, true, :classic, io, 0)
+            exit_kind === nothing || ConicIP._log_exit!(log, exit_kind)
+            truncate(io, 0)
+            ConicIP._log_final!(log, sol)
+            String(take!(io))
+        end
+        @test final(:optimal) == ""
+        @test occursin("POSTSOLVE -- status changed: Infeasible → Optimal", final(:infeasible))
+        @test occursin("EXIT -- Optimal", final(nothing))
+    end
+
 end

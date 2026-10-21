@@ -1066,8 +1066,10 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                  equilibrate = true, timeLimit = Inf, timing = nothing,
                  verbose = true, _log = nothing, kwargs...)
   t_start = time()
-  # The log is created here unless a caller up the stack (presolve) owns it.
-  log = _log === nothing ? _make_log(verbose) : _log
+  # The log is created here unless a caller up the stack (presolve) owns
+  # it; the owner reports the final verdict.
+  owner = _log === nothing
+  log = owner ? _make_log(verbose) : _log
   # t_gc: every entry point (this one, preprocess_conicIP, _preprocess_core,
   # the MOI optimize!) assigns it on exit; the outermost writes last and
   # wins (see gc_start/gc_stop! in timing.jl). `_conicIP` never touches it.
@@ -1075,6 +1077,7 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
   if !equilibrate
     sol = _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, timing = timing,
                    _log = log, kwargs...)
+    owner && log.on && _log_final!(log, sol)
     return gc_stop!(timing, gc0, sol)
   end
   eq = @phase timing t_equilibrate b_equilibrate equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
@@ -1097,6 +1100,7 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                              infeasTol = Float64(get(kwargs, :infeasTol, 1e-7)),
                              infeasAbsTol = Float64(get(kwargs, :infeasAbsTol, 1e-9)))
   end
+  owner && log.on && _log_final!(log, sol)
   return gc_stop!(timing, gc0, sol)
 end
 
@@ -1354,9 +1358,10 @@ function _conicIP(
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
       return exit_setup(claim_infeasible!(sol0, w̄, v̄))
     end
+    msg0 = "zero equality row certificate could not be normalized and validated"
+    log.on && _log_exit!(log, :error, msg0)
     return exit_setup(Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false,
-                    "zero equality row certificate could not be normalized and validated", 0))
+                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false, msg0, 0))
   end
 
   j0 = findfirst(j -> Zc[j] && c[j] != 0, 1:n)
@@ -1371,9 +1376,10 @@ function _conicIP(
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
       return exit_setup(claim_dual_infeasible!(sol0, ȳ, A))
     end
+    msg0 = "zero column certificate could not be normalized and validated"
+    log.on && _log_exit!(log, :error, msg0)
     return exit_setup(Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false,
-                    "zero column certificate could not be normalized and validated", 0))
+                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false, msg0, 0))
   end
 
   if any(Gzr) || any(Zc)
@@ -1697,7 +1703,10 @@ function _conicIP(
   end
 
   # A nonfinite initial point would reach LAPACK through maxstep below.
-  isfinite4(z) || return exit_init(errsol("non-finite initial point (initial point)"))
+  if !isfinite4(z)
+    log.on && _log_exit!(log, :error, "non-finite initial point (initial point)")
+    return exit_init(errsol("non-finite initial point (initial point)"))
+  end
 
   (α_v, α_s) = try
     (maxstep(z.v, nothing), maxstep(z.s, nothing))
@@ -2420,6 +2429,7 @@ function _conicIP(
 
   _stamp_kkt!(sol)
   if over_time()
+    log.on && _log_exit!(log, :time_limit, "$(timeLimit) s")
     sol.status = :TimeLimit
     return sol
   end
@@ -2516,6 +2526,7 @@ function _conicIP(
   end
 
   if over_time()
+    log.on && _log_exit!(log, :time_limit, "$(timeLimit) s")
     sol.status = :TimeLimit
     return sol
   end
@@ -2532,6 +2543,18 @@ function _conicIP(
     sol.status = :AlmostDualInfeasible
   else
     sol.status = :Abandoned
+  end
+
+  if log.on
+    best = "best iterate from iteration $(sol.Iter)"
+    if sol.status === :Abandoned
+      reason = isempty(sol.message) ? "iteration limit $maxIters" : sol.message
+      _log_exit!(log, :abandoned, "$reason; $best")
+    else
+      _log_exit!(log, sol.status === :AlmostInfeasible ? :almost_infeasible :
+                      :almost_dual_infeasible,
+                 "a ray validates only at 100×infeasTol; $best")
+    end
   end
 
   return sol

@@ -40,7 +40,15 @@ mutable struct SolverLog
   style   :: Symbol    # resolved style: :classic
   io      :: IO
   depth   :: Int       # 0 for the top-level solve
+  t0      :: Float64   # time() when the owner created the log
+  # The last verdict `_conicIP` reported (_log_exit!), against which the
+  # owner's final status is compared; :None until there is one.
+  exit_kind   :: Symbol
+  exit_status :: Symbol
 end
+
+SolverLog(on, show, style, io, depth) =
+  SolverLog(on, show, style, io, depth, time(), :none, :None)
 
 # The log of a solve that prints nothing. Never mutated.
 const _NOLOG = SolverLog(false, false, :classic, devnull, 0)
@@ -49,6 +57,14 @@ function _make_log(verbose::Bool)
   verbose || return _NOLOG
   return SolverLog(true, true, :classic, stdout, 0)
 end
+
+# The status each exit kind returns.
+const _EXIT_STATUS = Dict{Symbol,Symbol}(
+  :optimal => :Optimal, :infeasible => :Infeasible, :dual_infeasible => :DualInfeasible,
+  :struct_infeasible => :Infeasible, :struct_dual_infeasible => :DualInfeasible,
+  :error => :Error, :diverged => :Error, :time_limit => :TimeLimit,
+  :abandoned => :Abandoned, :almost_infeasible => :AlmostInfeasible,
+  :almost_dual_infeasible => :AlmostDualInfeasible)
 
 # ──────────────────────────────────────────────────────────────
 #  Events
@@ -80,10 +96,10 @@ end
 @noinline function _log_header!(log::SolverLog, h::NamedTuple)
   log.show || return nothing
   io = log.io
-  if h.routed
-    @printf(io, " > KKT solver: %s (auto, %.1f nnz/col)\n", h.kktsolver, h.nnz_per_col)
-  end
   print(io, "\n > INTERIOR POINT SOLVER (ConicIP v$(h.version))\n\n")
+  if h.routed
+    @printf(io, " > KKT solver: %s (auto, %.1f nnz/col)\n\n", h.kktsolver, h.nnz_per_col)
+  end
   return nothing
 end
 
@@ -122,21 +138,41 @@ end
   return nothing
 end
 
-# How `_conicIP` left: `kind` is one of :optimal :infeasible
-# :dual_infeasible :struct_infeasible :struct_dual_infeasible :error
-# :diverged :time_limit, and `detail` the reason shown with it.
+# How `_conicIP` left: `kind` is a key of _EXIT_STATUS, and `detail` the
+# reason shown with it.
 @noinline function _log_exit!(log::SolverLog, kind::Symbol, detail::AbstractString = "")
+  log.exit_kind = kind
+  log.exit_status = _EXIT_STATUS[kind]
   log.show || return nothing
   text = kind === :optimal                ? "Below Tolerance!" :
-         kind === :infeasible             ? "Certificate of Infeasiblity Found!" :
+         kind === :infeasible             ? "Certificate of Infeasibility Found!" :
          kind === :dual_infeasible        ? "Certificate of Dual Infeasibility Found!" :
          kind === :struct_infeasible      ? "Structurally infeasible ($detail)" :
          kind === :struct_dual_infeasible ? "Structurally dual infeasible ($detail)" :
          kind === :error                  ? "Error! ($detail)" :
          kind === :diverged               ? "Error!" :
          kind === :time_limit             ? "Time limit reached ($detail)" :
+         kind === :abandoned              ? "No verdict ($detail)" :
+         kind === :almost_infeasible      ? "Almost infeasible ($detail)" :
+         kind === :almost_dual_infeasible ? "Almost dual infeasible ($detail)" :
                                             string(kind)
   print(log.io, "\n > EXIT -- ", text, "\n\n")
+  return nothing
+end
+
+# The verdict the caller receives, reported once by the log's owner after
+# postsolve and certificate revalidation. In the classic table it adds a
+# line only when that verdict is not the one the solver's own exit line
+# announced (or when no solve ran, as for a presolve verdict).
+@noinline function _log_final!(log::SolverLog, sol)
+  log.show || return nothing
+  msg = isempty(sol.message) ? "" : " ($(sol.message))"
+  if log.exit_status === :None
+    print(log.io, "\n > EXIT -- ", sol.status, msg, "\n\n")
+  elseif sol.status !== log.exit_status
+    print(log.io, "\n > POSTSOLVE -- status changed: ", log.exit_status, " → ",
+          sol.status, msg, "\n\n")
+  end
   return nothing
 end
 

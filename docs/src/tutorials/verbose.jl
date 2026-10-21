@@ -117,7 +117,7 @@ println("status: ", sol.status)
 #
 # The log ends with a one-line verdict. `EXIT -- Below Tolerance!` means all
 # three optimality residuals cleared `optTol`, and the status returned is
-# `:Optimal`. The other exits — `Certificate of Infeasiblity Found!`,
+# `:Optimal`. The other exits — `Certificate of Infeasibility Found!`,
 # `Certificate of Dual Infeasibility Found!`, and `Error!` — are the subject
 # of the next page.
 #

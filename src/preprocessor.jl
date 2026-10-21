@@ -92,8 +92,14 @@ function preprocess_conicIP(Q, c::AbstractVector,
   t_start = time()
   time_left() = timeLimit - (time() - t_start)
   gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
-  # The log is created here (see logging.jl) and handed down to the solve.
-  log = _log === nothing ? _make_log(verbose) : _log
+  # The log is created here (see logging.jl) and handed down to the solve;
+  # its owner reports the final verdict on every exit.
+  owner = _log === nothing
+  log = owner ? _make_log(verbose) : _log
+  function finish(sol)
+    owner && log.on && _log_final!(log, sol)
+    return gc_stop!(timing, gc0, sol)
+  end
 
   log.on && _log_presolve_start!(log)
 
@@ -109,7 +115,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     fix_singletons ? _singleton_fixings(G, d; protect = protect) : nothing
   end
   if fx === nothing
-    return gc_stop!(timing, gc0, _preprocess_core(Q, c, A, b, cone_dims, G, d;
+    return finish(_preprocess_core(Q, c, A, b, cone_dims, G, d;
                             _log = log, rank_check = rank_check, timeLimit = time_left(),
                             timing = timing, options...))
   end
@@ -127,7 +133,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     # sign with dᵀw < 0 and let the validator normalize and confirm it.
     # (The block evaluates to the Solution so the phase closes before the
     # return.)
-    return gc_stop!(timing, gc0, @phase timing t_presolve b_presolve begin
+    return finish(@phase timing t_presolve b_presolve begin
       (i, k, j) = conflict
       Gs = sparse(G)
       w0 = zeros(p); w0[i] = 1 / Gs[i, j]; w0[k] = -1 / Gs[k, j]
@@ -186,7 +192,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # row's stationarity formula exact). Rays: a primal ray has zero fixed
   # components; a Farkas ray needs wᵢ chosen so that column j of Gᵀw − Aᵀv
   # vanishes, which is the same formula with c and Qy dropped.
-  return gc_stop!(timing, gc0, @phase timing t_postsolve begin
+  return finish(@phase timing t_postsolve begin
     y = fill(NaN, n); w = fill(NaN, p)
     if all(isfinite, sol.y)
       y[keepc] = sol.y

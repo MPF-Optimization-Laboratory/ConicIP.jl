@@ -1,6 +1,6 @@
-> KKT solver: kktsolver_qr (auto, # nnz/col)
 > INTERIOR POINT SOLVER (ConicIP v#)
+> KKT solver: kktsolver_qr (auto, # nnz/col)
 Optimality Objective Infeasibility
 Iter │ prFeas duFeas muFeas │ pobj dobj │ icertp icertd │ refine kkt cc
 # │ # # # │ # # │ # # │ #
-> EXIT -- Certificate of Infeasiblity Found!
+> EXIT -- Certificate of Infeasibility Found!
