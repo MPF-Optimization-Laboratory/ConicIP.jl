@@ -86,6 +86,8 @@ function preprocess_conicIP(Q, c::AbstractVector,
   fix_singletons = true,
   timeLimit = Inf,
   timing = nothing,
+  log_style = :auto,
+  log_io::IO = stdout,
   _log = nothing,
   options...)
 
@@ -95,9 +97,9 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # The log is created here (see logging.jl) and handed down to the solve;
   # its owner reports the final verdict on every exit.
   owner = _log === nothing
-  log = owner ? _make_log(verbose) : _log
+  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io) : _log
   function finish(sol)
-    owner && log.on && _log_final!(log, sol)
+    owner && log.on && _log_final!(log, sol, timing)
     return gc_stop!(timing, gc0, sol)
   end
 

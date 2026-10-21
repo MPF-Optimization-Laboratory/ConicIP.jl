@@ -1,6 +1,7 @@
 # Fixed problems whose solver logs are pinned by test/logging_tests.jl.
-# Each case is `name => f`, where `f()` runs one solve with the log on and
-# its output going to `stdout`; the harness captures and compares it.
+# Each case is `name => f`, where `f(; kw...)` runs one solve with the log
+# on and its output going to `stdout` (the keywords are passed to the
+# solver); the harness captures and compares it.
 # Shared with the local before/after diff used when the log code changes,
 # so keep every case deterministic.
 
@@ -15,50 +16,50 @@ const LOG_QP = (Q = [2.0 0.5 0.0; 0.5 2.0 0.5; 0.0 0.5 2.0], c = [1.0, 2.0, 3.0]
 
 const LOG_CASES = Pair{String,Function}[
   # The QP of docs/src/tutorials/verbose.jl
-  "qp_optimal" => () -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
-                                verbose = true),
+  "qp_optimal" => (; kw...) -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
+                                verbose = true, kw...),
   # kkt column filled by kktsolver_ldl
-  "qp_ldl" => () -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
-                            verbose = true, kktsolver = ConicIP.kktsolver_ldl),
+  "qp_ldl" => (; kw...) -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
+                            verbose = true, kw..., kktsolver = ConicIP.kktsolver_ldl),
   # cc column
-  "qp_correctors" => () -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
-                                   verbose = true, kktsolver = ConicIP.kktsolver_qr,
+  "qp_correctors" => (; kw...) -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
+                                   verbose = true, kw..., kktsolver = ConicIP.kktsolver_qr,
                                    centralityCorrectors = 2),
   # Iteration limit: :Abandoned
-  "qp_abandoned" => () -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
-                                  verbose = true, maxIters = 2, certFallback = false),
+  "qp_abandoned" => (; kw...) -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
+                                  verbose = true, kw..., maxIters = 2, certFallback = false),
   # max y₁ + y₂ over the unit second-order cone ball
-  "soc" => () -> conicIP(zeros(2, 2), [1.0, 1.0],
+  "soc" => (; kw...) -> conicIP(zeros(2, 2), [1.0, 1.0],
                          sparse([0.0 0.0; 1.0 0.0; 0.0 1.0]), [-1.0, 0.0, 0.0],
-                         [("Q", 3)]; verbose = true),
+                         [("Q", 3)]; verbose = true, kw...),
   # min ⟨C, X⟩ over tr X = 1, X ⪰ 0 (2×2, vecm form)
-  "sdp" => () -> conicIP(zeros(3, 3), -[2.0, sqrt(2.0), 3.0], sparse(1.0I, 3, 3),
+  "sdp" => (; kw...) -> conicIP(zeros(3, 3), -[2.0, sqrt(2.0), 3.0], sparse(1.0I, 3, 3),
                          zeros(3), [("S", 3)], sparse([1.0 0.0 1.0]), [1.0];
-                         verbose = true),
+                         verbose = true, kw...),
   # y ≥ 1 and −y ≥ 0
-  "infeasible" => () -> conicIP(zeros(1, 1), [0.0], sparse(reshape([1.0, -1.0], 2, 1)),
-                                [1.0, 0.0], [("R", 2)]; verbose = true),
+  "infeasible" => (; kw...) -> conicIP(zeros(1, 1), [0.0], sparse(reshape([1.0, -1.0], 2, 1)),
+                                [1.0, 0.0], [("R", 2)]; verbose = true, kw...),
   # min −y over y ≥ 0
-  "dual_infeasible" => () -> conicIP(zeros(1, 1), [1.0], sparse(reshape([1.0], 1, 1)),
-                                     [0.0], [("R", 1)]; verbose = true),
+  "dual_infeasible" => (; kw...) -> conicIP(zeros(1, 1), [1.0], sparse(reshape([1.0], 1, 1)),
+                                     [0.0], [("R", 1)]; verbose = true, kw...),
   # 0ᵀy = 1
-  "struct_infeasible" => () -> conicIP(zeros(2, 2), [1.0, 1.0], sparse(1.0I, 2, 2),
+  "struct_infeasible" => (; kw...) -> conicIP(zeros(2, 2), [1.0, 1.0], sparse(1.0I, 2, 2),
                                        zeros(2), [("R", 2)], spzeros(1, 2), [1.0];
-                                       verbose = true),
+                                       verbose = true, kw...),
   # Factorization failure at the initial point
-  "kkt_error" => () -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
-                               verbose = true, kktsolver = _failing_kktsolver),
+  "kkt_error" => (; kw...) -> conicIP(LOG_QP.Q, LOG_QP.c, LOG_QP.A, LOG_QP.b, LOG_QP.K;
+                               verbose = true, kw..., kktsolver = _failing_kktsolver),
   # Singleton row (fixes y₁) and a redundant pair of rows
-  "preprocess" => () -> preprocess_conicIP(Matrix(1.0I, 3, 3), ones(3),
+  "preprocess" => (; kw...) -> preprocess_conicIP(Matrix(1.0I, 3, 3), ones(3),
                                            sparse(1.0I, 3, 3), zeros(3), [("R", 3)],
                                            sparse([1.0 0.0 0.0; 0.0 1.0 1.0; 0.0 2.0 2.0]),
                                            [1.0, 1.0, 2.0];
-                                           verbose = true, rank_check = :always),
+                                           verbose = true, kw..., rank_check = :always),
   # Inconsistent equalities y₁ + y₂ = 1, y₁ + y₂ = 2: a presolve verdict
-  "preprocess_infeasible" => () -> preprocess_conicIP(Matrix(1.0I, 2, 2), ones(2),
+  "preprocess_infeasible" => (; kw...) -> preprocess_conicIP(Matrix(1.0I, 2, 2), ones(2),
                                      sparse(1.0I, 2, 2), zeros(2), [("R", 2)],
                                      sparse([1.0 1.0; 1.0 1.0]), [1.0, 2.0];
-                                     verbose = true, rank_check = :always),
+                                     verbose = true, kw..., rank_check = :always),
 ]
 
 # Captured stdout of `f()`.

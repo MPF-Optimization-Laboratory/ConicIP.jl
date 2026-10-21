@@ -1064,12 +1064,13 @@ original coordinates; see [`equilibrate_conicIP`](@ref). A custom
 function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                  G = spzeros(0, length(c)), d = zeros(0);
                  equilibrate = true, timeLimit = Inf, timing = nothing,
-                 verbose = true, _log = nothing, kwargs...)
+                 verbose = true, log_style = :auto, log_io::IO = stdout,
+                 _log = nothing, kwargs...)
   t_start = time()
   # The log is created here unless a caller up the stack (presolve) owns
   # it; the owner reports the final verdict.
   owner = _log === nothing
-  log = owner ? _make_log(verbose) : _log
+  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io) : _log
   # t_gc: every entry point (this one, preprocess_conicIP, _preprocess_core,
   # the MOI optimize!) assigns it on exit; the outermost writes last and
   # wins (see gc_start/gc_stop! in timing.jl). `_conicIP` never touches it.
@@ -1077,10 +1078,11 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
   if !equilibrate
     sol = _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, timing = timing,
                    _log = log, kwargs...)
-    owner && log.on && _log_final!(log, sol)
+    owner && log.on && _log_final!(log, sol, timing)
     return gc_stop!(timing, gc0, sol)
   end
   eq = @phase timing t_equilibrate b_equilibrate equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
+  log.on && _log_note!(log, :equilibrate, _equilibrate_msg(eq))
   # The core tests termination on residuals mapped back to the original
   # coordinates, so optTol keeps its meaning under any scaling.
   scaling = @phase timing t_equilibrate b_equilibrate (
@@ -1100,7 +1102,7 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                              infeasTol = Float64(get(kwargs, :infeasTol, 1e-7)),
                              infeasAbsTol = Float64(get(kwargs, :infeasAbsTol, 1e-9)))
   end
-  owner && log.on && _log_final!(log, sol)
+  owner && log.on && _log_final!(log, sol, timing)
   return gc_stop!(timing, gc0, sol)
 end
 
@@ -1720,7 +1722,7 @@ function _conicIP(
   z.s = z.s - α_s*e
   exit_init(nothing)
 
-  log.on && _log_table_start!(log)
+  log.on && _log_table_start!(log, kkt_diagnostics(_s3_cur[]) !== nothing)
 
   # ────────────────────────────────────────────────────────────
   #  Iterate Loop
