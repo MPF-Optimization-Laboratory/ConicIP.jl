@@ -76,12 +76,16 @@ _gram_chunk(rows, nbuf) = max(1, _GRAM_WORKSPACE_BYTES[] ÷ (8 * nbuf * max(rows
 # workspaces of each semidefinite block (an upper bound: unused blocks
 # allocate none), the sparse product of a diagonal block (at most ncol²
 # entries), and the streamed chunks, which never exceed the workspace (or
-# one column of the largest row count, when that alone is larger).
+# one column of the largest row count, when that alone is larger). With a
+# second-order cone there are two streamed phases, its products and then any
+# recomputation of suspect rows, whose chunks may both be live until the GC
+# runs, so both are counted.
 function _gram_bytes(m, ncol, cone_dims)
   # Six resident order-k matrices per block, plus three transient ones
   # (mat(x), RᵀX, RᵀXR) while a block applies its congruence to a column.
   ws = 8 * 9 * sum((ord(1:d)^2 for (t, d) in cone_dims if t == "S"); init = 0)
   stream = min(32 * m * ncol, max(_GRAM_WORKSPACE_BYTES[], 32 * m))
+  any(cd -> cd[1] == "Q", cone_dims) && (stream *= 2)
   return ws + 16 * ncol^2 + stream
 end
 
