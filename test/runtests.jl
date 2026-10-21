@@ -3739,6 +3739,8 @@ end
 
     include("tranche3_tests.jl")
 
+    include("logging_tests.jl")
+
     include("sdp_tests.jl")
     include("dualization_tests.jl")
     include("sdpschur_tests.jl")

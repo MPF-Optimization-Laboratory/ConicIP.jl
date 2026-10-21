@@ -1,0 +1,5 @@
+> KKT solver: kktsolver_qr (auto, # nnz/col)
+> INTERIOR POINT SOLVER (ConicIP v#)
+Optimality Objective Infeasibility
+Iter │ prFeas duFeas muFeas │ pobj dobj │ icertp icertd │ refine kkt cc
+# │ # # # │ # # │ # # │ #

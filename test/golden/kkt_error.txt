@@ -1,0 +1,2 @@
+> INTERIOR POINT SOLVER (ConicIP v#)
+> EXIT -- Error! (KKT solve failed (initial point): SingularException: matrix is singular; factorization failed. Zero pivot found at index #)
