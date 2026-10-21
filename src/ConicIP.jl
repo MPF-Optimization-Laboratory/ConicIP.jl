@@ -1201,10 +1201,11 @@ function _conicIP(
   timing = nothing,        # PhaseTimes to accumulate into (timing.jl); bound
                            # once here and only ever read, so the closures
                            # below capture it by value
-  _log::SolverLog = _NOLOG # the caller's log (logging.jl); read-only here too
+  _log::SolverLog = _NOLOG,# the caller's log (logging.jl); read-only here too
+  verbose::Bool = false    # direct callers only: a log of its own, classic
   )
 
-  log = _log
+  log = verbose && _log === _NOLOG ? _make_log(true; log_style = :classic) : _log
 
   centralityCorrectors >= 0 ||
     throw(ArgumentError("centralityCorrectors must be a nonnegative integer (got $centralityCorrectors)"))

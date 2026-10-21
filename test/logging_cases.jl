@@ -79,6 +79,8 @@ end
 # depend on the BLAS and the Julia version; the skeleton does not.
 function log_skeleton(s::AbstractString)
   s = replace(s, r"\e\[[0-9;]*m" => "")
+  # an exception's text depends on the Julia version
+  s = replace(s, r"(KKT solve failed \([^)]*\)): .*\)$"m => s"\1: <exception>)")
   s = replace(s, r"[-+]?(?:\d+(?:\.\d+)*(?:[eE][-+]?\d+)?|\bNaN\b|\bInf\b)" => "#")
   out = String[]
   for line in split(s, '\n')
