@@ -1025,23 +1025,9 @@ end
 
 _allfinite(x) = all(isfinite, x)
 
-# log2 ‖x‖ over the entries idx (−Inf for zero or none): the entries are
-# scaled by the exact power of two 2^e of the largest, so the sum of squares
-# s cannot overflow or underflow, and log2 ‖x‖ = e + ½ log2 s. Allocation-free.
-function _lnorm(x, idx)
-  μ = 0.0
-  for i in idx
-    μ = max(μ, abs(x[i]))
-  end
-  μ == 0 && return -Inf
-  isfinite(μ) || return Inf
-  e = exponent(μ)
-  s = 0.0
-  for i in idx
-    s += ldexp(x[i], -e)^2
-  end
-  return e + 0.5 * log2(s)
-end
+# log2 ‖x‖ (−Inf for zero or empty): the entries are scaled by the exact
+# power of two 2^e of the largest, so the sum of squares s cannot overflow or
+# underflow, and log2 ‖x‖ = e + ½ log2 s. Allocation-free.
 function _lnorm(x::AbstractVector)
   μ = 0.0
   for xi in x
@@ -1071,20 +1057,6 @@ function _lnorm(x, lst::Vector{Int}, rng::UnitRange{Int})
     s += ldexp(x[lst[k]], -e)^2
   end
   return e + 0.5 * log2(s)
-end
-
-# log2 of the norm of a vector given by the log2 norms L[h] of its parts h ∈ idx.
-function _lnormL(L, lst::Vector{Int}, rng::UnitRange{Int})
-  M = -Inf
-  for k in rng
-    M = max(M, L[lst[k]])
-  end
-  (M == -Inf || M == Inf) && return M
-  s = 0.0
-  for k in rng
-    s += exp2(2 * (L[lst[k]] - M))
-  end
-  return M + 0.5 * log2(s)
 end
 
 # log2 Σ 2^Lᵢ.
