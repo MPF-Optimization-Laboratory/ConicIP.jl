@@ -98,6 +98,8 @@ ConicIP.kktsolver_ldl
 ConicIP.cached_kktsolver_ldl
 ConicIP.soc_uv
 ConicIP.kktsolver_qr
+ConicIP.kktsolver_sdpschur
+ConicIP.sdpschur_eligible
 ConicIP.kktsolver_sparse
 ConicIP.kktsolver_2x2
 ConicIP.pivot
@@ -163,4 +165,7 @@ ConicIP.spectral_map!
 ConicIP.clip_spectral!
 ConicIP.centrality_correction!
 ConicIP._psd_vecm_to_moi
+ConicIP._schur_split
+ConicIP._gram_plan
+ConicIP._gram!
 ```

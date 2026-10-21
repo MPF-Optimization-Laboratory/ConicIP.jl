@@ -112,6 +112,7 @@ function _resolve_kktsolver(v)
     s == "auto"             && return default_kktsolver
     s == "ldl"              && return kktsolver_ldl
     s == "qr"               && return kktsolver_qr
+    s == "sdpschur"         && return kktsolver_sdpschur
     s == "sparse"           && return kktsolver_sparse
     s in ("2x2", "pivot")   && return pivot(kktsolver_2x2)
     throw(ArgumentError(

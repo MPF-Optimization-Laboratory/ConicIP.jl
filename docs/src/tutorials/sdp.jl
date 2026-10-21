@@ -13,17 +13,30 @@
 # objectives through the direct [`conicIP`](@ref) API. Through JuMP, see the
 # [JuMP Integration](@ref) guide for what the wrapper accepts.
 #
-# **How it is solved.** A problem with any `"S"` block is routed to
-# [`kktsolver_qr`](@ref ConicIP.kktsolver_qr), the dense double-QR method —
-# see the [KKT Solvers](@ref) guide. The Nesterov-Todd scaling block of a
-# semidefinite cone is a dense congruence transform, so the sparse solver has
-# nothing to exploit. The cost model follows from that routing: the dense
-# variable-space and reduced matrices grow with the *total* cone-vector
-# dimension times the number of variables, not with the order of a single
-# block. An order-`n` block contributes `n(n+1)/2` rows, so a single
-# order-100 block is 5050 rows, and a hundred order-10 blocks are 5500 rows —
-# comparable cost, even though the largest matrix differs by an order of
-# magnitude. Memory, not iteration count, is the binding constraint.
+# **How it is solved.** A problem with any `"S"` block is routed to a dense
+# method — see the [KKT Solvers](@ref) guide. The Nesterov-Todd scaling block
+# of a semidefinite cone is a dense congruence transform, so the sparse
+# solver has nothing to exploit. A problem with a PSD variable — standard
+# form (`Q = 0`, every variable one cone coordinate), or a few other
+# variables and rows besides — goes to
+# [`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur), which factors a
+# matrix the size of the equality block plus those extras; every other one to
+# [`kktsolver_qr`](@ref ConicIP.kktsolver_qr), which factors a matrix the
+# size of the variable count. Both assemble their matrix from the sparse
+# coefficient matrices of each block, in work that grows with the block
+# order cubed per coefficient matrix (less when it is sparse), so the
+# number of variables or equalities — not the order of a single block — is
+# what bounds memory.
+#
+# **The formulation matters.** A PSD *variable* (`@variable(model, X, PSD)`)
+# makes every matrix entry a solver variable. When the entries are
+# constrained by the cone, linear equalities and only a few other rows
+# (linear objective in the entries), ConicIP eliminates them and factors a
+# system of about the equality count instead
+# ([`kktsolver_sdpschur`](@ref ConicIP.kktsolver_sdpschur)); otherwise the
+# dense path grows like `k⁶` in the block order `k`. The
+# [SDP Formulation](@ref "Formulating Semidefinite Programs") guide says
+# which models qualify and how Dualization.jl handles the rest.
 #
 # **Accuracy in practice.** The SDPLIB 1.2 benchmark set (Borchers 1999) is
 # the reference. `benchmark/sdplib.jl` runs a spread of instances through the
@@ -37,30 +50,31 @@
 #
 # | Instances | `optTol` | Outcome |
 # |:---|:---|:---|
-# | `control1`, `truss1`–`truss4`, `theta1`, `theta2`, `mcp100`, `mcp124-1`, `qap5`, `arch0` | `1e-8` | `OPTIMAL`, relative error `1e-7` … `1e-10` |
-# | `control2`, `control3`, `gpp100`, `hinf2` | `1e-6` (default) | `OPTIMAL`, relative error `2e-7` … `2e-5` |
-# | `hinf1`, `hinf3`, `qap6` | `1e-4` | `OPTIMAL`, relative error `3e-4` … `1e-3` |
+# | `control1`, `control2`, `truss1`–`truss4`, `theta1`, `theta2`, `mcp100`, `mcp124-1`, `qap5`, `arch0` | `1e-8` | `OPTIMAL`, relative error `7e-11` … `4e-7` |
+# | `control3`, `gpp100`, `hinf2`, `qap6` | `1e-6` (default) | `OPTIMAL`, relative error `3e-8` … `2e-5` |
+# | `hinf1`, `hinf3` | `1e-6` (default) | `OPTIMAL`, relative error `2e-4` … `8e-4` |
 #
-# Each row gives a tolerance that solves those instances; `optTol = 1e-4`
-# solves every instance in the table. Solve times are modest:
-# `theta1` (order 50) takes about 0.1 s, `theta2` (order 100) about 1.7 s,
-# and `arch0` (order 335) about 8 s.
+# Each row gives a tolerance that solves those instances; the default
+# `optTol = 1e-6` solves every instance in the table. Solve times
+# are modest: `theta1` (order 50) takes about 0.04 s, `theta2` (order 100)
+# about 0.15 s, and `arch0` (order 335) about 1.3 s.
 #
 # **What is not there.**
 #
-# - No chordal decomposition and no sparse-SDP specialization. A large
-#   sparse coefficient matrix is factored densely once an `"S"` block is
-#   present.
-# - The degenerate instances need a loose tolerance. The `hinf` family lacks
-#   strict complementarity, and `qap6` behaves the same way: once feasibility
-#   reaches roughly `1e-6` the KKT system is ill-conditioned, the Newton step
-#   loses accuracy, and the iteration stagnates. At the default `optTol =
-#   1e-6`, `hinf1` and `qap6` return `ITERATION_LIMIT` and `hinf3` returns
-#   `NUMERICAL_ERROR`. Set `optTol = 1e-4` for these.
-# - Tighter is not always better. `control2`, `control3`, `gpp100` and
-#   `hinf2` give six correct digits at the default tolerance, but at
-#   `optTol = 1e-8` they stagnate in the same way and come back as
-#   `ITERATION_LIMIT` or `NUMERICAL_ERROR`. Loosen before tightening.
+# - No chordal decomposition. The reduced matrix is dense and factored by
+#   Cholesky (Bunch-Kaufman in the mixed form): sparse coefficient matrices
+#   make its assembly cheap, not its factorization, so the number of
+#   variables (or of equalities, in standard form) bounds the problem size.
+# - The degenerate instances are solved less accurately. The `hinf` family
+#   lacks strict complementarity, and `qap6` behaves the same way: once
+#   feasibility reaches roughly `1e-6` the KKT system is ill-conditioned and
+#   the Newton step loses accuracy. At the default tolerance `hinf1` and
+#   `hinf3` stop with three or four correct digits, and `qap6` needs 91
+#   iterations (19 at `optTol = 1e-4`).
+# - Tighter is not always better. `control3`, `gpp100`, `qap6`, `hinf1` and
+#   `hinf3` solve at the default tolerance, but at `optTol = 1e-8` they
+#   stagnate and come back as `ITERATION_LIMIT` or `NUMERICAL_ERROR`.
+#   Loosen before tightening.
 #
 # **Failures are statuses, not exceptions.** Every factorization and cone
 # line search that can fail on a boundary iterate is guarded. A failure ends

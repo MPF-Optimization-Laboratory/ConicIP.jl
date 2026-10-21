@@ -39,6 +39,7 @@ makedocs(;
             "JuMP Integration" => "guides/jump.md",
             "KKT Solvers" => "guides/kkt_solvers.md",
             "Preprocessing" => "guides/preprocessing.md",
+            "SDP Formulation" => "guides/sdp_formulation.md",
         ],
         "Mathematical Background" => "background.md",
         "API Reference" => "api.md",

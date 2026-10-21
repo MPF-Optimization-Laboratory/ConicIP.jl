@@ -24,6 +24,14 @@ excluded. Peak usage can be a small multiple of this figure.
 """
 dense_kkt_bytes(n, m, p) = 8 * (2n^2 + 2m*max(n - p, 0) + 2max(n - p, 0)^2)
 
+# Default dense storage budget of choose_kktsolver (4 GiB).
+const _DENSE_BYTES_MAX = 4 * 2^30
+
+# Dense storage of kktsolver_sdpschur's p×p Schur matrix in standard form:
+# the matrix, its equilibrated copy and the Cholesky factor. The router's
+# full estimate (`_sdpschur_bytes` in schur.jl) adds the Gram workspaces.
+sdpschur_bytes(p) = 8 * 3p^2
+
 """
     dense_kkt_flops(n, m, p; nnzA = 0, nnzQ = 0, iters = 25)
 
@@ -88,6 +96,11 @@ Pick a KKT solver from the problem's cone mix, size, and predicted
 factorization cost (issue #10). Returns one of the solver constructors,
 chosen by:
 
+- a semidefinite program with a PSD variable ([`sdpschur_eligible`](@ref):
+  standard form, or a semidefinite block whose entries are variables
+  with a reduced system at most half the variable count) whose reduced
+  matrix and factorization fit `dense_bytes_max` (`sdpschur_bytes(p)` in
+  standard form) ⇒ [`kktsolver_sdpschur`](@ref), before any rule below;
 0. the dense solver's storage estimate [`dense_kkt_bytes`](@ref) above
    `dense_bytes_max` ⇒ [`kktsolver_ldl`](@ref), whatever the rules
    below would say — dense QR at that size is an out-of-memory error,
@@ -120,10 +133,20 @@ choose_kktsolver(Q, A, G, cone_dims; kw...) =
   _choose_kktsolver(Q, A, G, cone_dims; kw...)[1]
 
 function _choose_kktsolver(Q, A, G, cone_dims;
-                           size_min = 200, dense_bytes_max = 4 * 2^30,
+                           size_min = 200, dense_bytes_max = _DENSE_BYTES_MAX,
                            ldl_flop_weight = 10.0)
   n = size(Q,1); m = size(A,1); p = size(G,1)
   has_sdp = any(cd -> isequal(cd[1], "S"), cone_dims)
+  # Semidefinite programs with a PSD *variable* eliminate the cone
+  # variables exactly and factor only a reduced system (the p×p equality
+  # Schur complement in standard form); decided before the dense-storage
+  # budget, which counts the k(k+1)/2 variables this solver never factors.
+  # Its own storage is the reduced matrix and its factorization: budgeted
+  # here, and a problem whose Schur matrix does not fit falls through to
+  # the rules below (which refuse it when the dense path does not fit
+  # either).
+  has_sdp && _sdpschur_fits(Q, A, G, cone_dims, dense_bytes_max) &&
+    return (kktsolver_sdpschur, nothing)
   bytes = dense_kkt_bytes(n, m, p)
   if bytes > dense_bytes_max
     if has_sdp
@@ -240,23 +263,46 @@ function kktsolver_qr(Q, A, G, cone_dims)
   Q1 = @view Q0[:, 1:p]
   Q2 = @view Q0[:, p+1:end]
 
-  # Constants across iterations
-  AQ2 = A * Q2           # m×(n−p) dense
-  S22 = Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
+  # With a semidefinite cone, A has k(k+1)/2 rows per order-k block, and
+  # the dense W = F⁻ᵀ(AQ2) below is (k(k+1)/2)×(n−p) — the memory wall of
+  # the affine (LMI) form. Without equality rows the Hessian
+  # Q + AᵀF⁻¹F⁻ᵀA is assembled instead by the trace-form Gram kernel
+  # (src/schur.jl) straight from the sparse columns of A, and the dense
+  # m×n product is never formed. With equality rows it is not: projecting
+  # an assembled H onto ker G (Q2ᵀHQ2) cancels catastrophically when H is
+  # badly scaled along range(Gᵀ) — a well-conditioned reduced Hessian came
+  # out as diag(1e-17, 1) — while the projected product (F⁻ᵀAQ2)ᵀ(F⁻ᵀAQ2)
+  # never forms the large directions. Assembling only at p = 0 also keeps
+  # the work bounded by the null-space dimension (none at p = n).
+  gram = p == 0 && any(cd -> cd[1] == "S", cone_dims)
 
-  function solve3x3gen(F, F⁻ᵀ)
+  # Constants across iterations
+  AQ2  = gram ? nothing : A * Q2           # m×(n−p) dense
+  S22  = gram ? nothing : Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
+  plan = gram ? _gram_plan(sparse(A), cone_dims) : nothing
+  Hbuf = gram ? zeros(n, n) : nothing
+
+  function solve3x3gen(F, F⁻ᵀ, pt = nothing)
 
     # Reduced Hessian Q2'(Q + A'F⁻¹F⁻ᵀA)Q2 = S22 + W'W, W = F⁻ᵀ(AQ2).
     # F⁻ᵀ is the cached block-diagonal inverse the caller passes in —
     # never densify it (it used to be shadowed by a dense m×m inverse).
-    W = F⁻ᵀ * AQ2
-    Lmat = S22 + W'W
-    L = try
+    Lmat = @phase pt t_kkt_assemble begin
+      if gram
+        _gram!(Hbuf, plan, F⁻ᵀ)             # AᵀF⁻¹F⁻ᵀA = (F⁻ᵀA)ᵀ(F⁻ᵀA)
+        Hbuf .+= Q
+      else
+        W = F⁻ᵀ * AQ2
+        S22 + W'W
+      end
+    end
+    L = @phase pt t_kkt_factor try
       cholesky(Symmetric(Lmat))   # SPD by construction (CVXOPT §10.2)
     catch err
       err isa LinearAlgebra.PosDefException || rethrow()
       qr(Lmat)                    # marginal PD: fall back to QR
     end
+    pt === nothing || (pt.n_kkt_factor += 1)
 
     # H*u = (Q + A'F⁻¹F⁻ᵀA)u via sparse matvecs and block applies;
     # F⁻¹ = (F⁻ᵀ)' holds for every scaling block (no symmetry assumed).
@@ -283,7 +329,28 @@ function kktsolver_qr(Q, A, G, cone_dims)
 
   end
 
+  return DenseKKTGen(solve3x3gen, nothing)
+
 end
+
+# Generator returned by the dense backends (`kktsolver_qr`,
+# `kktsolver_sdpschur`): callable as `gen(F, F⁻ᵀ)` like any solve3x3gen,
+# and the holder of the `PhaseTimes` that `kkt_attach_timing!` attaches,
+# which every later factorization reports its assembly and factorization
+# time into. Unattached, the timing sites cost one `nothing` check each.
+mutable struct DenseKKTGen{G}
+  gen::G
+  timing::Union{Nothing,PhaseTimes}
+  # kktsolver_sdpschur's counters, cumulative over the solve: [1] internal
+  # refinement corrections, [2] dense factorizations by kktsolver_qr,
+  # [3] solves returned above the residual target, [4] dense attempts
+  # rejected (failed or not tenfold better; the fallback is then off).
+  # Empty for kktsolver_qr.
+  stats::Vector{Int}
+end
+DenseKKTGen(gen::G, timing) where {G} = DenseKKTGen{G}(gen, timing, Int[])
+(g::DenseKKTGen)(F, F⁻ᵀ) = g.gen(F, F⁻ᵀ, g.timing)
+kkt_attach_timing!(g::DenseKKTGen, pt::PhaseTimes) = (g.timing = pt; nothing)
 
 function lift(F::Block)
 

@@ -6,6 +6,78 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-20
+
+### Breaking changes
+- Automatic KKT routing sends problems with a PSD *variable* (an order-`k`
+  semidefinite block whose rows each hold one variable, as
+  `@variable(model, X, PSD)` produces) to the new `kktsolver_sdpschur`
+  instead of `kktsolver_qr`. Iterates differ at rounding level, and a
+  custom `kktsolver` that forwards to `default_kktsolver` now receives the
+  Schur solver's generator for such problems.
+- For such problems presolve no longer fixes the cone variables from
+  singleton equality rows (`X[i, i] == 1`): fixing them would leave constant
+  cone coordinates and forfeit the elimination. A custom `kktsolver` sees
+  those rows and variables, where it previously saw them removed.
+- `kktsolver_qr(Q, A, G, cone_dims)` returns a callable struct rather than a
+  closure (it carries the timing hook below); code that tests `isa Function`
+  on it must call it instead.
+- `PhaseTimes` gains the fields `t_kkt_assemble`, `t_kkt_factor` and
+  `n_kkt_factor`; its positional constructor changes accordingly
+  (`PhaseTimes()` is unchanged).
+- `choose_kktsolver`'s dense storage guard no longer refuses an SDP that
+  `kktsolver_sdpschur` takes; that solver's own dense storage is budgeted
+  against the same `dense_bytes_max` instead, and an SDP that fits neither
+  is still refused with an `ArgumentError`.
+
+### Added
+- `kktsolver_sdpschur`: KKT solver that eliminates the cone variables of
+  PSD-variable models exactly. In standard form (`Q = 0`, every variable one
+  cone coordinate) it factors only the `p × p` equality Schur complement
+  `M_ij = tr(Ĝᵢ T Ĝⱼ T)`; in mixed form (free variables, bounds or a second
+  cone on entries of the matrix, a quadratic objective on the other
+  variables) it factors a reduced symmetric indefinite system in the
+  remaining variables and multipliers by Bunch-Kaufman. The reduced matrix
+  is equilibrated before the pivot test (to unit diagonal in standard form,
+  by symmetric Ruiz sweeps in mixed form), and `staticReg` is applied
+  relative to that scale, on the dual side for the eliminated block. Every
+  solve is checked against the original 3×3 system by its normwise
+  backward error, both per row block and per class of rows (variables
+  grouped by cone, equalities by the variables they touch, each judged
+  against only the data and solution blocks it touches, above a rounding
+  floor), so a large unrelated variable no longer hides a violated
+  equality above that floor; it is refined above `1e-10`, and one still grossly
+  wrong (above `1e-6`), or a failed factorization, is also solved by
+  `kktsolver_qr` when the dense path fits `dense_bytes_max` beside it, and
+  the better direction is used (bounded retries). `sdpschur_eligible(Q, A, G, cone_dims)` reports whether
+  the router takes it; the MOI option is `kktsolver = "sdpschur"`.
+- `PhaseTimes` reports the dense backends' matrix assembly and
+  factorization separately (`t_kkt_assemble`, `t_kkt_factor`,
+  `n_kkt_factor`).
+- Guide *Formulating Semidefinite Programs*: the PSD-variable and
+  linear-matrix-inequality forms, which models the elimination covers, and
+  Dualization.jl (`dual_optimizer(ConicIP.Optimizer)`) for the rest, with
+  tests that the dualized route returns the same optimum, primal values,
+  duals and infeasibility certificates.
+
+### Performance
+- PSD-variable SDPs no longer factor a dense matrix in the `k(k+1)/2`
+  matrix entries: per iteration O(p k³ + p² k² + p³) for `p` equality rows
+  instead of O(k⁶), and O(p² + k²) storage instead of O(k⁴). On the max-cut
+  relaxation, order 100 drops from 1.66 to about 0.01 s per iteration, and
+  orders 150 and 200, which the dense-storage guard refused, solve in under
+  half a second.
+- `kktsolver_qr` assembles the SDP Hessian `AᵀF⁻¹F⁻ᵀA` of an affine
+  (linear-matrix-inequality) model without equality rows directly from the
+  sparse coefficient matrices (trace form, one dense, rank-two or
+  four-index evaluation per column; entries whose terms cancel, or that
+  are not finite, are recomputed from the scaled products in chunks of
+  bounded size), instead of a dense `k(k+1)/2 × n` product per iteration:
+  2.5–9× per iteration on max-cut and theta relaxations of order 50–300.
+- The semidefinite cone division by the scaled point, whose matrix is
+  diagonal, uses the closed form `Z_ij = X_ij / ((λ_i + λ_j)/2)` instead of
+  a Lyapunov solve: O(k²) and allocation-free instead of O(k³).
+
 ## [0.6.0] - 2026-09-16
 
 ### Changed
@@ -353,7 +425,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0

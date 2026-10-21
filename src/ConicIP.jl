@@ -48,6 +48,7 @@ include("blockmatrices.jl")
 include("timing.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
+include("schur.jl")
 include("correctors.jl")
 
 ViewTypes   = Union{SubArray}
@@ -670,6 +671,53 @@ function dsdc!(x, y, o)
   Z = lyap(Y, -2 .* X)
   vecm!(o, (Z .+ Z') ./ 2)
 
+end
+
+function dsdc_diag!(x, y, o)
+
+  # dsdc! for a divisor whose matrix is diagonal, Y = Diag(λ₁, …, λₙ): the
+  # solver's λ = F*z, which nestod_sdc makes diagonal (R'ZR = Λ), and the
+  # identity e at the initial point. Then (YZ + ZY)/2 = X is entrywise
+  # Z_ij (λ_i + λ_j)/2 = X_ij, so Z_ij = X_ij / ((λ_i + λ_j)/2) — the √2
+  # packing weight cancels, and the packed coordinates divide in place.
+  # Only the diagonal of mat(y) is read: its off-diagonals are rounding.
+  # The quotient X_ij / ((λ_i + λ_j)/2) is one division by σ/2 when the
+  # sum σ = λ_i + λ_j is normal (σ/2 is then exact) and the result is
+  # normal too. Otherwise — σ subnormal or overflowing, or a result that
+  # underflows, where the single rounding of σ can flip a subnormal result
+  # (prevfloat(2) + 2 rounds to 4, and u/2 is a tie that rounds to 0 for
+  # the correct u) — it is computed exactly and rounded once, in extended
+  # precision (_dsdc_exact). O(k²) for order k against lyap's O(k³) Schur
+  # factorization, and allocation-free off those exceptional entries.
+  n = ord(y)
+  dpos(j) = (j - 1)*n - div((j - 1)*(j - 2), 2) + 1   # packed index of (j,j)
+  c = 1
+  @inbounds for i = 1:n
+    λi = y[c]
+    o[c] = x[c] / λi; c += 1
+    for j = i+1:n
+      λj = y[dpos(j)]
+      σ = λi + λj
+      q = isfinite(σ) && σ >= 2 * floatmin(σ) ? x[c] / (σ/2) : 0.0
+      if (q == 0 || !(abs(q) >= floatmin(q))) && x[c] != 0
+        q = _dsdc_exact(x[c], λi, λj)
+      end
+      o[c] = q
+      c += 1
+    end
+  end
+  return o
+
+end
+
+# X_ij / ((λ_i + λ_j)/2) correctly rounded, for dsdc_diag!'s exceptional
+# entries (subnormal or overflowing sums, underflowing results). The sum and
+# halving are exact in 2100-bit arithmetic, and the quotient is rounded
+# once to Float64.
+function _dsdc_exact(x, λi, λj)
+  setprecision(BigFloat, 2100) do
+    Float64(big(x) / ((big(λi) + big(λj)) / 2))
+  end
 end
 
 function xsdc!(x, y, o)
@@ -1489,13 +1537,15 @@ function _conicIP(
   function cone_div!(o,x,y)
 
     # In-place group division x ○\ y → o
-    # (each per-cone primitive fully overwrites its output view)
+    # (each per-cone primitive fully overwrites its output view).
+    # The divisor is always the scaled point λ = F*z.v, or e at the
+    # initial point; both are diagonal on S blocks, hence dsdc_diag!.
 
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I); yI = view(y,I); oI = view(o,I)
       if btype == "R"; drp!(xI, yI, oI);  end
       if btype == "Q"; dsoc!(xI, yI, oI); end
-      if btype == "S"; dsdc!(xI, yI, oI); end
+      if btype == "S"; dsdc_diag!(xI, yI, oI); end
     end
     return o;
 
@@ -1540,7 +1590,19 @@ function _conicIP(
   # Route once when the default router is in charge: `default_kktsolver`
   # would repeat this call, and so would the verbose line below, each time
   # paying for a symbolic analysis and an AMD ordering of the KKT pattern.
-  routed = kktsolver === default_kktsolver ?
+  # A PSD-variable SDP is decided on the unregularized Q: Qᵣ = Q + δI would
+  # hide it, and kktsolver_sdpschur regularizes itself (dual side, and on
+  # the variables it keeps). It receives the dimensionless staticReg, not
+  # δ: its shift is relative to a unit diagonal, where the (1 + ‖Q‖) factor
+  # that turns staticReg into an absolute shift would apply the objective's
+  # scale a second time. Asked for by name, it needs only an eliminable
+  # block; the default router also wants a small reduced system whose
+  # storage fits the budget, as choose_kktsolver does.
+  schur = kktsolver === kktsolver_sdpschur ? _schur_split(Q, A, cone_dims) !== nothing :
+          kktsolver === default_kktsolver &&
+          _sdpschur_fits(Q, A, G, cone_dims, _DENSE_BYTES_MAX)
+  routed = schur ? (kktsolver_sdpschur, nothing) :
+           kktsolver === default_kktsolver ?
            _choose_kktsolver(Qᵣ, A, G, cone_dims) : nothing
 
   if verbose && routed !== nothing
@@ -1551,6 +1613,8 @@ function _conicIP(
   solve3x3gen = try
     if routed === nothing
       kktsolver(Qᵣ,A,G,cone_dims)
+    elseif routed[1] === kktsolver_sdpschur
+      kktsolver_sdpschur(Q,A,G,cone_dims; static_reg = staticReg)
     elseif routed[2] === nothing
       routed[1](Qᵣ,A,G,cone_dims)
     else
