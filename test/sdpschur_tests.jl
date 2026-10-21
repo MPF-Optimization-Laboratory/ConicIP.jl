@@ -1117,4 +1117,282 @@ end
                           [0.0], [1e-100], [1e308], [0.0], [1e308], [1e308], zeros(1), zeros(1))[1]
         @test ρ >= 0.5
     end
+
+    # ── Sixth review pass (2026-10-20) ──────────────────────────────────
+    # The backward error judged each row block against the whole solution,
+    # so a large decoupled variable hid an O(1) equality violation; the
+    # class-wise measure judges each class against what it touches.
+
+    # The decoupled-variable kernel: a 3-PSD block, one nonnegative variable,
+    # equalities on the PSD coordinates; the scaling is badly conditioned.
+    sixth_kernel() = (Q = spzeros(4, 4), A = sparse(1.0I, 4, 4),
+                      G = sparse([1.0 0 0 0; 1 0 1 0]), cd = [("S", 3), ("R", 1)],
+                      F = C.Block([C.VecCongurance(Matrix(Diagonal([1.0, 1e-4]))),
+                                   Diagonal([1e4])]))
+    sixth_Fi(F) = C.Block([inv(F[1])', Diagonal([1e-4])])
+
+    @testset "sixth: a decoupled large variable does not hide an equality violation" begin
+        K = sixth_kernel(); Fi = sixth_Fi(K.F)
+        for t in (0.01, 1.0, 100.0)
+            b = ([0.0, 0, 0, t], [0.0, 1.0], zeros(4))
+            g = C.kktsolver_sdpschur(K.Q, K.A, K.G, K.cd)
+            sol = g(K.F, Fi)(b...)
+            @test sol[1][1:3] ≈ [0, 0, 1] atol = 1e-10
+            @test sol[1][4] ≈ 1e8t rtol = 1e-12
+            @test norm(K.G * sol[1] - b[2]) <= 1e-12
+            @test g.stats[2] == 1
+            g0 = C.kktsolver_sdpschur(K.Q, K.A, K.G, K.cd; dense_bytes_max = 0)
+            g0(K.F, Fi)(b...)
+            @test g0.stats[3] == 1                         # the miss is counted
+        end
+    end
+
+    @testset "sixth: each row class is judged against the blocks it touches" begin
+        # Each class denominator carries a rounding floor of √ε times the
+        # class's data against the whole solution, so a violation is seen
+        # once it reaches that floor: a score of 0.1 for a global score of
+        # about 1e-8 (the floor's ratio to the global denominator), not 1e-9.
+        Q = spzeros(4, 4); A = sparse(1.0I, 4, 4)
+        G = sparse([1.0 0 0 0; 1 0 1 0]); cd = [("S", 3), ("R", 1)]
+        P = C._resid_plan(Q, A, G, cd)
+        At = sparse(A'); Gt = sparse(G')
+        function scores(F, b, y, w, v)
+            args = (Q, A, At, G, Gt, 0.0, norm(A), norm(G), F, b[1], b[2], b[3], y, w, v,
+                    zeros(4), zeros(4))
+            return (C._kkt3_resid(args...; plan = P)[1], C._kkt3_resid(args...)[1])
+        end
+        # The reproducer's own answer at t = 100: scored 4e-11, now 4e-3.
+        K = sixth_kernel(); Fk = K.F; Fi = sixth_Fi(Fk)
+        b = ([0.0, 0, 0, 100.0], [0.0, 1.0], zeros(4))
+        (y0, w0, v0) = C.kktsolver_qr(Q, A, G, cd)(Fk, Fi)(b...)
+        y = copy(y0); y[3] = 5e-5
+        (ρp, ρg) = scores(Fk, b, y, w0, v0)
+        @test ρp >= 1e-3 && ρg <= 1e-9
+        # A well-conditioned scaling with a multiplier of 1e10 on the
+        # decoupled variable (y₄ = 1e18): violations of the PSD rows of each
+        # of y, v and w that the whole solution masks.
+        Fw = C.Block([C.VecCongurance(Matrix(1.0I, 2, 2)), Diagonal([1e4])])
+        Fwi = C.Block([inv(Fw[1])', Diagonal([1e-4])])
+        b = ([0.0, 0, 0, 1e10], [0.0, 1.0], zeros(4))
+        (y0, w0, v0) = C.kktsolver_qr(Q, A, G, cd)(Fw, Fwi)(b...)
+        @test scores(Fw, b, y0, w0, v0)[1] <= 1e-6
+        y = copy(y0); y[3] += 1e12
+        (ρp, ρg) = scores(Fw, b, y, w0, v0)
+        @test ρp >= 0.1 && ρg <= 1e-6 && ρp >= 1e5 * ρg
+        v = copy(v0); v[1] += 1e3
+        (ρp, ρg) = scores(Fw, b, y0, w0, v)
+        @test ρp >= 0.1 && ρg <= 1e-7 && ρp >= 1e5 * ρg
+        w = copy(w0); w[1] += 1e3
+        (ρp, ρg) = scores(Fw, b, y0, w, v0)
+        @test ρp >= 0.1 && ρg <= 1e-7 && ρp >= 1e5 * ρg
+    end
+
+    @testset "sixth: a weakly coupled large variable does not hide it either" begin
+        K = sixth_kernel(); Fi = sixth_Fi(K.F)
+        G = sparse([1.0 0 0 0; 1 0 1 0; 1 0 0 1])          # row 3 ties X₁₁ to the R variable
+        for t in (0.01, 1.0, 100.0)
+            b = ([0.0, 0, 0, 0], [0.0, 1.0, 1e8t], zeros(4))
+            g = C.kktsolver_sdpschur(K.Q, K.A, G, K.cd)
+            sol = g(K.F, Fi)(b...)
+            ref = C.kktsolver_qr(K.Q, K.A, G, K.cd)(K.F, Fi)(b...)
+            @test sol[1] ≈ ref[1] rtol = 1e-10
+            r = G * sol[1] - b[2]
+            @test norm(r[1:2]) <= 1e-12 && abs(r[3]) <= 1e-12 * 1e8t
+        end
+    end
+
+    @testset "sixth: the optimizer converges at a tight tolerance" begin
+        K = sixth_kernel()
+        c = [0.0, 1.0, 0.0, -1e-8]; d = [1.0, 1.0 + 1e-8]
+        probe = _GenProbe(nothing)
+        sol = conicIP(K.Q, c, K.A, zeros(4), K.cd, K.G, d;
+                      optTol = 1e-10, verbose = false, kktsolver = probe)
+        ref = conicIP(K.Q, c, K.A, zeros(4), K.cd, K.G, d;
+                      optTol = 1e-10, verbose = false, kktsolver = C.kktsolver_qr)
+        @test sol.status == :Optimal
+        @test norm(K.G * sol.y - d) <= 1e-8
+        @test norm(sol.y - ref.y) <= 1e-6
+        @test probe.g isa C.DenseKKTGen
+        @test probe.g.stats[2] >= 1
+        @test sol.Iter <= ref.Iter + 5
+    end
+
+    @testset "sixth: zero weights do not set the scale" begin
+        @test C._bw([1e-100], (0.0, [1e308]), (1.0, [1e-100])) ≈ 1.0 rtol = 1e-12
+        # The same through the 3×3 residual: Q = 0, A = 1e-308, y = 1e308.
+        A1 = sparse(reshape([1e-308], 1, 1)); E = spzeros(0, 1); cd1 = [("S", 1)]
+        F1 = C.Block([C.VecCongurance(fill(1.0, 1, 1))])
+        args = (spzeros(1, 1), A1, A1, E, sparse(E'), 0.0, 1e-308, 0.0, F1,
+                [1e-100], zeros(0), [1.0], [1e308], zeros(0), [0.0], zeros(1), zeros(1))
+        @test C._kkt3_resid(args...)[1] >= 0.5
+        @test C._kkt3_resid(args...; plan = C._resid_plan(spzeros(1, 1), A1, E, cd1))[1] >= 0.5
+        @test C._bw([0.0], (0.0, [NaN]), (1.0, [1.0])) == Inf
+        r = C._bw([1.0], (1e300, [1e300]), (1.0, [1.0]))   # 1e-600 underflows
+        @test isfinite(r) && r == 0.0
+    end
+
+    @testset "sixth: healthy multi-group solves stay off the dense path" begin
+        for (ci, cd) in enumerate(([("R", 3), ("S", 10), ("S", 6)],
+                                   [("S", 6), ("Q", 4), ("R", 2), ("S", 15)]))
+            P = standard_form(cd, 4; seed = 60 + ci)
+            z = interior(cd); s = interior(cd)
+            F = nt_block(cd, z, s); Fi = inv(F)'
+            g = C.kktsolver_sdpschur(P.Q, P.A, P.G, cd)
+            solve = g(F, Fi)
+            for _ in 1:3
+                solve(randn(P.m), randn(P.p), randn(P.m))
+            end
+            @test g.stats == [0, 0, 0, 0]
+        end
+        probe = _GenProbe(nothing)
+        opt = moi_solve(boxqp_model(12), probe)
+        @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+        @test probe.g.stats[2] == 0
+    end
+
+    @testset "sixth: the residual plan" begin
+        # S block on variables 1–3; R row 4 touches variable 3 (joins the
+        # group); R row 5 touches nothing; variables 4–6 are free. Q is
+        # asymmetric: row 4 couples variables 4 and 5, row 5 is empty.
+        cd = [("S", 3), ("R", 2)]
+        A = sparse([1, 2, 3, 4], [1, 2, 3, 3], ones(4), 5, 6)
+        Q = sparse([4, 4], [4, 5], [1.0, 3.0], 6, 6)
+        G = sparse([1, 1, 2, 3, 3, 4, 4], [1, 2, 3, 1, 4, 5, 6], [1.0, 2, 3, 4, 5, 6, 7], 4, 6)
+        P = C._resid_plan(Q, A, G, cd)
+        parts(key) = Set(Set(findall(==(g), key)) for g in unique(key))
+        @test parts(P.ygrp) == Set([Set([1, 2, 3]), Set([4]), Set([5]), Set([6])])
+        @test parts(P.rgrp) == Set([Set([1, 2, 3, 4]), Set([5])])
+        @test P.ng == 5
+        @test P.rgrp[1] == P.ygrp[1] && P.vptr[P.rgrp[5]+1] == P.vptr[P.rgrp[5]]
+        @test parts(P.ecls) == Set([Set([1, 2]), Set([3]), Set([4])])
+        g4 = P.ygrp[4]; g5 = P.ygrp[5]; gS = P.ygrp[1]
+        seg(idx, ptr, k) = Set(idx[ptr[k]:ptr[k+1]-1])
+        @test seg(P.qidx, P.qptr, g4) == Set([g4, g5])     # row 4 of Q
+        @test isempty(seg(P.qidx, P.qptr, g5))             # row 5 of Q is empty
+        @test seg(P.sidx, P.sptr, P.ecls[3]) == Set([gS, g4])
+        # Block norms against the sliced data, and the group → classes lists.
+        vars(g) = findall(==(g), P.ygrp)
+        for g in (g4, g5), k in P.qptr[g]:P.qptr[g+1]-1
+            @test P.LQgh[k] ≈ log2(norm(Q[vars(g), vars(P.qidx[k])])) atol = 1e-12
+        end
+        for s in 1:P.nc, k in P.sptr[s]:P.sptr[s+1]-1
+            rows = findall(==(s), P.ecls)
+            @test P.LGsg[k] ≈ log2(norm(G[rows, vars(P.sidx[k])])) atol = 1e-12
+            @test P.scls[k] == s
+        end
+        for g in (gS, g4, g5, P.ygrp[6])
+            @test Set(P.scls[P.gk[P.gptr[g]:P.gptr[g+1]-1]]) ==
+                  Set(s for s in 1:P.nc if g in seg(P.sidx, P.sptr, s))
+        end
+    end
+
+    @testset "sixth: the class check does not allocate" begin
+        cd = [("R", 3), ("S", 10), ("S", 6)]
+        P = standard_form(cd, 4; seed = 71)
+        z = interior(cd); s = interior(cd); F = nt_block(cd, z, s)
+        plan = C._resid_plan(P.Q, P.A, P.G, cd)
+        At = sparse(P.A'); Gt = sparse(P.G')
+        (nQ, nA, nG) = (norm(P.Q), norm(P.A), norm(P.G))
+        bx = randn(P.m); by = randn(P.p); bz = randn(P.m)
+        y = randn(P.m); w = randn(P.p); v = randn(P.m); t1 = zeros(P.m); t2 = zeros(P.m)
+        plain() = C._kkt3_resid(P.Q, P.A, At, P.G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2)
+        withp() = C._kkt3_resid(P.Q, P.A, At, P.G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2; plan)
+        plain(); withp()
+        @test (@allocated withp()) <= (@allocated plain()) + 1024
+        (_, r1, r2, r3) = plain()
+        function class_bytes(plan, y, w, v, t1, bx, by, bz, r1, r2, r3)
+            # ConicIP, not the local alias C: a captured local is dynamic dispatch.
+            ConicIP._class_resid(plan, y, w, v, t1, bx, by, bz, r1, r2, r3)
+            return @allocated ConicIP._class_resid(plan, y, w, v, t1, bx, by, bz, r1, r2, r3)
+        end
+        @test class_bytes(plan, y, w, v, t1, bx, by, bz, r1, r2, r3) == 0
+    end
+
+    @testset "sixth: the log-domain norms are exact" begin
+        rng = MersenneTwister(2026)
+        subn = randn(rng, 7); subn[3] = 5e-324
+        xs = [randn(rng, n) .* sc for n in (1, 7, 1000) for sc in (1e-300, 1.0, 1e300)]
+        push!(xs, subn)
+        let x = [5e-324, 1e-320, 3e-322]                 # every entry subnormal
+            @test C._lnorm(x) ≈ Float64(log2(norm(big.(x)))) atol = 1e-12
+        end
+        for x in xs
+            @test C._lnorm(x) ≈ log2(norm(x)) atol = 1e-12
+            k = max(1, length(x) ÷ 2); lst = randperm(rng, length(x))[1:k]
+            seg = k > 2 ? (2:k-1) : (1:k)
+            @test C._lnorm(x, lst, seg) ≈ log2(norm(x[lst[seg]])) atol = 1e-12
+        end
+        let S = sprandn(rng, 30, 20, 0.3), cols = [2, 5, 6, 11, 19]
+            @test C._lfro(S, cols) ≈ log2(norm(S[:, cols])) atol = 1e-12
+        end
+        let r = randn(rng, 9), x1 = randn(rng, 9), x2 = randn(rng, 4), x3 = randn(rng, 9)
+            @test C._bw(r, (2.0, x1), (0.5, x2), (1.0, x3)) ≈
+                  norm(r) / (2.0 * norm(x1) + 0.5 * norm(x2) + norm(x3)) rtol = 1e-12
+        end
+        # One group, one equality class: the class measure is the block measure.
+        P = standard_form([("S", 10)], 3; seed = 91)
+        cd = [("S", 10)]
+        z = interior(cd); s = interior(cd); F = nt_block(cd, z, s)
+        plan = C._resid_plan(P.Q, P.A, P.G, cd)
+        At = sparse(P.A'); Gt = sparse(P.G')
+        (nQ, nA, nG) = (norm(P.Q), norm(P.A), norm(P.G))
+        bx = randn(rng, P.m); by = randn(rng, P.p); bz = randn(rng, P.m)
+        y = randn(rng, P.m); w = randn(rng, P.p); v = randn(rng, P.m)
+        t1 = zeros(P.m); t2 = zeros(P.m)
+        (ρg, r1, r2, r3) = C._kkt3_resid(P.Q, P.A, At, P.G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2)
+        (ρp, _...) = C._kkt3_resid(P.Q, P.A, At, P.G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2; plan)
+        @test plan.ng == 1 && plan.nc == 1
+        @test ρp == ρg
+        # The class denominators add the rounding floor (about 3√ε of the
+        # global ones), so the class score sits just below the global one.
+        ρc = C._class_resid(plan, y, w, v, t1, bx, by, bz, r1, r2, r3)
+        @test ρc <= ρg * (1 + 1e-12) && ρc >= ρg * (1 - 1e-6)
+    end
+
+    @testset "sixth: a weakly coupled large variable is weighted by its coupling" begin
+        K = sixth_kernel(); Fi = sixth_Fi(K.F)
+        for cpl in (1e-8, 1e-16)
+            G = sparse([1.0 0 0 cpl; 1 0 1 cpl])
+            b = ([0.0, 0, 0, 100], [1e10 * cpl, 1 + 1e10 * cpl], zeros(4))
+            g = C.kktsolver_sdpschur(K.Q, K.A, G, K.cd)
+            sol = g(K.F, Fi)(b...)
+            ref = C.kktsolver_qr(K.Q, K.A, G, K.cd)(K.F, Fi)(b...)
+            @test sol[1][1:3] ≈ ref[1][1:3] atol = 1e-10
+            @test sol[1][4] ≈ ref[1][4] rtol = 1e-12
+            @test norm(G * sol[1] - b[2]) <= 1e-10 * norm(b[2])
+            @test g.stats[2] == 1
+            c = [0.0, 1, 0, -1e-8]; d = [1.0, 1 + 1e-8]
+            s1 = conicIP(K.Q, c, K.A, zeros(4), K.cd, G, d; optTol = 1e-10, verbose = false)
+            s2 = conicIP(K.Q, c, K.A, zeros(4), K.cd, G, d; optTol = 1e-10, verbose = false,
+                         kktsolver = C.kktsolver_qr)
+            @test s1.status == :Optimal && s2.status == :Optimal
+            @test s1.Iter <= s2.Iter + 5
+        end
+    end
+
+    @testset "sixth: a vanishing class does not trigger the dense path" begin
+        # The scalar equality's exact direction is zero: its computed value
+        # is rounding from the rest of the solve, which no refinement or
+        # dense solve can lower relative to its own magnitude.
+        K = sixth_kernel()
+        G = sparse([1.0 0 1 0.1; 0 0 0 1])
+        probe = _GenProbe(nothing)
+        sol = conicIP(K.Q, [0.0, 1, 0, 0.1], K.A, zeros(4), K.cd, G, [2.1, 1.0];
+                      optTol = 1e-8, verbose = false, kktsolver = probe)
+        @test sol.status == :Optimal
+        @test sol.Iter <= 8
+        @test probe.g.stats[2] == 0 && probe.g.stats[4] == 0
+    end
+
+    @testset "sixth: near-degenerate equalities beside a decoupled scalar agree with QR: δ = $δ, cost = $cost" for
+            δ in (1e-6, 1e-8, 1e-10, 1e-12), cost in (0.0, 1e-8, 1e-12, -1e-8)
+        # The scalar shares no equality and no Q row with the PSD block;
+        # cost −1e-8 is unbounded, so a match there is :DualInfeasible.
+        K = sixth_kernel(); c = [0.0, 1, 0, -cost]; d = [1.0, 1.0 + δ]
+        s1 = conicIP(K.Q, c, K.A, zeros(4), K.cd, K.G, d; optTol = 1e-10, verbose = false)
+        s2 = conicIP(K.Q, c, K.A, zeros(4), K.cd, K.G, d; optTol = 1e-10, verbose = false,
+                     kktsolver = C.kktsolver_qr)
+        @test s1.status == s2.status
+        @test s1.status == (cost >= 0 ? :Optimal : :DualInfeasible)   # all 16 agree at 1e-10
+    end
 end

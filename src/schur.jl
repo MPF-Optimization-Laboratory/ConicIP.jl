@@ -623,13 +623,21 @@ positive, dual side negative).
 Forming the reduced matrix squares the scaling's conditioning, and some
 losses no shift recovers (two independent equality rows whose Schur rows
 agree to 1e-16 collapse to one). So every solve is checked against the
-original 3×3 system by its normwise block-wise backward error (each row
-block's residual against the norms of that block's data times the whole
-solution, plus its right-hand side), which a backward-stable solve meets
-however large or cancelling its products, and a collapsed equality does
-not. Above `1e-10` it is refined with the Schur factorization up to
-twice. A solve that is still grossly wrong (above `1e-6`), or a failed
-factorization, is also solved by [`kktsolver_qr`](@ref) on the same data —
+original 3×3 system by its normwise backward error, which a backward-stable
+solve meets however large or cancelling its products, and a collapsed
+equality does not. It is the larger of two measures: each row block's
+residual against the norms of that block's data times the whole solution
+(plus its right-hand side), and each class of rows (variables grouped by
+cone unit, equalities by the groups they touch) against the coupling blocks
+it touches, each weighted by its own part of the solution, plus a rounding
+floor of `√ε` times its data against the whole solution. A large decoupled
+or weakly coupled variable no longer hides a violated equality above that
+rounding floor (a violation below it is not seen); one inside the same cone
+unit still can hide one, and a large disconnected part of the solution
+raises the floor of every class. Above `1e-10` it is refined with the Schur
+factorization up to twice. A solve that is still grossly wrong (above
+`1e-6`), or a failed factorization, is also solved by
+[`kktsolver_qr`](@ref) on the same data —
 provided the dense path and the Schur storage fit `dense_bytes_max`
 together (and `p ≤ n`) — and the better of the two directions is
 returned. A dense attempt that does not improve the residual tenfold is
@@ -919,12 +927,28 @@ const _SCHUR_DENSE_TOL  = Ref(1e-6)
 # fallback is switched off for the rest of a solve.
 const _SCHUR_DENSE_TRIES = 3
 
-# Normwise block-wise backward error (Rigal-Gaches, per row block) of
-# (y, w, v) in the 3×3 system
+# Rounding floor of the class backward error: each class's denominator also
+# carries η times its own data applied to the whole solution, so that a class
+# whose exact direction vanishes, or is far smaller than the rest of the
+# solution, is not judged on rounding injected from elsewhere (which no
+# refinement or dense solve can lower relative to its own magnitudes). η is a
+# heuristic tradeoff, not a bound: with injected rounding about ε·κ times the
+# solution, the score is about √ε·κ, so at the 1e-6 dense threshold κ up to
+# about 67 passes, and refinement usually removes the rest first. Against the
+# whole solution, a large part that is disconnected from a class raises its
+# floor and can hide a small needed correction; in our tests, that showed up
+# only at optTol 1e-12 with nearly coincident equality right-hand sides. A
+# floor restricted to the class's connected component closes that case on
+# paper but judged late-iteration rounding too strictly, and did worse overall.
+const _SCHUR_CLASS_FLOOR = sqrt(eps(Float64))
+
+# Normwise backward error (Rigal-Gaches) of (y, w, v) in the 3×3 system
 #
 #   Q y + Gᵀw − Aᵀv = bx,   G y = by,   A y + FᵀF v = bz,
 #
-# the largest over the three row blocks of
+# in two parts, of which the larger is returned.
+#
+# The global part is the largest over the three row blocks of
 #
 #   ‖r₁‖ / (‖Q‖‖y‖ + ‖G‖‖w‖ + ‖A‖‖v‖ + ‖bx‖),   ‖r₂‖ / (‖G‖‖y‖ + ‖by‖),
 #   ‖r₃‖ / (‖A‖‖y‖ + ‖FᵀFv‖ + ‖bz‖),
@@ -937,13 +961,41 @@ const _SCHUR_DENSE_TRIES = 3
 # cancellation; against the terms of the whole system, multipliers blown up
 # to 1e12 hid an equality violation of 0.7; against the operands of each
 # product (|G||y|), a direction that leaves X_ii fixed (Δy_ii at rounding
-# level) failed every equality row with a ratio of 1. Per block and
-# normwise, the violated block is judged against the whole solution.
-# Each block's vectors are scaled by its own power of two (ldexp, exact
-# and overflow-free) before any norm is formed, so neither the norms nor
-# their sums overflow or underflow, and one block's magnitude cannot erase
-# another's residual. Returns the residual blocks (unscaled) too.
-function _kkt3_resid(Q, A, At, G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2)
+# level) failed every equality row with a ratio of 1.
+#
+# The global part still judges each block against the whole solution, so a
+# decoupled variable of 1e10 let a 0.7 equality violation score 4e-11. The
+# class part (a _ResidPlan) judges each row class against only what it
+# touches. Variables are grouped by cone unit (a PSD or second-order block,
+# or one nonnegative row): the scaling mixes coordinates within a unit, so
+# rounding there scales with the whole unit, and nothing else mixes. Equality
+# rows with the same set of touched groups form a class. Each denominator
+# sums over the coupling blocks, every block of data against its own part of
+# the solution (so a coefficient of 1e-8 on a huge group weighs 1e-8 of it,
+# not all of it):
+#
+#   r₁ of a group g:  ‖r₁_g‖ / (Σ_h ‖Q[g,h]‖‖y_h‖ + Σ_{s∋g} ‖G[s,g]‖‖w_s‖
+#                                + ‖A[:,g]‖‖v_g‖ + ‖bx_g‖ + floor₁),
+#   r₂ of a class s:  ‖r₂_s‖ / (Σ_{g∈sig(s)} ‖G[s,g]‖‖y_g‖ + ‖by_s‖ + floor₂),
+#   r₃ of a group g:  ‖r₃_g‖ / (‖A[:,g]‖‖y_g‖ + ‖t1_g‖ + ‖bz_g‖ + floor₃),
+#
+# where h runs over the groups coupled to g by rows of Q and s over the
+# classes whose signature contains g. The floors are _SCHUR_CLASS_FLOOR times
+# the class's data against the whole solution; they keep a class whose exact
+# direction vanishes from being judged on rounding injected from elsewhere.
+# With one group (a single PSD block) every denominator is at least the
+# global one, so nothing changes there. A large coordinate inside the same
+# cone unit as a violated row can still mask it, by design, and a violation
+# below the floors goes unseen.
+#
+# All magnitudes are carried as log2 (−Inf for zero): norms are formed
+# after an exact power-of-two scaling (ldexp), terms and ratios combine in
+# the log domain, so nothing overflows or underflows, a zero weight drops
+# out instead of setting the scale, and one block's magnitude cannot erase
+# another's residual. Anything non-finite is never accepted. Returns the
+# residual blocks (unscaled) too.
+function _kkt3_resid(Q, A, At, G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2;
+                     plan = nothing)
   mul!(t2, F, v); mul_adjoint!(t1, F, t2)              # FᵀF v
   r1 = Q * y + Gt * w - At * v - bx
   r2 = G * y - by
@@ -951,30 +1003,323 @@ function _kkt3_resid(Q, A, At, G, Gt, nQ, nA, nG, F, bx, by, bz, y, w, v, t1, t2
   ρ1 = _bw(r1, (nQ, y), (nG, w), (nA, v), (1.0, bx))
   ρ2 = _bw(r2, (nG, y), (1.0, by))
   ρ3 = _bw(r3, (nA, y), (1.0, t1), (1.0, bz))
-  return (max(ρ1, ρ2, ρ3), r1, r2, r3)
+  ρ = max(ρ1, ρ2, ρ3)
+  plan === nothing || (ρ = max(ρ, _class_resid(plan, y, w, v, t1, bx, by, bz, r1, r2, r3)))
+  return (ρ, r1, r2, r3)
 end
 
-# ‖r‖ / Σ cᵢ‖xᵢ‖, every vector first scaled exactly by 2^(−e) with e the
-# exponent of the largest magnitude among r and the xᵢ. A zero denominator
-# accepts only a zero residual; anything non-finite is never accepted.
+# ‖r‖ / Σ cᵢ‖xᵢ‖ in the log domain. A zero denominator accepts only a zero
+# residual; anything non-finite — in r or any xᵢ, even under a zero weight —
+# is never accepted.
 function _bw(r, terms...)
-  μ = _maxabs(r)
-  for (_, x) in terms
-    μ = max(μ, _maxabs(x))
+  _allfinite(r) || return Inf
+  for (c, x) in terms
+    (isfinite(c) && _allfinite(x)) || return Inf
   end
-  μ == 0 && return 0.0
+  Ld = -Inf
+  for (c, x) in terms
+    Ld = _lse(Ld, log2(abs(c)) + _lnorm(x))
+  end
+  return _lratio(_lnorm(r), Ld)
+end
+
+_allfinite(x) = all(isfinite, x)
+
+# log2 ‖x‖ over the entries idx (−Inf for zero or none): the entries are
+# scaled by the exact power of two 2^e of the largest, so the sum of squares
+# s cannot overflow or underflow, and log2 ‖x‖ = e + ½ log2 s. Allocation-free.
+function _lnorm(x, idx)
+  μ = 0.0
+  for i in idx
+    μ = max(μ, abs(x[i]))
+  end
+  μ == 0 && return -Inf
   isfinite(μ) || return Inf
   e = exponent(μ)
-  nr = norm(ldexp.(r, -e))
-  den = 0.0
-  for (c, x) in terms
-    isempty(x) || (den += c * norm(ldexp.(x, -e)))
+  s = 0.0
+  for i in idx
+    s += ldexp(x[i], -e)^2
   end
-  return !(isfinite(nr) && isfinite(den)) ? Inf :
-         den > 0 ? nr / den : (nr == 0 ? 0.0 : Inf)
+  return e + 0.5 * log2(s)
+end
+function _lnorm(x::AbstractVector)
+  μ = 0.0
+  for xi in x
+    μ = max(μ, abs(xi))
+  end
+  μ == 0 && return -Inf
+  isfinite(μ) || return Inf
+  e = exponent(μ)
+  s = 0.0
+  for xi in x
+    s += ldexp(xi, -e)^2
+  end
+  return e + 0.5 * log2(s)
 end
 
-_maxabs(x) = isempty(x) ? 0.0 : maximum(abs, x)
+# The same over the entries lst[rng] (a CSR segment), without forming a view.
+function _lnorm(x, lst::Vector{Int}, rng::UnitRange{Int})
+  μ = 0.0
+  for k in rng
+    μ = max(μ, abs(x[lst[k]]))
+  end
+  μ == 0 && return -Inf
+  isfinite(μ) || return Inf
+  e = exponent(μ)
+  s = 0.0
+  for k in rng
+    s += ldexp(x[lst[k]], -e)^2
+  end
+  return e + 0.5 * log2(s)
+end
+
+# log2 of the norm of a vector given by the log2 norms L[h] of its parts h ∈ idx.
+function _lnormL(L, lst::Vector{Int}, rng::UnitRange{Int})
+  M = -Inf
+  for k in rng
+    M = max(M, L[lst[k]])
+  end
+  (M == -Inf || M == Inf) && return M
+  s = 0.0
+  for k in rng
+    s += exp2(2 * (L[lst[k]] - M))
+  end
+  return M + 0.5 * log2(s)
+end
+
+# log2 Σ 2^Lᵢ.
+function _lse(Ls::Vararg{Float64,N}) where {N}
+  M = maximum(Ls)
+  (M == -Inf || M == Inf) && return M
+  return M + log2(sum(L -> exp2(L - M), Ls))
+end
+
+# 2^(Ln − Ld) with 0 for a zero numerator and Inf for a zero denominator;
+# exp2 saturates to 0 or Inf by itself.
+function _lratio(Ln, Ld)
+  Ln == -Inf && return 0.0
+  (Ld == -Inf || Ln == Inf) && return Inf
+  return exp2(Ln - Ld)
+end
+
+# Variable groups, row classes and per-solve scratch of the class part of
+# the backward error (see _kkt3_resid). Built once per problem; the scratch
+# vectors make a check allocation-free. Block norms are log2 Frobenius
+# norms, aligned with the CSR lists they belong to.
+struct _ResidPlan
+  ng::Int; nc::Int
+  ygrp::Vector{Int}                  # group of each variable
+  rgrp::Vector{Int}                  # group of each cone row
+  vptr::Vector{Int}; vidx::Vector{Int}   # variables of each group (CSR)
+  cptr::Vector{Int}; cidx::Vector{Int}   # cone rows of each group
+  qptr::Vector{Int}; qidx::Vector{Int}   # qsig: groups coupled by rows of Q
+  LQgh::Vector{Float64}                  #   ‖Q[vars(g), vars(h)]‖, aligned with qidx
+  ecls::Vector{Int}                  # class of each equality row
+  eptr::Vector{Int}; eidx::Vector{Int}   # equality rows of each class
+  sptr::Vector{Int}; sidx::Vector{Int}   # signature (groups) of each class
+  LGsg::Vector{Float64}                  #   ‖G[rows(s), vars(g)]‖, aligned with sidx
+  scls::Vector{Int}                      #   class of each signature entry
+  gptr::Vector{Int}; gk::Vector{Int}     # ccls: signature entries of each group
+  LQ::Vector{Float64}; LGc::Vector{Float64}; LA::Vector{Float64}   # per group
+  LGs::Vector{Float64}                                             # per class
+  Ly::Vector{Float64}; Lv::Vector{Float64}; Lbx::Vector{Float64}   # scratch, per group
+  Lr1::Vector{Float64}; Lt1::Vector{Float64}; Lbz::Vector{Float64}
+  Lr3::Vector{Float64}
+  Lr2::Vector{Float64}; Lby::Vector{Float64}; Lw::Vector{Float64}  # scratch, per class
+end
+
+# Items 1:length(key) bucketed by key ∈ 1:nk, as CSR.
+function _csr(key, nk)
+  ptr = zeros(Int, nk + 1)
+  for k in key
+    ptr[k+1] += 1
+  end
+  ptr[1] = 1
+  for k = 1:nk
+    ptr[k+1] += ptr[k]
+  end
+  idx = Vector{Int}(undef, length(key)); pos = copy(ptr)
+  for (i, k) in enumerate(key)
+    idx[pos[k]] = i; pos[k] += 1
+  end
+  return ptr, idx
+end
+
+function _uf_find!(parent, j)
+  while parent[j] != j
+    parent[j] = parent[parent[j]]; j = parent[j]
+  end
+  return j
+end
+
+# Frobenius log2-norm of the stored nonzeros of the columns cols of S.
+function _lfro(S::SparseMatrixCSC, cols)
+  vals = Float64[]
+  nz = nonzeros(S)
+  for j in cols, t in nzrange(S, j)
+    push!(vals, nz[t])
+  end
+  return _lnorm(vals)
+end
+
+function _resid_plan(Q, A, G, cone_dims)
+  As = sparse(A); Gs = sparse(G); Qs = sparse(Q)
+  m, n = size(As); p = size(Gs, 1)
+  At = sparse(As'); Gt = sparse(Gs'); Qt = sparse(Qs')
+  # Cone units: a PSD or second-order block, or one row of a nonnegative one.
+  ulo = Int[]; uhi = Int[]; off = 0
+  for (bt, d) in cone_dims
+    if bt == "R"
+      for i = 1:d
+        push!(ulo, off + i); push!(uhi, off + i)
+      end
+    else
+      push!(ulo, off + 1); push!(uhi, off + d)
+    end
+    off += d
+  end
+  parent = collect(1:n)
+  anchor = zeros(Int, length(ulo))
+  rv = rowvals(At); az = nonzeros(At)
+  for u in eachindex(ulo), i = ulo[u]:uhi[u], t in nzrange(At, i)
+    az[t] == 0 && continue
+    j = rv[t]
+    if anchor[u] == 0
+      anchor[u] = j
+    else
+      parent[_uf_find!(parent, j)] = _uf_find!(parent, anchor[u])
+    end
+  end
+  gid = zeros(Int, n); ygrp = zeros(Int, n); ng = 0
+  for j = 1:n
+    r = _uf_find!(parent, j)
+    gid[r] == 0 && (ng += 1; gid[r] = ng)
+    ygrp[j] = gid[r]
+  end
+  rgrp = zeros(Int, m)
+  for u in eachindex(ulo)
+    g = anchor[u] == 0 ? (ng += 1) : ygrp[anchor[u]]
+    rgrp[ulo[u]:uhi[u]] .= g
+  end
+  vptr, vidx = _csr(ygrp, ng)
+  cptr, cidx = _csr(rgrp, ng)
+
+  # Groups coupled by rows of Q, with the norm of each coupling block.
+  qptr = Int[1]; qidx = Int[]; LQgh = Float64[]
+  slot = zeros(Int, ng)                  # position of h in this group's list
+  qv = rowvals(Qt); qz = nonzeros(Qt)
+  for g = 1:ng
+    first = length(qidx) + 1
+    vals = Vector{Float64}[]
+    for k = vptr[g]:vptr[g+1]-1, t in nzrange(Qt, vidx[k])
+      qz[t] == 0 && continue
+      h = ygrp[qv[t]]
+      if slot[h] < first
+        push!(qidx, h); push!(vals, Float64[]); slot[h] = length(qidx)
+      end
+      push!(vals[slot[h]-first+1], qz[t])
+    end
+    append!(LQgh, _lnorm.(vals))
+    push!(qptr, length(qidx) + 1)
+  end
+
+  # Equality rows by the set of groups their nonzeros touch.
+  ecls = zeros(Int, p); sigs = Vector{Vector{Int}}(); known = Dict{Vector{Int},Int}()
+  tv = rowvals(Gt); tz = nonzeros(Gt)
+  for i = 1:p
+    sig = Int[]
+    for t in nzrange(Gt, i)
+      tz[t] == 0 && continue
+      push!(sig, ygrp[tv[t]])
+    end
+    sort!(sig); unique!(sig)
+    ecls[i] = get!(known, sig) do
+      push!(sigs, sig); length(sigs)
+    end
+  end
+  nc = length(sigs)
+  eptr, eidx = _csr(ecls, nc)
+  sptr = Int[1]; sidx = Int[]; scls = Int[]
+  for (s, sig) in enumerate(sigs)
+    append!(sidx, sig); append!(scls, fill(s, length(sig))); push!(sptr, length(sidx) + 1)
+  end
+  # Norm of each (class, group) block of G.
+  LGsg = zeros(length(sidx))
+  for s = 1:nc
+    vals = [Float64[] for _ = sptr[s]:sptr[s+1]-1]
+    for r = eptr[s]:eptr[s+1]-1, t in nzrange(Gt, eidx[r])
+      tz[t] == 0 && continue
+      k = searchsortedfirst(sigs[s], ygrp[tv[t]])
+      push!(vals[k], tz[t])
+    end
+    LGsg[sptr[s]:sptr[s+1]-1] .= _lnorm.(vals)
+  end
+  gptr, gk = _csr(sidx, ng)
+
+  LQ = [_lfro(Qt, view(vidx, vptr[g]:vptr[g+1]-1)) for g = 1:ng]
+  LGc = [_lfro(Gs, view(vidx, vptr[g]:vptr[g+1]-1)) for g = 1:ng]
+  LA = [_lfro(At, view(cidx, cptr[g]:cptr[g+1]-1)) for g = 1:ng]
+  LGs = [_lfro(Gt, view(eidx, eptr[s]:eptr[s+1]-1)) for s = 1:nc]
+  z(k) = zeros(k)
+  return _ResidPlan(ng, nc, ygrp, rgrp, vptr, vidx, cptr, cidx, qptr, qidx, LQgh,
+                    ecls, eptr, eidx, sptr, sidx, LGsg, scls, gptr, gk,
+                    LQ, LGc, LA, LGs,
+                    z(ng), z(ng), z(ng), z(ng), z(ng), z(ng), z(ng), z(nc), z(nc), z(nc))
+end
+
+_seg(ptr, k) = ptr[k]:ptr[k+1]-1
+
+# Largest class backward error of (y, w, v) against the plan's classes.
+# Every denominator is a log-domain sum: the coupling blocks the class
+# touches (each against its own part of the solution), its right-hand side,
+# and the rounding floor η times the class's data against the whole solution.
+function _class_resid(P::_ResidPlan, y, w, v, t1, bx, by, bz, r1, r2, r3)
+  for x in (y, w, v, t1, bx, by, bz, r1, r2, r3)
+    _allfinite(x) || return Inf
+  end
+  Lη = log2(_SCHUR_CLASS_FLOOR)
+  Lyn = _lnorm(y); Lwn = _lnorm(w); Lvn = _lnorm(v); Ltn = _lnorm(t1)
+  for g = 1:P.ng
+    V = _seg(P.vptr, g); R = _seg(P.cptr, g)
+    P.Ly[g] = _lnorm(y, P.vidx, V); P.Lbx[g] = _lnorm(bx, P.vidx, V)
+    P.Lr1[g] = _lnorm(r1, P.vidx, V)
+    P.Lv[g] = _lnorm(v, P.cidx, R); P.Lt1[g] = _lnorm(t1, P.cidx, R)
+    P.Lbz[g] = _lnorm(bz, P.cidx, R); P.Lr3[g] = _lnorm(r3, P.cidx, R)
+  end
+  for s = 1:P.nc
+    E = _seg(P.eptr, s)
+    P.Lr2[s] = _lnorm(r2, P.eidx, E); P.Lby[s] = _lnorm(by, P.eidx, E)
+    P.Lw[s] = _lnorm(w, P.eidx, E)
+  end
+  ρ = 0.0
+  for g = 1:P.ng
+    if P.vptr[g+1] > P.vptr[g]                       # r₁ rows
+      Ld = _lse(P.LA[g] + P.Lv[g], P.Lbx[g],
+                Lη + _lse(P.LQ[g] + Lyn, P.LGc[g] + Lwn, P.LA[g] + Lvn))
+      for k in _seg(P.qptr, g)
+        Ld = _lse(Ld, P.LQgh[k] + P.Ly[P.qidx[k]])
+      end
+      for j in _seg(P.gptr, g)
+        e = P.gk[j]
+        Ld = _lse(Ld, P.LGsg[e] + P.Lw[P.scls[e]])
+      end
+      ρ = max(ρ, _lratio(P.Lr1[g], Ld))
+    end
+    if P.cptr[g+1] > P.cptr[g]                       # r₃ rows
+      Ld = _lse(P.LA[g] + P.Ly[g], P.Lt1[g], P.Lbz[g],
+                Lη + _lse(P.LA[g] + Lyn, Ltn))
+      ρ = max(ρ, _lratio(P.Lr3[g], Ld))
+    end
+  end
+  for s = 1:P.nc                                     # r₂ classes
+    Ld = _lse(P.Lby[s], Lη + P.LGs[s] + Lyn)
+    for k in _seg(P.sptr, s)
+      Ld = _lse(Ld, P.LGsg[k] + P.Ly[P.sidx[k]])
+    end
+    ρ = max(ρ, _lratio(P.Lr2[s], Ld))
+  end
+  return ρ
+end
 
 # Wrap a Schur solve3x3gen with an accuracy check on the original 3×3
 # system. Eliminating the cone variables squares the scaling's conditioning
@@ -1005,6 +1350,7 @@ function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
   Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
   At = sparse(As'); Gt = sparse(Gs')
   nQ = norm(Qs); nA = norm(As); nG = norm(Gs)          # Frobenius
+  plan = _resid_plan(Qs, As, Gs, cone_dims)
   dense_on = Ref(p <= n && dense_kkt_bytes(n, m, p) + schur_bytes <= dense_bytes_max)
   qrgen = Ref{Any}(nothing)
   stats = zeros(Int, 4)
@@ -1020,7 +1366,7 @@ function _schur_checked(gen, Q, A, G, cone_dims; static_reg = 0.0,
     return qrgen[]
   end
   resid(F, bx, by, bz, x) =
-    _kkt3_resid(Qs, As, At, Gs, Gt, nQ, nA, nG, F, bx, by, bz, x..., t1, t2)
+    _kkt3_resid(Qs, As, At, Gs, Gt, nQ, nA, nG, F, bx, by, bz, x..., t1, t2; plan)
   tol() = _SCHUR_RESID_TOL[]
 
   function solve3x3gen(F, F⁻ᵀ, pt = nothing)
