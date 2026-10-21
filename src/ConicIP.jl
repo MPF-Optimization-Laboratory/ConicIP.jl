@@ -1,7 +1,8 @@
 module ConicIP
 
 export Id, conicIP, pivot, preprocess_conicIP,
-  Optimizer, Block, choose_kktsolver, default_kktsolver
+  Optimizer, Block, choose_kktsolver, default_kktsolver,
+  SolverTrace, write_jsonl
 
 import Base: +, *, -, \, ^
 using LinearAlgebra
@@ -42,6 +43,7 @@ Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/
 include("blockmatrices.jl")
 include("timing.jl")
 include("logging.jl")
+include("trace.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
 include("schur.jl")
@@ -1065,12 +1067,24 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                  G = spzeros(0, length(c)), d = zeros(0);
                  equilibrate = true, timeLimit = Inf, timing = nothing,
                  verbose = true, log_style = :auto, log_io::IO = stdout,
-                 _log = nothing, kwargs...)
+                 trace = nothing, _log = nothing, kwargs...)
   t_start = time()
   # The log is created here unless a caller up the stack (presolve) owns
-  # it; the owner reports the final verdict.
+  # it; the owner reports the final verdict and closes a trace file.
   owner = _log === nothing
-  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io) : _log
+  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io,
+                          trace = trace === nothing ? _env_trace() : trace) : _log
+  try
+    return _conicIP_entry(Q, c, A, b, cone_dims, G, d, log, owner, t_start;
+                          equilibrate = equilibrate, timeLimit = timeLimit,
+                          timing = timing, kwargs...)
+  finally
+    owner && _close_log!(log)
+  end
+end
+
+function _conicIP_entry(Q, c, A, b, cone_dims, G, d, log, owner, t_start;
+                        equilibrate, timeLimit, timing, kwargs...)
   # t_gc: every entry point (this one, preprocess_conicIP, _preprocess_core,
   # the MOI optimize!) assigns it on exit; the outermost writes last and
   # wins (see gc_start/gc_stop! in timing.jl). `_conicIP` never touches it.
@@ -2493,11 +2507,13 @@ function _conicIP(
     # Each solve is gated on the deadline separately: the first can use
     # up what is left of the budget, and the second must not then start.
     if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0 && !over_time()
+      log.on && _log_note!(log, :fallback, "auxiliary min-norm solve for a Farkas ray")
       # The auxiliary solve runs untimed inside (no `timing` reaches it).
       ray = @phase timing t_fallback fallback_infeasibility_ray(
                                        Q, c, A, b, cone_dims, G, d;
                                        maxIters = certFallbackIters,
                                        timeLimit = max(time_left(), 0.0))
+      log.on && ray === nothing && _log_note!(log, :fallback, "no Farkas ray found")
       if ray !== nothing
         (fchk, fw̄, fv̄) = @phase timing t_final validate_infeasibility_certificate(
                             Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
@@ -2506,14 +2522,17 @@ function _conicIP(
           log.on && _log_exit!(log, :infeasible)
           return claim_infeasible!(sol, fw̄, fv̄)
         end
+        log.on && _log_note!(log, :fallback, "Farkas ray found but not validated")
       end
     end
 
     if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0 && !over_time()
+      log.on && _log_note!(log, :fallback, "auxiliary min-norm solve for a recession ray")
       ray = @phase timing t_fallback fallback_unbounded_ray(
                                    Q, c, A, b, cone_dims, G, d;
                                    maxIters = certFallbackIters,
                                    timeLimit = max(time_left(), 0.0))
+      log.on && ray === nothing && _log_note!(log, :fallback, "no recession ray found")
       if ray !== nothing
         (fchk, fȳ) = @phase timing t_final validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, ray;
@@ -2522,6 +2541,7 @@ function _conicIP(
           log.on && _log_exit!(log, :dual_infeasible)
           return claim_dual_infeasible!(sol, fȳ, A)
         end
+        log.on && _log_note!(log, :fallback, "recession ray found but not validated")
       end
     end
 

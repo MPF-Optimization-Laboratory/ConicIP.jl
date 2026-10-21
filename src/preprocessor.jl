@@ -88,16 +88,30 @@ function preprocess_conicIP(Q, c::AbstractVector,
   timing = nothing,
   log_style = :auto,
   log_io::IO = stdout,
+  trace = nothing,
   _log = nothing,
   options...)
 
+  # The log is created here (see logging.jl) and handed down to the solve;
+  # its owner reports the final verdict on every exit and closes a trace
+  # file.
+  owner = _log === nothing
+  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io,
+                          trace = trace === nothing ? _env_trace() : trace) : _log
+  try
+    return _preprocess_entry(Q, c, A, b, cone_dims, G, d, log, owner;
+                             rank_check = rank_check, fix_singletons = fix_singletons,
+                             timeLimit = timeLimit, timing = timing, options...)
+  finally
+    owner && _close_log!(log)
+  end
+end
+
+function _preprocess_entry(Q, c, A, b, cone_dims, G, d, log, owner;
+                           rank_check, fix_singletons, timeLimit, timing, options...)
   t_start = time()
   time_left() = timeLimit - (time() - t_start)
   gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
-  # The log is created here (see logging.jl) and handed down to the solve;
-  # its owner reports the final verdict on every exit.
-  owner = _log === nothing
-  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io) : _log
   function finish(sol)
     owner && log.on && _log_final!(log, sol, timing)
     return gc_stop!(timing, gc0, sol)

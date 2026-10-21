@@ -15,6 +15,9 @@ Settable as constructor keywords or through
 - `log_style` -- `"auto"` (default: rich on an interactive terminal,
   classic otherwise), `"classic"` or `"rich"`; see [`conicIP`](@ref)
 - `log_io::IO` -- where the log is printed (default: `stdout`)
+- `trace` -- `nothing` (default), a [`SolverTrace`](@ref), a callable that
+  receives one record per solver event, or a path to append JSON Lines to;
+  not affected by `MOI.Silent` (see [`conicIP`](@ref))
 - `optTol::Float64` -- optimality tolerance (default: `1e-6`)
 - `maxIters::Int` -- maximum iterations (default: `100`)
 - `infeasTol::Float64` -- infeasibility/unboundedness certificate tolerance
@@ -103,6 +106,7 @@ const _SUPPORTED_OPTIONS = (
     "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
     "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
     "assemble_only", "centralityCorrectors", "timing", "log_style", "log_io",
+    "trace",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the name
@@ -267,7 +271,7 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
         "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
         "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false,
         "centralityCorrectors" => 0, "timing" => nothing, "log_style" => "auto",
-        "log_io" => stdout)
+        "log_io" => stdout, "trace" => nothing)
     return get(model.options, attr.name, defaults[attr.name])
 end
 

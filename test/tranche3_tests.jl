@@ -778,7 +778,7 @@
     # Bounds are exact invariants or carry slack: on this platform K = 2
     # saves 0–3 iterations per problem (three of the nine tie), so a strict
     # `Iter ≤ Iter₀` would hinge on rounding elsewhere on the CI matrix; the
-    # corrector solves are counted from the verbose `cc` column (tried), at
+    # corrector solves are counted from the trace's `cc_try` (tried), at
     # most K per iteration by construction; the budget against the
     # uncorrected run allows for refinement counts that differ between the
     # two trajectories (one seeded mix sits exactly at `+ 2·Iter₀`).
@@ -786,10 +786,10 @@
       s0 = conicIP(P.Q, P.c, P.A, P.b, P.cone_dims, P.G, P.d; verbose = false)
       s2 = conicIP(P.Q, P.c, P.A, P.b, P.cone_dims, P.G, P.d; verbose = false,
                    centralityCorrectors = 2)
-      out = capture(() -> conicIP(P.Q, P.c, P.A, P.b, P.cone_dims, P.G, P.d;
-                                  verbose = true, centralityCorrectors = 2))
-      tried = sum(parse(Int, split(strip(m.match), '/')[2])
-                  for m in eachmatch(r"\d+/\d+\s*$"m, out); init = 0)
+      tr = SolverTrace()
+      conicIP(P.Q, P.c, P.A, P.b, P.cone_dims, P.G, P.d;
+              verbose = false, centralityCorrectors = 2, trace = tr)
+      tried = sum(r.cc_try for r in ConicIP.iterations(tr))
       @test s0.status == :Optimal
       @test s2.status == :Optimal
       @test s2.Iter <= s0.Iter + 1
@@ -815,8 +815,9 @@
     g0 = conicIP(fs...; verbose = false, maxIters = 2)
     g2 = conicIP(fs...; verbose = false, maxIters = 2, centralityCorrectors = 2)
     @test g0.kkt_solves <= g2.kkt_solves <= g0.kkt_solves + 1
-    outf = capture(() -> conicIP(fs...; verbose = true, centralityCorrectors = 2))
-    cellsf = [strip(m.match) for m in eachmatch(r"\d+/\d+\s*$"m, outf)]
+    trf = SolverTrace()
+    conicIP(fs...; verbose = false, centralityCorrectors = 2, trace = trf)
+    cellsf = ["$(r.cc_acc)/$(r.cc_try)" for r in ConicIP.iterations(trf)]
     @test cellsf[1] == "0/0" && cellsf[2] == "0/0"     # initial point, iteration 1
     @test all(in(("0/0", "0/1")), cellsf[3:end])       # never more than one tried, none accepted
     @test count(==("0/1"), cellsf[3:end]) >= length(cellsf[3:end]) - 1

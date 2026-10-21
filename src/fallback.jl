@@ -94,6 +94,7 @@ function fallback_infeasibility_ray(Q, c, A, b, cone_dims, G, d;
             maxIters = maxIters,
             timeLimit = time_left(),
             verbose = false,
+            _log = _NOLOG,          # silent and untraced (the caller notes it)
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
   catch err
@@ -171,6 +172,7 @@ function fallback_unbounded_ray(Q, c, A, b, cone_dims, G, d;
             maxIters = maxIters,
             timeLimit = time_left(),
             verbose = false,
+            _log = _NOLOG,          # silent and untraced (the caller notes it)
             staticReg = 1e-8,
             certFallback = false)   # recursion guard
   catch err

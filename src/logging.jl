@@ -61,6 +61,8 @@ _LogHistory() = _LogHistory(Float64[], Float64[], Float64[], Float64[], Float64[
 mutable struct SolverLog
   on      :: Bool      # anything consumes the events (printing or a trace)
   show    :: Bool      # print to `io`
+  sink    :: Any       # trace callable (trace.jl), or nothing
+  closeio :: Any       # trace file the owner closes, or nothing
   style   :: Symbol    # resolved style: :classic or :rich
   io      :: IO
   color   :: Bool      # emit ANSI colour (rich style)
@@ -81,8 +83,8 @@ mutable struct SolverLog
 end
 
 SolverLog(on, show, style, io, depth) =
-  SolverLog(on, show, style, io, false, 120, depth, time(), :none, :None, "",
-            nothing, 0, 0.0, false, _LogHistory())
+  SolverLog(on, show, nothing, nothing, style, io, false, 120, depth, time(),
+            :none, :None, "", nothing, 0, 0.0, false, _LogHistory())
 
 # The log of a solve that prints nothing. Never mutated.
 const _NOLOG = SolverLog(false, false, :classic, devnull, 0)
@@ -109,16 +111,31 @@ function _resolve_style(log_style, io::IO)
   return _is_tty(io) && get(ENV, "TERM", "") != "dumb" ? :rich : :classic
 end
 
-function _make_log(verbose::Bool; log_style = :auto, log_io::IO = stdout)
+# The log of an owner. `trace` is a sink accepted by `_open_trace`; the
+# caller closes the log with `_close_log!` when the solve is over.
+function _make_log(verbose::Bool; log_style = :auto, log_io::IO = stdout, trace = nothing)
   # The style is checked even when nothing is printed, so that a typo
   # does not wait for the first verbose run to surface.
   _check_log_style(log_style)
-  verbose || return _NOLOG
-  log = SolverLog(true, true, _resolve_style(log_style, log_io), log_io, 0)
-  log.color = get(log_io, :color, false)::Bool && !haskey(ENV, "NO_COLOR")
-  log.width = _is_tty(log_io) ? displaysize(log_io)[2] :
-              get(log_io, :displaysize, (24, 120))[2]
+  (verbose || trace !== nothing) || return _NOLOG
+  log = SolverLog(true, verbose, verbose ? _resolve_style(log_style, log_io) : :classic,
+                  log_io, 0)
+  (log.sink, log.closeio) = _open_trace(trace)
+  if verbose
+    log.color = get(log_io, :color, false)::Bool && !haskey(ENV, "NO_COLOR")
+    log.width = _is_tty(log_io) ? displaysize(log_io)[2] :
+                get(log_io, :displaysize, (24, 120))[2]
+  end
   return log
+end
+
+_close_log!(log::SolverLog) = (log.closeio === nothing || close(log.closeio); nothing)
+
+# Hand an event to the trace sink, stamped with its kind, depth and time.
+function _emit(log::SolverLog, event::Symbol, rec::NamedTuple)
+  log.sink === nothing && return nothing
+  log.sink(merge((; event, depth = log.depth, t = time() - log.t0), rec))
+  return nothing
 end
 
 # The status each exit kind returns.
@@ -145,6 +162,7 @@ end
 # :presolve :equilibrate :kkt :stall :fallback :retry :deflate :postsolve.
 # The classic table shows the presolve and stall notes only.
 @noinline function _log_note!(log::SolverLog, source::Symbol, msg::AbstractString)
+  _emit(log, :note, (; source, msg = String(msg)))
   log.show || return nothing
   io = log.io
   if log.style === :rich
@@ -165,6 +183,7 @@ end
   log.t_hdr = time()
   log.hist = _LogHistory()
   log.exit_kind = :none; log.exit_status = :None; log.exit_detail = ""
+  _emit(log, :header, merge((; schema = TRACE_SCHEMA), h))
   log.show || return nothing
   log.style === :rich && return _rich_header(log, h)
   io = log.io
@@ -200,6 +219,7 @@ end
   push!(h.icertp, r.icertp); push!(h.icertd, r.icertd)
   h.refine += r.refine
   r.refine_warn && push!(h.warn, r.iter)
+  _emit(log, :iter, r)
   log.show || return nothing
   log.style === :rich && return _rich_iter(log, r)
   # The kkt cell is repaired/refactors of the factorization that produced
@@ -227,6 +247,7 @@ end
   log.exit_kind = kind
   log.exit_status = _EXIT_STATUS[kind]
   log.exit_detail = detail
+  _emit(log, :exit, (; kind, status = log.exit_status, detail = String(detail)))
   log.show || return nothing
   log.style === :rich && return nothing
   text = kind === :optimal                ? "Below Tolerance!" :
@@ -252,6 +273,13 @@ end
 # style prints the exit card. `timing` (a PhaseTimes or nothing) adds a
 # time breakdown to the card.
 @noinline function _log_final!(log::SolverLog, sol, timing = nothing)
+  changed = log.exit_status !== :None && sol.status !== log.exit_status
+  _emit(log, :final, (; status = sol.status, message = sol.message, iters = sol.Iter,
+                        time = time() - log.t0, sol.pobj, sol.dobj, sol.prFeas,
+                        sol.duFeas, sol.muFeas, sol.rGap, sol.has_certificate,
+                        sol.kkt_solves, sol.kkt_repaired, sol.kkt_refactors,
+                        changed_from = changed ? log.exit_status : nothing,
+                        phases = timing === nothing ? nothing : (; phase_table(timing)...)))
   log.show || return nothing
   log.style === :rich && return _rich_final(log, sol, timing)
   msg = isempty(sol.message) ? "" : " ($(sol.message))"
