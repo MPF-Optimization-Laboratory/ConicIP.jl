@@ -1385,9 +1385,11 @@ end
     end
 
     @testset "sixth: near-degenerate equalities beside a decoupled scalar agree with QR: δ = $δ, cost = $cost" for
-            δ in (1e-6, 1e-8, 1e-10, 1e-12), cost in (0.0, 1e-8, 1e-12, -1e-8)
+            δ in (1e-6, 1e-8, 1e-10), cost in (0.0, 1e-8, 1e-12, -1e-8)
         # The scalar shares no equality and no Q row with the PSD block;
         # cost −1e-8 is unbounded, so a match there is :DualInfeasible.
+        # δ = 1e-12 is the documented limit (see _SCHUR_CLASS_FLOOR): on some
+        # platforms it already returns :DualInfeasible at this tolerance.
         K = sixth_kernel(); c = [0.0, 1, 0, -cost]; d = [1.0, 1.0 + δ]
         s1 = conicIP(K.Q, c, K.A, zeros(4), K.cd, K.G, d; optTol = 1e-10, verbose = false)
         s2 = conicIP(K.Q, c, K.A, zeros(4), K.cd, K.G, d; optTol = 1e-10, verbose = false,

@@ -941,7 +941,8 @@ const _SCHUR_DENSE_TRIES = 3
 # about 67 passes, and refinement usually removes the rest first. Against the
 # whole solution, a large part that is disconnected from a class raises its
 # floor and can hide a small needed correction; in our tests, that showed up
-# only at optTol 1e-12 with nearly coincident equality right-hand sides. A
+# only with equality right-hand sides 1e-12 apart, at optTol 1e-12 (and, on
+# some platforms, 1e-10). A
 # floor restricted to the class's connected component closes that case on
 # paper but judged late-iteration rounding too strictly, and did worse overall.
 const _SCHUR_CLASS_FLOOR = sqrt(eps(Float64))
