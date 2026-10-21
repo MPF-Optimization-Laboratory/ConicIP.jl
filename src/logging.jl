@@ -26,6 +26,14 @@
 # loop. It flags an ill-conditioned KKT system.
 const REFINE_WARN_NORM = 1e-3
 
+# Per-iteration refinement statistics of the solver loop (see `_it` in
+# `_conicIP`): corrections applied and the relative KKT residual of the
+# step, ‖r − KΔz‖/(1 + ‖r‖).
+mutable struct IterStats
+  nref  :: Int
+  rnorm :: Float64
+end
+
 mutable struct SolverLog
   on      :: Bool      # anything consumes the events (printing or a trace)
   show    :: Bool      # print to `io`

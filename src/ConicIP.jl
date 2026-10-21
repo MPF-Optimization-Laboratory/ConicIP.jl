@@ -1720,10 +1720,12 @@ function _conicIP(
   sol     = Solution(copy(z.y), copy(z.w), copy(z.v), copy(z.s), :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
   _stamp_kkt!(sol)
   optBest = Inf
-  nref    = 0      # refinement corrections applied in the previous iteration
+  # Refinement corrections applied in the previous iteration and the
+  # relative KKT residual of its step. Fields, not locals: refine! updates
+  # them, and a local assigned both there and in the loop would be boxed.
+  _it     = IterStats(0, 0.0)
   cc_acc  = 0      # centrality correctors accepted / tried in the previous
   cc_try  = 0      #   iteration (verbose cc column)
-  rnorm   = 0
   nstall  = 0      # consecutive iterations with a negligible step
   μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
   α_prev  = NaN    # step length and centering of the step that produced
@@ -2086,12 +2088,12 @@ function _conicIP(
                          optMeasure, pobj, dobj, mu = μ,
                          icertp = p_infeas, icertd = d_infeas,
                          alpha = α_prev, sigma = σ_prev,
-                         refine = nref, rnorm = Float64(rnorm),
+                         refine = _it.nref, rnorm = _it.rnorm,
                          kkt_repaired  = dg === nothing ? -1 : dg.repaired,
                          kkt_refactors = dg === nothing ? -1 : dg.refactors,
                          cc_acc = cc_on ? cc_acc : -1, cc_try = cc_on ? cc_try : -1,
                          kkt_solves = _nsolve[], best = isbest,
-                         refine_warn = rnorm > REFINE_WARN_NORM))
+                         refine_warn = _it.rnorm > REFINE_WARN_NORM))
     end
 
     if optimal
@@ -2165,7 +2167,7 @@ function _conicIP(
     # that does not reduce it is undone and ends the loop: refinement with
     # an approximate factorization K̃ contracts only when ‖I − K̃⁻¹K‖ < 1,
     # and a worsening step is the evidence that it does not. The step that
-    # leaves this function is therefore the best one seen, and `rnorm`
+    # leaves this function is therefore the best one seen, and `_it.rnorm`
     # (relative, shown in red in the verbose row when large) describes it.
     # The tolerance is a target, not a guarantee: a step that still misses
     # it is used as is. Returns false after stamping sol when a correction
@@ -2210,12 +2212,12 @@ function _conicIP(
         end
         rres = rnew
       end
-      nref += k                         # iteration total, for the verbose row
-      rnorm = rres / (1 + nr)
+      _it.nref += k                     # iteration total, for the log row
+      _it.rnorm = rres / (1 + nr)
       true
       end # @phase t_dir_refine
     end
-    nref = 0
+    _it.nref = 0
 
     # t_direction covers the base solve (also t_dir_base) and the
     # refinement; the finiteness checks between them are left out.
