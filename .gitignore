@@ -5,9 +5,6 @@
 docs/build/
 docs/src/tutorials/generated/
 /Manifest.toml
-benchmark/.cache/
-benchmark/results/
-benchmark/Manifest.toml
 
 # Track the shared Claude Code settings, nothing else in .claude/
 !.claude/

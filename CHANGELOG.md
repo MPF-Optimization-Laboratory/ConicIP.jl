@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-20
+
 ### Breaking changes
 - Automatic KKT routing sends problems with a PSD *variable* (an order-`k`
   semidefinite block whose rows each hold one variable, as
@@ -75,10 +77,6 @@ uses [Semantic Versioning](https://semver.org/).
 - The semidefinite cone division by the scaled point, whose matrix is
   diagonal, uses the closed form `Z_ij = X_ij / ((λ_i + λ_j)/2)` instead of
   a Lyapunov solve: O(k²) and allocation-free instead of O(k³).
-- Benchmark: `benchmark/sdp_scaling.jl` measures SDP families (max-cut,
-  theta, mixed forms) across the block order in PSD-variable and LMI form,
-  one fresh process per instance, with the routed backend, the dimensions
-  after presolve, assembly and factorization times, and peak RSS.
 
 ## [0.6.0] - 2026-09-16
 
@@ -222,14 +220,6 @@ uses [Semantic Versioning](https://semver.org/).
   back-solve per corrector on the current factorization.
 - MOI option `assemble_only`: `optimize!` returns after assembling the
   solver's matrices (`OPTIMIZE_NOT_CALLED`, `ResultCount == 0`).
-- Benchmark: `benchmark/baselines.jl` runs the instance set through
-  Clarabel, ECOS or ConicIP-via-MOI from one problem tuple
-  (`benchmark/moi_model.jl`), `benchmark/compare.jl` joins result CSVs;
-  `suite.jl --opt key=value,...` passes solver options, `--timeout` kills a
-  child process, and the CSV gains `kktsolver`, `kkt_repaired`,
-  `kkt_refactors` columns. `benchmark/sumnorms_diag.jl` attributes the
-  sum-of-norms SOCP regression; `benchmark/hsd-design.md` is the design
-  note for the homogeneous self-dual embedding.
 - `kktsolver_ldl`: sparse LDLᵀ factorization of the symmetric
   quasi-definite KKT system (QDLDL.jl backend, pure Julia). Fixed pattern
   with AMD ordering analysed once, numeric refactorization in place each
@@ -282,11 +272,6 @@ uses [Semantic Versioning](https://semver.org/).
   callback (initial point, predictor, corrector, outer refinements). Solves
   a backend performs internally, such as `kktsolver_ldl`'s own refinement,
   are not counted.
-- `benchmark/suite.jl`: reproducible harness with phase timings, solve
-  counts, fill proxies, peak RSS in a fresh process, and residuals
-  recomputed from the original data.
-- `benchmark/large-scale-roadmap.md`: diagnosis of the scale limits and the
-  tranche plan to lift them.
 - The KKT-solver guide documents the callback contract: data and signs,
   the scaling-block types, calls per iteration, ownership of returned
   arrays, accuracy and regularization, and failure reporting.
@@ -295,10 +280,6 @@ uses [Semantic Versioning](https://semver.org/).
 - A certificate return (`:Infeasible`, `:DualInfeasible`) no longer carries
   the discarded iterate's `rEq`/`rGap`; they are `NaN`, like `pobj`, and
   `MOI.RelativeGap` is `NaN` for such a result.
-- `benchmark/suite.jl --opt` rejects entries with an empty key or value;
-  `test/testdata.jl` is no longer included twice when `suite.jl` and
-  `issue10.jl` are loaded into one module (no more "Replacing docs"
-  warnings from the review tests).
 - Automatic routing uses LDL for non-SDP problems with more equality rows
   than variables; dense QR cannot factor these systems. Its flop estimate
   is `Inf` in this unsupported regime instead of zero or negative.
@@ -444,7 +425,8 @@ uses [Semantic Versioning](https://semver.org/).
 First registered release. Modernized the 2016 code base for Julia ≥ 1.10,
 MathOptInterface 1.x, and JuMP; added Documenter.jl documentation and CI.
 
-[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MPF-Optimization-Laboratory/ConicIP.jl/compare/v0.3.2...v0.4.0
