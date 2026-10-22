@@ -572,6 +572,15 @@ end
                                            kktsolver = kktsolver,
                                            optTol = optTol)
 
+            # A with more columns than c has entries, every other size
+            # consistent: refused by the dimension check, before the
+            # equilibration sweeps index the data unchecked (they used to
+            # write past the end of a column-norm buffer here).
+            @test_throws ErrorException conicIP(H, c,
+                                                A, zeros(n + 2), [("R", n + 2)],
+                                                kktsolver = kktsolver,
+                                                optTol = optTol)
+
         end
 
     end

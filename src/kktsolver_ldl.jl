@@ -121,6 +121,85 @@ function _dense_FtF(Blk::VecCongurance)
 end
 _dense_FtF(Blk::AbstractMatrix) = Blk'Blk
 
+# The entries −(FᵀF + δc I) of one scaling block, as `kktsolver_ldl` stores
+# them: the block's upper triangle column by column for `:dense` blocks
+# (`_fill_packed!`), the diagonal for `:diag` ones, and `u`, `v` and the two
+# unit pivots after `d²` for `:lift` ones. `Blk` arrives as a `BlockElem`,
+# whose `SymWoodbury{Float64}` member is not concrete, so every helper here
+# narrows to the types the solver itself builds (`DiagBlock`, `SOCBlock`,
+# `VecCongurance`, dense) before touching an entry: the per-entry loops then
+# run on concrete types, and the one remaining dynamic call is the fallback
+# for a `SymWoodbury` of some other shape. The dispatchers are `@inline` so
+# that the narrowing happens in the caller, where `Blk` is a `BlockElem`:
+# called as functions, they would be reached by a dynamic dispatch.
+function _fill_packed!(vbuf, M::AbstractMatrix, δc)
+  t = 0
+  for b in axes(M, 2), a in 1:b
+    t += 1
+    vbuf[t] = -M[a, b] - (a == b ? δc : 0.0)
+  end
+  return vbuf
+end
+
+# F = D + c·w wᵀ is symmetric, so FᵀF = F² has the closed form
+#
+#     (FᵀF)ₐᵦ = δₐᵦ dₐ² + wₐ wᵦ (c (dₐ + dᵦ) + c² wᵀw),
+#
+# written straight into `vbuf`: forming F and then FᵀF (what `_dense_FtF`
+# does) costs two k×k temporaries and a product per cone per iteration,
+# which on many small cones dominates the factorization phase.
+function _fill_soc_packed!(vbuf, Blk::SOCBlock, δc)
+  d = Blk.A.diag; w = Blk.B; c = Blk.D
+  γ = c^2 * dot(w, w)
+  t = 0
+  @inbounds for b in eachindex(d), a in 1:b
+    t += 1
+    f = w[a] * w[b] * (c * (d[a] + d[b]) + γ)
+    vbuf[t] = -(a == b ? d[a]^2 + f + δc : f)
+  end
+  return vbuf
+end
+
+@inline function _fill_dense!(vbuf, Blk, δc)
+  Blk isa SOCBlock      && return _fill_soc_packed!(vbuf, Blk, δc)
+  Blk isa DiagBlock     && return _fill_packed!(vbuf, _dense_FtF(Blk), δc)
+  Blk isa VecCongurance && return _fill_packed!(vbuf, _dense_FtF(Blk), δc)
+  Blk isa Matrix{Float64} && return _fill_packed!(vbuf, _dense_FtF(Blk), δc)
+  return _fill_packed!(vbuf, _dense_FtF(Blk)::Matrix{Float64}, δc)
+end
+
+# A `:diag` block is a Diagonal; anything else is read off its dense value.
+@inline function _fill_diag!(vbuf, Blk, δc)
+  d = Blk isa DiagBlock ? Blk.diag : _diag_of(Blk)
+  @inbounds for t in eachindex(d)
+    vbuf[t] = -(d[t]^2) - δc
+  end
+  return vbuf
+end
+_diag_of(Blk) = LinearAlgebra.diag(Matrix(Blk))::Vector{Float64}
+
+# soc_uv with the result typed, for the same reason as above.
+@inline function _soc_uv(Blk)
+  Blk isa SOCBlock  && return soc_uv(Blk)
+  Blk isa DiagBlock && return soc_uv(Blk)
+  return soc_uv(Blk)::NTuple{3, Vector{Float64}}
+end
+
+# A `:lift` block: −(d² + δc), −u, v, then the two pivots. Returns the
+# spectral-norm bound √(‖u‖² + ‖v‖²) of [u v], for `last_bound`.
+@inline function _fill_lift!(vbuf, Blk, δc)
+  (d², u, v) = _soc_uv(Blk)
+  k = length(d²)
+  @inbounds for i in 1:k
+    vbuf[i]      = -d²[i] - δc
+    vbuf[k + i]  = -u[i]
+    vbuf[2k + i] =  v[i]
+  end
+  vbuf[3k + 1] =  1.0
+  vbuf[3k + 2] = -1.0
+  return sqrt(dot(u, u) + dot(v, v))
+end
+
 # `sparse(M)` without the copy when M already is one. The pattern assembly
 # and the structure key below only read these matrices, and they copy each
 # column's row indices straight into K, so those indices have to be strictly
@@ -342,14 +421,18 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   # diagonals below, so the pattern's own placeholder shifts do not matter.
   pat = pattern !== nothing ? pattern :
         _ldl_pattern(Q, A, G, cone_dims; lift_min = lift_min)
-  (; K, kinds, ranges, blk_idx, Dsigns, n, m, p, N, oz, oa,
+  (; K, kinds, blk_idx, Dsigns, n, m, p, N, oz, oa,
      qdiag_idx, qdiag, ediag_idx) = pat
   δp0 = static_reg; δe0 = static_reg; δc = cone_reg
-  δp = δp0; δe = δe0
+
+  # The shifts in effect live in `diag.δp`/`diag.δe`, not in locals: they
+  # are reassigned by `bump!` and by `solve3x3gen`, and a local assigned in
+  # two closures is boxed (see AGENTS.md).
+  diag = LDLDiagnostics(δp0, δe0, δc)
 
   # Base static shifts in K before the symbolic analysis copies it.
-  K.nzval[qdiag_idx] .= qdiag .+ δp
-  K.nzval[ediag_idx] .= -δe
+  K.nzval[qdiag_idx] .= qdiag .+ δp0
+  K.nzval[ediag_idx] .= -δe0
 
   # Symbolic analysis once, with the ordering the pattern carries; numeric
   # factorizations happen in refactor! after each value update.
@@ -360,12 +443,11 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   shift = zeros(N)
   shift[oz+1:oz+m] .= -δc
 
-  diag = LDLDiagnostics(δp, δe, δc)
-
   # Write the static shifts in effect into K, into the factorization's
   # internal copy, and into `shift`, so that K − Diagonal(shift) is always
   # the exact unregularized matrix.
   function write_static!()
+    δp = diag.δp; δe = diag.δe
     @inbounds for t in 1:n
       K.nzval[qdiag_idx[t]] = qdiag[t] + δp
     end
@@ -374,7 +456,6 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     update_values!(Fact, ediag_idx, view(K.nzval, ediag_idx))
     shift[1:n] .= δp
     shift[n+1:n+p] .= -δe
-    diag.δp = δp; diag.δe = δe
     return nothing
   end
   write_static!()
@@ -427,7 +508,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     refactor!(Fact)
     diag.repaired        = regularized_entries(Fact)
     diag.repaired_total += diag.repaired
-    diag.pos_inertia     = positive_inertia(Fact)
+    diag.pos_inertia     = positive_inertia(Fact)::Int
     diag.repaired > 0 &&
       @debug "LDLᵀ: dynamic regularization replaced pivots" _group = :kkt repaired = diag.repaired pos_inertia = diag.pos_inertia
     if pt !== nothing
@@ -441,13 +522,13 @@ function kktsolver_ldl(Q, A, G, cone_dims;
   # shift starts at shift_floor), cap at shift_max, and refactorize. The
   # bumped shifts stay in effect until the next solve3x3gen call.
   function bump!()
-    δp = min(max(δp * retry_factor, shift_floor), shift_max)
-    δe = min(max(δe * retry_factor, shift_floor), shift_max)
+    diag.δp = min(max(diag.δp * retry_factor, shift_floor), shift_max)
+    diag.δe = min(max(diag.δe * retry_factor, shift_floor), shift_max)
     write_static!()
     numeric_factor!()
     diag.refactors       += 1
     diag.refactors_total += 1
-    @debug "LDLᵀ: static shifts bumped, refactorized" _group = :kkt δp δe refactors = diag.refactors
+    @debug "LDLᵀ: static shifts bumped, refactorized" _group = :kkt δp = diag.δp δe = diag.δe refactors = diag.refactors
     return nothing
   end
 
@@ -455,8 +536,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
 
     # Every factorization starts from the base shifts: a retry in the
     # previous iteration does not carry its bumps forward.
-    if δp != δp0 || δe != δe0
-      δp = δp0; δe = δe0
+    if diag.δp != δp0 || diag.δe != δe0
+      diag.δp = δp0; diag.δe = δe0
       write_static!()
     end
     diag.refactors = 0
@@ -464,38 +545,18 @@ function kktsolver_ldl(Q, A, G, cone_dims;
 
     # Rewrite the scaling entries (in K, for the residual, and in the
     # factorization's internal copy), then refactorize numerically.
-    for (bi, (kind, I)) in enumerate(zip(kinds, ranges))
+    for bi in eachindex(kinds)
+      kind = kinds[bi]
       Blk = F.Blocks[bi]
       idx = blk_idx[bi]
+      resize!(vbuf, length(idx))
       if kind == :diag
-        # `diag` is the diagnostics record here; qualify the function.
-        d = Blk isa Diagonal ? Blk.diag : LinearAlgebra.diag(Matrix(Blk))
-        resize!(vbuf, length(idx))
-        @inbounds for t in eachindex(idx)
-          vbuf[t] = -(d[t]^2) - δc
-        end
+        _fill_diag!(vbuf, Blk, δc)
       elseif kind == :dense
-        M = _dense_FtF(Blk)
-        k = length(I)
-        resize!(vbuf, length(idx))
-        t = 0
-        for b in 1:k, a in 1:b
-          t += 1
-          vbuf[t] = -M[a, b] - (a == b ? δc : 0.0)
-        end
+        _fill_dense!(vbuf, Blk, δc)
       else
-        (d², u, v) = soc_uv(Blk)
-        k = length(I)
-        resize!(vbuf, length(idx))
-        @inbounds for i in 1:k
-          vbuf[i]      = -d²[i] - δc
-          vbuf[k + i]  = -u[i]
-          vbuf[2k + i] =  v[i]
-        end
-        vbuf[3k + 1] =  1.0
-        vbuf[3k + 2] = -1.0
         # Spectral-norm bound of this block's [u v], for `last_bound`.
-        diag.lift_gain = max(diag.lift_gain, sqrt(dot(u, u) + dot(v, v)))
+        diag.lift_gain = max(diag.lift_gain, _fill_lift!(vbuf, Blk, δc))
       end
       K.nzval[idx] .= vbuf
       update_values!(Fact, idx, vbuf)
@@ -823,18 +884,19 @@ end
 ks.hits   # number of solves that reused the ordering
 ```
 """
-mutable struct cached_kktsolver_ldl
+mutable struct cached_kktsolver_ldl{KW}
   key    :: Any
   perm   :: Union{Nothing, Vector{Int}}
   hits   :: Int
-  kwargs :: Any
+  kwargs :: KW
 end
 cached_kktsolver_ldl(; kwargs...) = cached_kktsolver_ldl(nothing, nothing, 0, kwargs)
 
 function (ks::cached_kktsolver_ldl)(Q, A, G, cone_dims)
   key = _ldl_structure_key(Q, A, G, cone_dims)
   hint = nothing
-  if ks.perm !== nothing && key == ks.key
+  old = ks.key
+  if ks.perm !== nothing && old isa typeof(key) && key == old
     hint = ks.perm
     ks.hits += 1
   end

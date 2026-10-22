@@ -279,11 +279,15 @@ function kktsolver_qr(Q, A, G, cone_dims)
   # the work bounded by the null-space dimension (none at p = n).
   gram = p == 0 && any(cd -> cd[1] == "S", cone_dims)
 
-  # Constants across iterations
-  AQ2  = gram ? nothing : A * Q2           # m×(n−p) dense
-  S22  = gram ? nothing : Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
-  plan = gram ? _gram_plan(sparse(A), cone_dims) : nothing
-  Hbuf = gram ? zeros(n, n) : nothing
+  # Constants across iterations. The branch that is not taken gets an empty
+  # placeholder of the same type rather than `nothing`: a captured variable
+  # of type `Union{Nothing, T}` makes the closure's type, and so the
+  # `DenseKKTGen` around it, abstract.
+  AQ2  = gram ? zeros(0, 0) : A * Q2           # m×(n−p) dense
+  S22  = gram ? zeros(0, 0) : Q2' * (Q * Q2)   # (n−p)×(n−p), the Q part of the reduced Hessian
+  plan = gram ? _gram_plan(sparse(A), cone_dims) :
+                _gram_plan(spzeros(0, 0), Tuple{String,Int}[])
+  Hbuf = gram ? zeros(n, n) : zeros(0, 0)
 
   function solve3x3gen(F, F⁻ᵀ, pt = nothing)
 
@@ -355,6 +359,30 @@ DenseKKTGen(gen::G, timing) where {G} = DenseKKTGen{G}(gen, timing, Int[])
 (g::DenseKKTGen)(F, F⁻ᵀ) = g.gen(F, F⁻ᵀ, g.timing)
 kkt_attach_timing!(g::DenseKKTGen, pt::PhaseTimes) = (g.timing = pt; nothing)
 
+# The triplets of one SymWoodbury block's contribution to `lift`: its
+# diagonal part (rows In), B (columns Ir+1 …) and −D⁻¹. A function barrier:
+# `lift` reaches it with the block as a `BlockElem`, whose `SymWoodbury`
+# member is not concrete, and one dynamic call per block beats element-wise
+# dynamic dispatch in these loops. Returns the next free auxiliary column.
+function _lift_woodbury!(IA, JA, VA, IB, JB, VB, ID, JD, VD, In, Ir, Blk::SymWoodbury)
+  for i = 1:length(Blk.A.diag)
+    push!(IA,In[i]); push!(JA,In[i]); push!(VA,Blk.A.diag[i])
+  end
+
+  for i = 1:size(Blk.B,1), j = 1:size(Blk.B,2)
+    push!(IB,In[i]); push!(JB,Ir+j); push!(VB,Blk.B[i,j])
+  end
+
+  invD = inv(Blk.D)
+  for i = 1:size(Blk.D,1), j = 1:size(Blk.D,2)
+    if Blk.D[i,j] != 0
+      push!(ID,Ir+i); push!(JD,Ir+j); push!(VD,-invD[i,j])
+    end
+  end
+
+  return Ir + size(Blk.B,2)
+end
+
 function lift(F::Block)
 
   d = zeros(0)
@@ -369,27 +397,10 @@ function lift(F::Block)
   for (In,Blk) = zip(block_idx(F), F.Blocks)
 
     if isa(Blk, SymWoodbury)
-
-      for i = 1:length(Blk.A.diag)
-        push!(IA,In[i]); push!(JA,In[i]); push!(VA,Blk.A.diag[i])
-      end
-
-      for i = 1:size(Blk.B,1), j = 1:size(Blk.B,2)
-        push!(IB,In[i]); push!(JB,Ir+j); push!(VB,Blk.B[i,j])
-      end
-
-      invD = inv(Blk.D)
-      for i = 1:size(Blk.D,1), j = 1:size(Blk.D,2)
-        if Blk.D[i,j] != 0
-          push!(ID,Ir+i); push!(JD,Ir+j); push!(VD,-invD[i,j])
-        end
-      end
-
-      Ir = Ir + size(Blk.B,2)
-
+      Ir = _lift_woodbury!(IA, JA, VA, IB, JB, VB, ID, JD, VD, In, Ir, Blk)::Int
     end
 
-    if isa(Blk, Diagonal)
+    if isa(Blk, DiagBlock)
 
       for i = 1:length(Blk.diag)
         push!(IA, In[i]); push!(JA, In[i]); push!(VA, Blk.diag[i])
@@ -401,6 +412,36 @@ function lift(F::Block)
   return (sparse(IA,JA,VA), sparse(IB,JB,VB,n,Ir), sparse(ID,JD,VD));
 
 end
+
+# Cached UMFPACK factorization, shared by `kktsolver_sparse` and
+# `kktsolver_2x2`. Once the pattern of the matrix stabilizes (typically from
+# the second interior-point iteration on), `lu!` refactorizes numerically
+# inside the cached object, skipping the symbolic analysis. A fresh `lu`
+# whenever the pattern changes (e.g. identity scaling at the initial point,
+# or exact cancellation dropping an entry). A struct rather than two captured
+# locals: a local reassigned inside a closure is boxed.
+mutable struct _LUCache
+  fact :: Union{Nothing, SparseArrays.UMFPACK.UmfpackLU{Float64, Int}}
+  pat  :: Union{Nothing, SparseMatrixCSC{Float64, Int}}
+end
+_LUCache() = _LUCache(nothing, nothing)
+
+function _factor!(cache::_LUCache, Z::SparseMatrixCSC{Float64, Int})
+  f = cache.fact; pat = cache.pat
+  if f !== nothing && pat !== nothing && identical_sparse_structure(Z, pat)
+    lu!(f, Z)
+    return f
+  end
+  f = lu(Z)
+  cache.fact = f
+  cache.pat = Z
+  return f
+end
+
+# A block-matrix literal of sparse matrices (`[Q G'; G 0]`) infers as `Any`
+# in Base, which would make everything downstream of it dynamic; this pins
+# the type (and converts the rare other index type, as `lu` accepted it).
+_spmat(Z) = convert(SparseMatrixCSC{Float64, Int}, Z)::SparseMatrixCSC{Float64, Int}
 
 """
 Estimates for the number of nonzeros of lift(F)
@@ -485,23 +526,7 @@ function kktsolver_sparse(Q, A, G, cone_dims)
   A = sparse(A)
   G = sparse(G)
 
-  # Symbolic-factorization reuse: once the NT block's sparsity pattern
-  # stabilizes (typically from the second interior-point iteration on),
-  # lu! refactorizes numerically inside the cached UMFPACK object,
-  # skipping the symbolic analysis. Falls back to a fresh lu whenever
-  # the pattern changes (e.g. identity scaling at the initial point, or
-  # exact cancellation dropping an entry).
-  Zfact = nothing
-  Zpat  = nothing
-  function factor!(Z)
-    if Zfact !== nothing && identical_sparse_structure(Z, Zpat)
-      lu!(Zfact, Z)
-    else
-      Zfact = lu(Z)
-      Zpat  = Z
-    end
-    return Zfact
-  end
+  luc = _LUCache()
 
   # lift() can only represent Diagonal and SymWoodbury blocks; an SDP
   # (VecCongurance) block would contribute nothing and leave a
@@ -519,7 +544,7 @@ function kktsolver_sparse(Q, A, G, cone_dims)
         Z₀ = [ Q        G'             -A'
                G        spzeros(p,p)   spzeros(p,m)
                A        spzeros(m,p)   FᵀFA         ]
-        Z₀ᶠ = lu(Z₀)
+        Z₀ᶠ = lu(_spmat(Z₀))
         function solve3x3I(Δy, Δw, Δv)
           z = Z₀ᶠ\[Δy; Δw; Δv]
           return (z[1:n], z[n+1:n+p], z[n+p+1:end])
@@ -530,7 +555,7 @@ function kktsolver_sparse(Q, A, G, cone_dims)
               G             spzeros(p,p)   spzeros(p,m)  spzeros(p,r)
               A             spzeros(m,p)   FᵀFA          FᵀFB
               spzeros(r,n)  spzeros(r,p)   FᵀFB'         invFᵀFD      ]
-        Zᶠ = factor!(Z)
+        Zᶠ = _factor!(luc, _spmat(Z))
         function solve3x3lift(Δy, Δw, Δv)
           z = Zᶠ\[Δy; Δw; Δv; zeros(r)]
           return (z[1:n], z[n+1:n+p], z[(n+p+1):(n+m+p)])
@@ -549,7 +574,7 @@ function kktsolver_sparse(Q, A, G, cone_dims)
       Z₀ = [ Q        G'             -A'
              G        spzeros(p,p)   spzeros(p,m)
              A        spzeros(m,p)   FᵀF          ]
-      Z₀ᶠ = factor!(Z₀)
+      Z₀ᶠ = _factor!(luc, _spmat(Z₀))
       function solve3x3_nolift(Δy, Δw, Δv)
         z = Z₀ᶠ\[Δy; Δw; Δv]
         return (z[1:n], z[n+1:n+p], z[n+p+1:end])
@@ -581,19 +606,7 @@ function kktsolver_2x2(Q, A, G, cone_dims)
 
   Q = sparse(Q); A = sparse(A); G = sparse(G)
 
-  # Symbolic-factorization reuse, as in kktsolver_sparse: the Schur
-  # complement's pattern is fixed once the scaling has left the identity.
-  Zfact = nothing
-  Zpat  = nothing
-  function factor!(Z)
-    if Zfact !== nothing && identical_sparse_structure(Z, Zpat)
-      lu!(Zfact, Z)
-    else
-      Zfact = lu(Z)
-      Zpat  = Z
-    end
-    return Zfact
-  end
+  luc = _LUCache()
 
   function solve2x2gen(F, F⁻ᵀ)
 
@@ -603,7 +616,7 @@ function kktsolver_2x2(Q, A, G, cone_dims)
     Z = [ Q + AᵀF⁻¹F⁻ᵀA   G'
           G               spzeros(p,p) ]
 
-    Zᶠ = factor!(Z)
+    Zᶠ = _factor!(luc, _spmat(Z))
 
     function solve2x2(Δy, Δw)
 

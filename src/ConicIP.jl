@@ -33,7 +33,7 @@ The action `W * x` computes `vecm(R' * mat(x) * R)`.
 
 Used internally as the Nesterov-Todd scaling matrix for semidefinite cones.
 """
-mutable struct VecCongurance; R :: Matrix; end
+mutable struct VecCongurance; R :: Matrix{Float64}; end
 
 Base.adjoint(W::VecCongurance)         = VecCongurance(W.R');
 Base.inv(W::VecCongurance)             = VecCongurance(inv(W.R))
@@ -54,8 +54,9 @@ VectorTypes = Union{Vector, ViewTypes}
 MatrixTypes = Union{Matrix, Array{Real,2},
                     SparseMatrixCSC{Real,Integer}}
 
-# returns 0 for matrices with dimension 0.
-normsafe(x) = isempty(x) ? 0 : norm(x)
+# returns 0 for matrices with dimension 0. A Float64 either way: an integer
+# zero would make every norm built from it a Union.
+normsafe(x) = isempty(x) ? 0.0 : norm(x)
 
 # Entrywise absolute value |M| of a data matrix, for the backward-error
 # style residual normalizations ‖|M||x|‖. Storage is preserved: sparse
@@ -537,27 +538,34 @@ function maxstep_rp(x, e::Nothing)
   # 0       if α < 0   (point is STRICTLY feasible)
   # 1 + α   otherwise
 
-  if all(x .> 0)
-    return 0;
+  if all(>(0), x)
+    return 0.0;
   else
     return -1 + minimum(x);
   end
 
 end
 
-function maxstep_soc(x,d)
+# `dn` and `xbar` are scratch of length(x) for -d and x/√γ; the solver
+# passes views of its own buffers (this runs per cone, several times per
+# iteration), a caller that omits them gets fresh vectors. The operations
+# are those of the allocating form, so the result is the same to the bit.
+function maxstep_soc(x, d, dn = Vector{Float64}(undef, length(x)),
+                     xbar = Vector{Float64}(undef, length(x)))
 
   # Assume x in Q.
   # Returns maximum α such that x - α*d in Q.
 
-  d = -d;
+  dn .= .-d
   γ = Q(x,x)
-  xbar = x/sqrt(γ)
-  β = Q(xbar,d)
+  xbar .= x ./ sqrt(γ)
+  β = Q(xbar,dn)
 
   ρ1 = β /sqrt(γ)
-  μ  = (β + d[1])/(xbar[1] + 1)
-  ρ2 = (d[2:end] - μ*xbar[2:end])
+  μ  = (β + dn[1])/(xbar[1] + 1)
+  # ρ2 = dn[2:end] - μ*xbar[2:end], formed over dn's own tail
+  ρ2 = view(dn, 2:length(dn))
+  ρ2 .= ρ2 .- μ .* view(xbar, 2:length(xbar))
   alpha = norm(ρ2)/sqrt(γ) - ρ1
   if alpha < 0
     return Inf
@@ -570,8 +578,8 @@ end
 function maxstep_soc(x, e::Nothing)
 
   # Maximum step to cone
-  α = norm(x[2:end]) - x[1];
-  return α < 0 ? 0 : -1 - α;
+  α = norm(view(x, 2:length(x))) - x[1];
+  return α < 0 ? 0.0 : -1 - α;
 
 end
 
@@ -610,9 +618,9 @@ function maxstep_sdc(x,d::Nothing)
 
   # Maximum step to Semidefinite cone (see maxstep_rp(x, ::Nothing))
   # An order-0 block is vacuously strictly feasible and needs no shift.
-  isempty(x) && return 0
+  isempty(x) && return 0.0
   minΛ = eigmin(Symmetric(mat(x)))
-  return minΛ > 0 ? 0 : -1 + minΛ
+  return minΛ > 0 ? 0.0 : -1 + minΛ
 
 end
 
@@ -784,10 +792,10 @@ the certificate-fallback auxiliary problems are not included.
 
 Residual and diagnostic tail:
 
-- `rEq::Real` -- relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))`
+- `rEq::Float64` -- relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))`
   of the returned point (`prFeas = max(rPr, rEq)`); `NaN` when no iterate
   was evaluated or when a certificate is returned (the iterate is discarded)
-- `rGap::Real` -- relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`,
+- `rGap::Float64` -- relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`,
   the quantity the termination test compares with `optTol`; `NaN` when
   unset or when a certificate is returned
 - `kkt_repaired::Int` -- pivots the KKT solver dynamically regularized,
@@ -807,19 +815,19 @@ mutable struct Solution
   v      :: Vector{Float64}  # dual (linear inequality)
   s      :: Vector{Float64}  # cone slack (Ay - s = b, s ∈ K)
   status :: Symbol  # :Optimal, :Infeasible
-  Iter   :: Integer # number of iterations
-  Mu     :: Real    # optimality conditions
-  prFeas :: Real
-  duFeas :: Real
-  muFeas :: Real
-  pobj   :: Real
-  dobj   :: Real
+  Iter   :: Int     # number of iterations
+  Mu     :: Float64 # optimality conditions
+  prFeas :: Float64
+  duFeas :: Float64
+  muFeas :: Float64
+  pobj   :: Float64
+  dobj   :: Float64
   has_certificate :: Bool  # y/w/v carry a verified ray
   message :: String        # diagnostic detail (e.g. the factorization
                            # failure behind an :Error status); "" otherwise
   kkt_solves :: Int        # KKT back-solves performed by the main loop
-  rEq    :: Real           # equality residual ‖Gy − d‖ (relative); NaN if unset
-  rGap   :: Real           # relative gap |vᵀs| / (1 + |pobj + offset|); NaN if unset
+  rEq    :: Float64        # equality residual ‖Gy − d‖ (relative); NaN if unset
+  rGap   :: Float64        # relative gap |vᵀs| / (1 + |pobj + offset|); NaN if unset
   kkt_repaired  :: Int     # dynamically regularized pivots, summed over the solve
   kkt_refactors :: Int     # retry refactorizations (shift bumps), summed over the solve
 
@@ -888,6 +896,22 @@ structurally_zero_rows(M::AbstractMatrix) =
 # The generic method above would scan a full row per index, O(n²) on a
 # structured matrix whose only entries are on the diagonal.
 structurally_zero_rows(M::Diagonal) = iszero.(M.diag)
+
+# Problem dimensions, checked before anything is computed from them. The
+# equilibration sweeps and the solver's own loops index the data under
+# `@inbounds` by these sizes, so a mismatch has to be refused up front:
+# an `A` with more columns than `c` has entries once had the column-norm
+# sweep write past the end of its buffer.
+function _check_dims(Q, c, A, b, G, d)
+  n = length(c); m = size(A,1); p = size(G,1)
+  size(Q,1) != size(Q,2) && error("Q is not square")
+  size(Q,1) != n         && error("Inconsistency in objective")
+  size(b,1) != m         && error("Inconsistency in inequalities")
+  size(A,2) != n         && error("Inconsistency in inequalities/objective")
+  size(d,1) != p         && error("Inconsistency in equalities")
+  size(G,2) != n         && error("Inconsistency in equalities/objective")
+  return nothing
+end
 
 function structurally_zero_cols(M::SparseMatrixCSC)
   z = trues(size(M,2))
@@ -1266,9 +1290,12 @@ function _conicIP(
   _rhs_s     = zeros(m)
   # λ = F*z.v, recomputed at the top of every iteration
   _λ         = zeros(m)
-  # Trial iterate for the interiority check of the line search
+  # Trial iterate for the interiority check of the line search, and the
+  # second-order-cone step length's scratch (-d and x/√γ per cone)
   _trial_v   = zeros(m)
   _trial_s   = zeros(m)
+  _ms_dn     = zeros(m)
+  _ms_xbar   = zeros(m)
   _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   # Best step seen so far during refinement (restored when a correction
@@ -1282,17 +1309,17 @@ function _conicIP(
   _d_aff = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _Δz    = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _Δzr   = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-  # Centrality-corrector scratch (allocated only when the option is on):
+  # Centrality-corrector scratch (full size only when the option is on):
   # trial scaled iterates ṽ, s̃, their product w, the correction Δw, the
   # corrector right-hand side (zero except the s block), and the candidate
-  # direction Δz + Δz_c.
-  if centralityCorrectors > 0
-    _cc_v  = zeros(m); _cc_s = zeros(m); _cc_w = zeros(m); _cc_dw = zeros(m)
-    _cc_b1 = zeros(m); _cc_b2 = zeros(m)   # FΔv and F⁻ᵀΔs
-    _cc_r  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-    _cc_Δz = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-    _Δz_c  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-  end
+  # direction Δz + Δz_c. Bound on both paths, empty when off: a local
+  # bound inside an `if` is boxed by the closures that capture it.
+  (ncc, pcc, mcc) = centralityCorrectors > 0 ? (n, p, m) : (0, 0, 0)
+  _cc_v  = zeros(mcc); _cc_s = zeros(mcc); _cc_w = zeros(mcc); _cc_dw = zeros(mcc)
+  _cc_b1 = zeros(mcc); _cc_b2 = zeros(mcc)   # FΔv and F⁻ᵀΔs
+  _cc_r  = v4x1(zeros(ncc), zeros(pcc), zeros(mcc), zeros(mcc))
+  _cc_Δz = v4x1(zeros(ncc), zeros(pcc), zeros(mcc), zeros(mcc))
+  _Δz_c  = v4x1(zeros(ncc), zeros(pcc), zeros(mcc), zeros(mcc))
 
   # KKT back-solve counter, reported as Solution.kkt_solves
   _nsolve = Ref(0)
@@ -1363,12 +1390,7 @@ function _conicIP(
   _div_n = zeros(n); _div_m = zeros(m); _div_p = zeros(p)
 
   # Sanity Checks
-  ◂ = nothing
-  size(Q,1) != size(Q,2) ? error("Q is not square") : ◂
-  size(b,1) != m        ? error("Inconsistency in inequalities") : ◂
-  size(c,1) != n        ? error("Inconsistency in inequalities/objective") : ◂
-  size(d,1) != p        ? error("Inconsistency in equalities") : ◂
-  size(G,2) != n        ? error("Inconsistency in equalities/objective") : ◂
+  _check_dims(Q, c, A, b, G, d)
 
   # ────────────────────────────────────────────────────────────
   #  Structural degeneracy: exact O(nnz) handling (issue #10)
@@ -1494,9 +1516,12 @@ function _conicIP(
     min_α = Inf;
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I)
-      dI = ( d == nothing ? nothing : view(d,I) )
+      dI = ( d === nothing ? nothing : view(d,I) )
       if btype == "R"; α = maxstep_rp(xI,dI);  end
-      if btype == "Q"; α = maxstep_soc(xI,dI); end
+      if btype == "Q"
+        α = dI === nothing ? maxstep_soc(xI, nothing) :
+                             maxstep_soc(xI, dI, view(_ms_dn, I), view(_ms_xbar, I))
+      end
       if btype == "S"; α = maxstep_sdc(xI,dI); end
       min_α = min(α, min_α)
     end

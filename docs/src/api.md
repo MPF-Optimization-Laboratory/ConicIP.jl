@@ -26,15 +26,15 @@ ConicIP.Solution
 | `w` | `Vector{Float64}` | Dual variables for equality constraints (`Gy = d`) |
 | `v` | `Vector{Float64}` | Dual variables for inequality constraints (`Ay ≥ b`) |
 | `status` | `Symbol` | Termination status (see below) |
-| `pobj` | `Real` | Primal objective value |
-| `dobj` | `Real` | Stationary quadratic dual objective estimate |
-| `prFeas` | `Real` | Maximum cone/equality feasibility residual |
-| `duFeas` | `Real` | Dual feasibility residual |
-| `muFeas` | `Real` | Complementarity residual |
-| `Iter` | `Integer` | Number of iterations |
-| `Mu` | `Real` | Final barrier parameter |
-| `rEq` | `Real` | Relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))` of the returned point; `NaN` when no iterate was evaluated or a certificate is returned |
-| `rGap` | `Real` | Relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`, the quantity the gap test compares with `optTol`; `NaN` when unset |
+| `pobj` | `Float64` | Primal objective value |
+| `dobj` | `Float64` | Stationary quadratic dual objective estimate |
+| `prFeas` | `Float64` | Maximum cone/equality feasibility residual |
+| `duFeas` | `Float64` | Dual feasibility residual |
+| `muFeas` | `Float64` | Complementarity residual |
+| `Iter` | `Int` | Number of iterations |
+| `Mu` | `Float64` | Final barrier parameter |
+| `rEq` | `Float64` | Relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))` of the returned point; `NaN` when no iterate was evaluated or a certificate is returned |
+| `rGap` | `Float64` | Relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`, the quantity the gap test compares with `optTol`; `NaN` when unset |
 | `kkt_solves` | `Int` | KKT back-solves performed by the main loop |
 | `kkt_repaired` | `Int` | Pivots the KKT solver dynamically regularized, summed over the solve (0 unless the solver reports diagnostics; see the KKT-solver guide) |
 | `kkt_refactors` | `Int` | Refactorizations after a regularization bump (`kktsolver_ldl` with `retry_max > 0`), summed over the solve |

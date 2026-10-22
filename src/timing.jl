@@ -237,7 +237,9 @@ outermost assigns last, so the recorded value is the outermost call's.
 """
 @inline gc_start(timing) = timing === nothing ? UInt64(0) : Base.gc_time_ns()
 @inline function gc_stop!(timing, gc0, x)
-  timing === nothing || (timing.t_gc = Base.gc_time_ns() - gc0)
+  # `PhaseTimes` is the only non-`nothing` value `timing` takes; asserting it
+  # types the write for callers whose `timing` is inferred as `Any`.
+  timing === nothing || ((timing::PhaseTimes).t_gc = Base.gc_time_ns() - gc0)
   return x
 end
 
