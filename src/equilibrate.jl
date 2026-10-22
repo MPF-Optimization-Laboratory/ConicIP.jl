@@ -24,6 +24,8 @@
 # blocks of one KKT column, so the accumulating form lets one buffer serve
 # them all and keeps the sweep free of allocation.
 function _col_infnorms!(out, S::SparseMatrixCSC)
+  length(out) == size(S, 2) || throw(DimensionMismatch(
+    "column norms: $(size(S, 2)) columns, buffer of length $(length(out))"))
   colptr = S.colptr; vals = S.nzval
   @inbounds for j in 1:size(S, 2)
     mx = out[j]
@@ -35,6 +37,8 @@ function _col_infnorms!(out, S::SparseMatrixCSC)
   return out
 end
 function _row_infnorms!(out, S::SparseMatrixCSC)
+  length(out) == size(S, 1) || throw(DimensionMismatch(
+    "row norms: $(size(S, 1)) rows, buffer of length $(length(out))"))
   rows = S.rowval; vals = S.nzval
   @inbounds for t in eachindex(vals)
     i = rows[t]
@@ -48,6 +52,8 @@ end
 # (`(dl[i] * S[i,j]) * dr[j]`), so the scaled entries are bitwise identical
 # to the matrix the allocating form would have built.
 function _scale_rows_cols!(S::SparseMatrixCSC, dl, dr)
+  (length(dl), length(dr)) == size(S) || throw(DimensionMismatch(
+    "scaling a $(size(S)) matrix by $(length(dl)) row and $(length(dr)) column factors"))
   colptr = S.colptr; rows = S.rowval; vals = S.nzval
   @inbounds for j in 1:size(S, 2)
     dj = dr[j]
@@ -172,6 +178,7 @@ function equilibrate_conicIP(Q, c, A, b, cone_dims, G, d;
                              iters::Int = 10, tol::Float64 = 1e-2,
                              bound::Float64 = 1e6,
                              σ_range::Tuple{Float64,Float64} = (1e-3, 1e3))
+  _check_dims(Q, c, A, b, G, d)
   n = length(c); m = size(A, 1); p = size(G, 1)
   ranges = cum_range([cd[2] for cd in cone_dims])
   uniform = [cd[1] != "R" for cd in cone_dims]

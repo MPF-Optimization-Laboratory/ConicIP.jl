@@ -897,6 +897,22 @@ structurally_zero_rows(M::AbstractMatrix) =
 # structured matrix whose only entries are on the diagonal.
 structurally_zero_rows(M::Diagonal) = iszero.(M.diag)
 
+# Problem dimensions, checked before anything is computed from them. The
+# equilibration sweeps and the solver's own loops index the data under
+# `@inbounds` by these sizes, so a mismatch has to be refused up front:
+# an `A` with more columns than `c` has entries once had the column-norm
+# sweep write past the end of its buffer.
+function _check_dims(Q, c, A, b, G, d)
+  n = length(c); m = size(A,1); p = size(G,1)
+  size(Q,1) != size(Q,2) && error("Q is not square")
+  size(Q,1) != n         && error("Inconsistency in objective")
+  size(b,1) != m         && error("Inconsistency in inequalities")
+  size(A,2) != n         && error("Inconsistency in inequalities/objective")
+  size(d,1) != p         && error("Inconsistency in equalities")
+  size(G,2) != n         && error("Inconsistency in equalities/objective")
+  return nothing
+end
+
 function structurally_zero_cols(M::SparseMatrixCSC)
   z = trues(size(M,2))
   nz = nonzeros(M)
@@ -1374,12 +1390,7 @@ function _conicIP(
   _div_n = zeros(n); _div_m = zeros(m); _div_p = zeros(p)
 
   # Sanity Checks
-  ◂ = nothing
-  size(Q,1) != size(Q,2) ? error("Q is not square") : ◂
-  size(b,1) != m        ? error("Inconsistency in inequalities") : ◂
-  size(c,1) != n        ? error("Inconsistency in inequalities/objective") : ◂
-  size(d,1) != p        ? error("Inconsistency in equalities") : ◂
-  size(G,2) != n        ? error("Inconsistency in equalities/objective") : ◂
+  _check_dims(Q, c, A, b, G, d)
 
   # ────────────────────────────────────────────────────────────
   #  Structural degeneracy: exact O(nnz) handling (issue #10)
