@@ -97,12 +97,15 @@ for each diagonal block of `A`.
 """
 function block_idx(A::Block)
 
-  k = size(A.Blocks,1)
+  k = length(A.Blocks)
   IColl = Vector{UnitRange{Int}}(undef, k)
 
   cum_count = 1
   for i = 1:k
-    blk_size = size(A.Blocks[i],1);
+    # `_blk_dim` reads the common block types' sizes statically; `size` on
+    # the `BlockElem` union is a dynamic call per block, and the dense and
+    # sparse KKT solvers call `block_idx` on every iteration.
+    blk_size = _blk_dim(A.Blocks[i])
     IColl[i] = cum_count:(cum_count + blk_size - 1)
     cum_count += blk_size
   end
@@ -176,20 +179,25 @@ function SparseArrays.sparse(W::SymWoodbury)
   return A_sp + B_sp * D_sp * B_sp'
 end
 
+# Triplets of one block, shifted to rows/columns `off+1:…`. Separate from
+# `sparse(::Block)` as a function barrier: `sparse(Blk)` is not inferrable
+# for the `BlockElem` union, and the loop below visits every nonzero.
+function _push_block_triplets!(I₊, J₊, V₊, Aᵢ::SparseMatrixCSC, off::Int)
+  rows = rowvals(Aᵢ)
+  vals = nonzeros(Aᵢ)
+  @inbounds for i = 1:size(Aᵢ, 2)
+    for j in nzrange(Aᵢ, i)
+      push!(J₊, i + off); push!(I₊, rows[j] + off); push!(V₊, vals[j])
+    end
+  end
+  return nothing
+end
+
 function SparseArrays.sparse(A::Block)
 
   I₊, J₊, V₊ = Int[], Int[], Float64[]
-  @inbounds for (I,Blk) = zip(block_idx(A), A.Blocks)
-    Aᵢ = sparse(Blk)
-    rows = rowvals(Aᵢ)
-    vals = nonzeros(Aᵢ)
-    m, n = size(Aᵢ)
-    for i = 1:n
-       for j in nzrange(Aᵢ, i)
-          row = rows[j]; val = vals[j]
-          push!(J₊, i + I[1] - 1); push!(I₊, row + I[1] - 1); push!(V₊, val)
-       end
-    end
+  for (I,Blk) = zip(block_idx(A), A.Blocks)
+    _push_block_triplets!(I₊, J₊, V₊, sparse(Blk), I[1] - 1)
   end
   return sparse(I₊,J₊,V₊);
 
