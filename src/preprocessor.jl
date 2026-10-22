@@ -12,11 +12,11 @@ function imcols(A, b, ϵ = 1e-8)
 
   A = sparse(A)
 
-  if isempty(A); return ([], true); end
+  if isempty(A); return (Int[], true); end
 
   # 0·x = b is consistent iff b ≈ 0; guard the normalization against 0/0
   nA = norm(A)
-  if nA == 0; return ([], norm(b, Inf) <= ϵ); end
+  if nA == 0; return (Int[], norm(b, Inf) <= ϵ); end
 
   A = A/nA; b = b/nA
 
@@ -29,17 +29,19 @@ function imcols(A, b, ϵ = 1e-8)
   F = qr(sparse(A'))
   diag_R = abs.(diag(F.R))
   n_r = min(size(F.R)...)
-  piv = F.pcol  # fill-reducing column permutation
+  # fill-reducing column permutation; `getproperty` on a `QRSparse` is
+  # not inferrable, so convert to pin `R` (and the return) to `Vector{Int}`
+  piv = convert(Vector{Int}, F.pcol)
   R = sort(piv[findall(view(diag_R, 1:n_r) .> ϵ)])
 
-  if isempty(R); return ([], true); end
+  if isempty(R); return (Int[], true); end
 
   # Consistency: solve with the kept rows and verify against all rows.
   # NB this is a second sparse factorization. Reusing F alone is not
   # sound: SPQR's dead columns leave nonzero off-diagonal rows in R, so
   # an R-only test with the dead coordinates zeroed checks membership in
   # a subspace of the true row space and can misreport inconsistency.
-  return (norm(A*(A[R,:]\b[R]) - b, Inf) < ϵ) ? (R, true) : ([], false)
+  return (norm(A*(A[R,:]\b[R]) - b, Inf) < ϵ) ? (R, true) : (Int[], false)
 
 end
 
@@ -426,7 +428,7 @@ function _preprocess_core(Q, c::AbstractVector,
 
   # The wall-clock budget covers the rank detection above and any retry
   # below, not just the solve.
-  timeLimit = get(opts, :timeLimit, Inf)
+  timeLimit = Float64(get(opts, :timeLimit, Inf))
   time_left() = timeLimit - (time() - t_start)
 
   # The row selection G[IP,:] is presolve materialization; the solve itself
@@ -461,8 +463,11 @@ function _preprocess_core(Q, c::AbstractVector,
   # The iterate belongs to a different problem, so it is NaN'd rather than
   # returned as a "best iterate". (Defined outside the postsolve phase
   # because `@phase` expands its body twice; it is only called inside it.)
-  function retract!(sol, claim)
-    dropped = setdiff(1:p, IP)
+  # `kept` is an argument rather than a capture of `IP`: `IP` is assigned in
+  # several branches above, and a closure over such a variable boxes it
+  # (an untyped `IP` then flows into every `G[IP,:]` and `setdiff`).
+  function retract!(sol, claim, kept)
+    dropped = setdiff(1:p, kept)
     sol.y = nanvec(n); sol.w = nanvec(p); sol.v = nanvec(m); sol.s = nanvec(m)
     sol.has_certificate = false
     sol.status  = :Error
@@ -496,7 +501,7 @@ function _preprocess_core(Q, c::AbstractVector,
       if check.valid
         sol.w = w̄; sol.v = v̄
       else
-        retract!(sol, :Infeasible); retracted = true
+        retract!(sol, :Infeasible, IP); retracted = true
       end
     end
 
@@ -508,7 +513,7 @@ function _preprocess_core(Q, c::AbstractVector,
       if check.valid
         sol.y = ȳ; sol.s = A*ȳ
       else
-        retract!(sol, :DualInfeasible); retracted = true
+        retract!(sol, :DualInfeasible, IP); retracted = true
       end
     end
 
