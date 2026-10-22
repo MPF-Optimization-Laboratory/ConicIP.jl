@@ -447,9 +447,19 @@ function _column_index_map(model::MOI.ModelLike, cols::Vector{Int},
         map[v] = MOI.VariableIndex(k)
     end
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
-        for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
-            map[ci] = _dest_ci(cols, ci)
-        end
+        _map_constraints!(map, model, cols, F, S)
+    end
+    return map
+end
+
+# One (F, S) pair of `_column_index_map`. `ListOfConstraintTypesPresent` is
+# heterogeneous, so the loop over it is dispatched once per pair; passing
+# the pair as types makes the per-constraint loop below statically typed
+# (a loop over `ci::Any` would dispatch every `_dest_ci` and `setindex!`).
+function _map_constraints!(map, model, cols::Vector{Int},
+                           ::Type{F}, ::Type{S}) where {F, S}
+    for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
+        map[ci] = _dest_ci(cols, ci)
     end
     return map
 end
@@ -575,6 +585,89 @@ end
 #  optimize!
 # ──────────────────────────────────────────────────────────────
 
+# Constraint bookkeeping, keyed by the index the caller gets back from
+# `optimize!` — for a variable bound that is the index of the variable's
+# *column*, not of the variable in `model` (see `_dest_ci`).
+function _record_eq!(dest::Optimizer, cols::Vector{Int}, ci, rows, offset, scalar)
+    push!(dest.eq_rows, rows); push!(dest.eq_offset, offset)
+    push!(dest.eq_is_scalar, scalar)
+    dest.eq_ci_map[_dest_ci(cols, ci)] = length(dest.eq_rows)
+end
+function _record_ineq!(dest::Optimizer, cols::Vector{Int}, ci, rows, sign, offset,
+                       scalar, psd)
+    push!(dest.ineq_rows, rows); push!(dest.ineq_sign, sign)
+    push!(dest.ineq_offset, offset); push!(dest.ineq_is_scalar, scalar)
+    push!(dest.ineq_is_psd, psd)
+    dest.ineq_ci_map[_dest_ci(cols, ci)] = length(dest.ineq_rows)
+end
+
+# Append every constraint of one (F, S) pair to the accumulators. The
+# constraint types present are heterogeneous, so `_assemble_model!` calls
+# this once per pair; with `F` and `S` as type arguments the `F <: …` /
+# `S <: …` tests below fold at compile time and the loop over indices is
+# statically typed. (Looping over `ci::Any` in `_assemble_model!` itself
+# dispatched every getter and appender per constraint: a front-end cost
+# that grows with the number of scalar rows.)
+function _assemble_constraints!(dest::Optimizer, model, cols::Vector{Int},
+                                tG::_Triplets, tA::_Triplets, cone_dims,
+                                ::Type{F}, ::Type{S}) where {F, S}
+    for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
+        f = MOI.get(model, MOI.ConstraintFunction(), ci)
+        s = MOI.get(model, MOI.ConstraintSet(), ci)
+
+        if F <: Union{MOI.VectorAffineFunction{Float64}, MOI.VectorOfVariables}
+            dim = MOI.output_dimension(f)
+            if S <: MOI.Zeros
+                # f(x) = 0:  G = A_f, d = -const
+                rows = _append_vector!(tG, cols, f, dim, 1.0)
+                _record_eq!(dest, cols, ci, rows, 0.0, false)
+            elseif S <: MOI.Nonnegatives
+                rows = _append_vector!(tA, cols, f, dim, 1.0)
+                _push_orthant!(cone_dims, dim)
+                _record_ineq!(dest, cols, ci, rows, 1.0, 0.0, false, false)
+            elseif S <: MOI.Nonpositives
+                # f(x) ≤ 0  →  -f(x) ≥ 0
+                rows = _append_vector!(tA, cols, f, dim, -1.0)
+                _push_orthant!(cone_dims, dim)
+                _record_ineq!(dest, cols, ci, rows, -1.0, 0.0, false, false)
+            elseif S <: MOI.SecondOrderCone
+                rows = _append_vector!(tA, cols, f, dim, 1.0)
+                push!(cone_dims, ("Q", dim))
+                _record_ineq!(dest, cols, ci, rows, 1.0, 0.0, false, false)
+            elseif S <: MOI.PositiveSemidefiniteConeTriangle
+                # MOI's column-major unscaled triangle → vecm's row-major
+                # triangle with √2 on the off-diagonal rows, applied to
+                # the triplets directly.
+                perm, is_offdiag = _psd_moi_vecm_info(dim)
+                scale = [od ? √2 : 1.0 for od in is_offdiag]
+                rows = _append_vector!(tA, cols, f, dim, 1.0;
+                                       rowmap = perm, rowscale = scale)
+                push!(cone_dims, ("S", dim))
+                _record_ineq!(dest, cols, ci, rows, 1.0, 0.0, false, true)
+            end
+
+        elseif F <: Union{MOI.ScalarAffineFunction{Float64}, MOI.VariableIndex}
+            if S <: MOI.EqualTo{Float64}
+                rhs = MOI.constant(s)
+                rows = _append_scalar!(tG, cols, f, 1.0, rhs)
+                _record_eq!(dest, cols, ci, rows, rhs, true)
+            elseif S <: MOI.GreaterThan{Float64}
+                lower = MOI.constant(s)
+                rows = _append_scalar!(tA, cols, f, 1.0, lower)
+                _push_orthant!(cone_dims, 1)
+                _record_ineq!(dest, cols, ci, rows, 1.0, lower, true, false)
+            elseif S <: MOI.LessThan{Float64}
+                # f(x) ≤ u  →  -f(x) ≥ -u
+                upper = MOI.constant(s)
+                rows = _append_scalar!(tA, cols, f, -1.0, upper)
+                _push_orthant!(cone_dims, 1)
+                _record_ineq!(dest, cols, ci, rows, -1.0, upper, true, false)
+            end
+        end
+    end
+    return nothing
+end
+
 # Build the solver's data `(Q, c, A, b, cone_dims, G, d)` from `model`,
 # whose k-th variable occupies column `cols[k-th index value]`, and fill
 # the constraint-tracking fields of `dest`. This is a function barrier:
@@ -643,76 +736,8 @@ function _assemble_model!(dest::Optimizer, model, cols::Vector{Int}, n::Int)
     tA = _Triplets()          # cone rows,       A y ≥_K b
     cone_dims = Tuple{String, Int}[]
 
-    # Keyed by the index the caller gets back from `optimize!` — for a
-    # variable bound that is the index of the variable's *column*, not of the
-    # variable in `model` (see `_dest_ci`).
-    function record_eq!(ci, rows, offset, scalar)
-        push!(dest.eq_rows, rows); push!(dest.eq_offset, offset)
-        push!(dest.eq_is_scalar, scalar)
-        dest.eq_ci_map[_dest_ci(cols, ci)] = length(dest.eq_rows)
-    end
-    function record_ineq!(ci, rows, sign, offset, scalar, psd)
-        push!(dest.ineq_rows, rows); push!(dest.ineq_sign, sign)
-        push!(dest.ineq_offset, offset); push!(dest.ineq_is_scalar, scalar)
-        push!(dest.ineq_is_psd, psd)
-        dest.ineq_ci_map[_dest_ci(cols, ci)] = length(dest.ineq_rows)
-    end
-
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
-        for ci in MOI.get(model, MOI.ListOfConstraintIndices{F, S}())
-            f = MOI.get(model, MOI.ConstraintFunction(), ci)
-            s = MOI.get(model, MOI.ConstraintSet(), ci)
-
-            if F <: Union{MOI.VectorAffineFunction{Float64}, MOI.VectorOfVariables}
-                dim = MOI.output_dimension(f)
-                if S <: MOI.Zeros
-                    # f(x) = 0:  G = A_f, d = -const
-                    rows = _append_vector!(tG, cols, f, dim, 1.0)
-                    record_eq!(ci, rows, 0.0, false)
-                elseif S <: MOI.Nonnegatives
-                    rows = _append_vector!(tA, cols, f, dim, 1.0)
-                    _push_orthant!(cone_dims, dim)
-                    record_ineq!(ci, rows, 1.0, 0.0, false, false)
-                elseif S <: MOI.Nonpositives
-                    # f(x) ≤ 0  →  -f(x) ≥ 0
-                    rows = _append_vector!(tA, cols, f, dim, -1.0)
-                    _push_orthant!(cone_dims, dim)
-                    record_ineq!(ci, rows, -1.0, 0.0, false, false)
-                elseif S <: MOI.SecondOrderCone
-                    rows = _append_vector!(tA, cols, f, dim, 1.0)
-                    push!(cone_dims, ("Q", dim))
-                    record_ineq!(ci, rows, 1.0, 0.0, false, false)
-                elseif S <: MOI.PositiveSemidefiniteConeTriangle
-                    # MOI's column-major unscaled triangle → vecm's row-major
-                    # triangle with √2 on the off-diagonal rows, applied to
-                    # the triplets directly.
-                    perm, is_offdiag = _psd_moi_vecm_info(dim)
-                    scale = [od ? √2 : 1.0 for od in is_offdiag]
-                    rows = _append_vector!(tA, cols, f, dim, 1.0;
-                                           rowmap = perm, rowscale = scale)
-                    push!(cone_dims, ("S", dim))
-                    record_ineq!(ci, rows, 1.0, 0.0, false, true)
-                end
-
-            elseif F <: Union{MOI.ScalarAffineFunction{Float64}, MOI.VariableIndex}
-                if S <: MOI.EqualTo{Float64}
-                    rhs = MOI.constant(s)
-                    rows = _append_scalar!(tG, cols, f, 1.0, rhs)
-                    record_eq!(ci, rows, rhs, true)
-                elseif S <: MOI.GreaterThan{Float64}
-                    lower = MOI.constant(s)
-                    rows = _append_scalar!(tA, cols, f, 1.0, lower)
-                    _push_orthant!(cone_dims, 1)
-                    record_ineq!(ci, rows, 1.0, lower, true, false)
-                elseif S <: MOI.LessThan{Float64}
-                    # f(x) ≤ u  →  -f(x) ≥ -u
-                    upper = MOI.constant(s)
-                    rows = _append_scalar!(tA, cols, f, -1.0, upper)
-                    _push_orthant!(cone_dims, 1)
-                    record_ineq!(ci, rows, -1.0, upper, true, false)
-                end
-            end
-        end
+        _assemble_constraints!(dest, model, cols, tG, tA, cone_dims, F, S)
     end
 
     # ── Assemble matrices (one sparse() per matrix) ──
@@ -730,7 +755,9 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     # Opt-in phase timing: everything this wrapper does around the solver
     # call (assembly, the Hessian check, the result products) is front-end
     # work, charged to `t_frontend`; the solver fills the other phases.
-    pt = get(dest.options, "timing", nothing)
+    # (`options` is an untyped store; the assertion types `pt` for the
+    # field updates and `gc_stop!` below.)
+    pt = get(dest.options, "timing", nothing)::Union{Nothing, PhaseTimes}
     gc0 = gc_start(pt)
     t_front = time_ns()
 
