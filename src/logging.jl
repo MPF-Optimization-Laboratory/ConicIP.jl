@@ -62,7 +62,7 @@ mutable struct SolverLog
   on      :: Bool      # anything consumes the events (printing or a trace)
   show    :: Bool      # print to `io`
   sink    :: Any       # trace callable (trace.jl), or nothing
-  closeio :: Any       # trace file the owner closes, or nothing
+  closeio :: Union{Nothing,IOStream}   # trace file the owner closes, or nothing
   style   :: Symbol    # resolved style: :classic or :rich
   io      :: IO
   color   :: Bool      # emit ANSI colour (rich style)
@@ -74,8 +74,13 @@ mutable struct SolverLog
   exit_kind   :: Symbol
   exit_status :: Symbol
   exit_detail :: String
-  # Rich-style state of the current `_conicIP`
-  header  :: Any       # its header record, or nothing before the first
+  # Rich-style state of the current `_conicIP`. The renderers read three
+  # values of its header record; they are kept as concrete fields (holding
+  # the defaults shown before any header) rather than read out of an
+  # untyped record.
+  optTol    :: Float64 # header optTol
+  infeasTol :: Float64 # header infeasTol
+  ccorr     :: Int     # header centralityCorrectors
   nsolves :: Int       # headers seen (a presolve retry is the second)
   t_hdr   :: Float64   # time() at its header
   has_kkt :: Bool      # kkt column shown
@@ -84,7 +89,7 @@ end
 
 SolverLog(on, show, style, io, depth) =
   SolverLog(on, show, nothing, nothing, style, io, false, 120, depth, time(),
-            :none, :None, "", nothing, 0, 0.0, false, _LogHistory())
+            :none, :None, "", 1e-6, 1e-7, 0, 0, 0.0, false, _LogHistory())
 
 # The log of a solve that prints nothing. Never mutated.
 const _NOLOG = SolverLog(false, false, :classic, devnull, 0)
@@ -129,7 +134,11 @@ function _make_log(verbose::Bool; log_style = :auto, log_io::IO = stdout, trace 
   return log
 end
 
-_close_log!(log::SolverLog) = (log.closeio === nothing || close(log.closeio); nothing)
+function _close_log!(log::SolverLog)
+  io = log.closeio
+  io === nothing || close(io)
+  return nothing
+end
 
 # Hand an event to the trace sink, stamped with its kind, depth and time.
 function _emit(log::SolverLog, event::Symbol, rec::NamedTuple)
@@ -178,7 +187,7 @@ end
 # Problem summary, once per `_conicIP` that reaches the iteration (after the
 # KKT solver is built). `h` is the header record (see the trace schema).
 @noinline function _log_header!(log::SolverLog, h::NamedTuple)
-  log.header = h
+  log.optTol = h.optTol; log.infeasTol = h.infeasTol; log.ccorr = h.centralityCorrectors
   log.nsolves += 1
   log.t_hdr = time()
   log.hist = _LogHistory()
@@ -335,17 +344,20 @@ const _EIGHTHS = ('▏', '▎', '▍', '▌', '▋', '▊', '▉', '█')
 function _sparkline(xs::AbstractVector{<:Real}; width::Int = 40, scale::Symbol = :log,
                     floor::Real = 0.0)
   isempty(xs) && return ""
-  ys = Float64.(xs)
-  if length(ys) > width
-    edges = round.(Int, range(0, length(ys), length = width + 1))
-    ys = [maximum(view(ys, edges[k]+1:edges[k+1])) for k in 1:width]
+  # (single-assignment locals: a closure would box a reassigned one)
+  ys0 = Float64.(xs)
+  ys = if length(ys0) > width
+    edges = round.(Int, range(0, length(ys0), length = width + 1))
+    Float64[maximum(view(ys0, edges[k]+1:edges[k+1])) for k in 1:width]
+  else
+    ys0
   end
   f(x) = scale === :log ? (isnan(x) ? NaN : (x = max(x, floor); x > 0 ? log10(x) : NaN)) :
                           clamp(x, 0.0, 1.0)
   vs = f.(ys)
   fin = filter(isfinite, vs)
-  lo, hi = scale === :log ? (isempty(fin) ? (0.0, 0.0) : extrema(fin)) : (0.0, 1.0)
-  floor > 0 && scale === :log && (lo = log10(floor))
+  lo0, hi = scale === :log ? (isempty(fin) ? (0.0, 0.0) : extrema(fin)) : (0.0, 1.0)
+  lo = floor > 0 && scale === :log ? Float64(log10(floor)) : lo0
   # A flat series is drawn mid-height, or at the bottom when it sits on
   # the floor.
   flat = floor > 0 && scale === :log && hi <= lo ? 1 : 4
@@ -393,11 +405,10 @@ end
 # Column layout: (head, width, right-aligned). kkt and cc only when they
 # carry information; time and progress only when the table fits.
 function _rich_columns(log::SolverLog)
-  h = log.header
   cols = Tuple{String,Int}[("iter", 4), ("primal", 7), ("dual", 7), ("compl", 7),
                            ("gap", 7), ("pobj", 10), ("dobj", 10), ("step", 5), ("ref", 3)]
   log.has_kkt && push!(cols, ("kkt", 5))
-  h !== nothing && h.centralityCorrectors > 0 && push!(cols, ("cc", 3))
+  log.ccorr > 0 && push!(cols, ("cc", 3))
   w = sum(c[2] + 2 for c in cols) + 1
   if w + 9 + 14 <= log.width
     push!(cols, ("time", 7)); push!(cols, ("progress", 12))
@@ -415,10 +426,10 @@ function _rich_table_start(log::SolverLog)
 end
 
 function _rich_iter(log::SolverLog, r::NamedTuple)
-  h = log.header; tol = h === nothing ? 1e-6 : h.optTol
+  tol = log.optTol
   cols = _rich_columns(log)
   names = first.(cols)
-  res(x) = (s = _e1(x); !isfinite(x) ? (s, :red) : x < tol ? (s, :green) : (s, :normal))
+  res(x) = (str = _e1(x); !isfinite(x) ? (str, :red) : x < tol ? (str, :green) : (str, :normal))
   print(log.io, " ", lpad(r.iter, 4))
   for (x, w) in ((max(r.rPr, r.rEq), 7), (r.rDu, 7), (r.rCp, 7), (r.rGap, 7))
     (s, c) = res(x)
@@ -465,7 +476,7 @@ function _rich_progress(log::SolverLog, r::NamedTuple, tol)
   m1 = log.hist.m[1]
   # the closer of the two infeasibility screens (NaN when its sign test fails)
   scr, which = isnan(r.icertd) || r.icertp <= r.icertd ? (r.icertp, "p") : (r.icertd, "d")
-  itol = log.header === nothing ? 1e-7 : log.header.infeasTol
+  itol = log.infeasTol
   if m < tol
     _put(log, _bar(1.0, 10) * " ✓"; color = :green)
   elseif isfinite(scr) && scr < 1e-2 && m > 1e2 * tol
@@ -494,19 +505,23 @@ function _rich_final(log::SolverLog, sol, timing)
   io = log.io
   h = log.hist
   st = sol.status
+  # (concrete whatever the declared types of the Solution fields)
+  iter_best = Int(sol.Iter)
+  pobj = Float64(sol.pobj); dobj = Float64(sol.dobj); rGap = Float64(sol.rGap)
+  prFeas = Float64(sol.prFeas); duFeas = Float64(sol.duFeas); muFeas = Float64(sol.muFeas)
   (mark, col) = _status_mark(st)
   title = get(_STATUS_TITLE, st, string(st))
   changed = log.exit_status !== :None && st !== log.exit_status
   changed && (title = get(_STATUS_TITLE, log.exit_status, "") * " → " * title)
-  iters = isempty(h.m) ? sol.Iter : length(h.m)
+  iters = isempty(h.m) ? iter_best : length(h.m)
   # (after a header with no table the header's blank line separates)
-  print(io, log.header !== nothing && isempty(h.m) ? " " : "\n ")
+  print(io, log.nsolves > 0 && isempty(h.m) ? " " : "\n ")
   _put(log, "$mark $title"; color = col, bold = true)
   _put(log, "  $iters iteration$(iters == 1 ? "" : "s") · $(_dur(time() - log.t0)) · " *
             "$(sol.kkt_solves) KKT solve$(sol.kkt_solves == 1 ? "" : "s")\n"; dim = true)
   lab(s) = _put(log, "   " * rpad(s, 12); dim = true)
-  tol = log.header === nothing ? 1e-6 : log.header.optTol
-  itol = log.header === nothing ? 1e-7 : log.header.infeasTol
+  tol = log.optTol
+  itol = log.infeasTol
   if changed
     lab("postsolve")
     print(io, "the solver reported $(log.exit_status); checks on the original data changed it\n")
@@ -529,15 +544,15 @@ function _rich_final(log::SolverLog, sol, timing)
     isempty(h.icertd) || (lab("screen"); _spark_value(log, "icertd", h.icertd, itol / 100);
                           print(io, "  (infeasTol $(_g(itol)))\n"))
   else
-    if isfinite(sol.pobj) || isfinite(sol.dobj)
+    if isfinite(pobj) || isfinite(dobj)
       lab("objective")
-      @printf(io, "pobj % .6e   dobj % .6e   rel. gap %s\n", sol.pobj, sol.dobj, _e1(sol.rGap))
+      @printf(io, "pobj % .6e   dobj % .6e   rel. gap %s\n", pobj, dobj, _e1(rGap))
     end
     if st !== :Optimal && iters > 0
       lab("best")
-      print(io, "iteration $(sol.Iter): ")
-      for (name, x) in (("primal", sol.prFeas), ("dual", sol.duFeas), ("compl", sol.muFeas),
-                        ("gap", sol.rGap))
+      print(io, "iteration $iter_best: ")
+      for (name, x) in (("primal", prFeas), ("dual", duFeas), ("compl", muFeas),
+                        ("gap", rGap))
         isfinite(x) || continue
         print(io, name, " ")
         _put(log, _e1(x); color = x < tol ? :green : :red)
@@ -616,8 +631,8 @@ end
 
 # The display name of a KKT solver: a function's name, or a callable
 # object's type name.
-_kkt_name(k::Function) = string(nameof(k))
-_kkt_name(k) = string(nameof(typeof(k)))
+_kkt_name(k::Function) = string(nameof(k)::Symbol)
+_kkt_name(k) = string(nameof(typeof(k))::Symbol)
 
 # "ℝ₊ 120 · SOC 4×5, 2×11 · PSD 1×(10×10)": the orthant as one total, the
 # second-order and semidefinite cones as count×size per distinct size, in
