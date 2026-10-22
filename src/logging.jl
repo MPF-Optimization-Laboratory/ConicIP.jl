@@ -505,15 +505,11 @@ function _rich_final(log::SolverLog, sol, timing)
   io = log.io
   h = log.hist
   st = sol.status
-  # (concrete whatever the declared types of the Solution fields)
-  iter_best = Int(sol.Iter)
-  pobj = Float64(sol.pobj); dobj = Float64(sol.dobj); rGap = Float64(sol.rGap)
-  prFeas = Float64(sol.prFeas); duFeas = Float64(sol.duFeas); muFeas = Float64(sol.muFeas)
   (mark, col) = _status_mark(st)
   title = get(_STATUS_TITLE, st, string(st))
   changed = log.exit_status !== :None && st !== log.exit_status
   changed && (title = get(_STATUS_TITLE, log.exit_status, "") * " → " * title)
-  iters = isempty(h.m) ? iter_best : length(h.m)
+  iters = isempty(h.m) ? sol.Iter : length(h.m)
   # (after a header with no table the header's blank line separates)
   print(io, log.nsolves > 0 && isempty(h.m) ? " " : "\n ")
   _put(log, "$mark $title"; color = col, bold = true)
@@ -544,15 +540,15 @@ function _rich_final(log::SolverLog, sol, timing)
     isempty(h.icertd) || (lab("screen"); _spark_value(log, "icertd", h.icertd, itol / 100);
                           print(io, "  (infeasTol $(_g(itol)))\n"))
   else
-    if isfinite(pobj) || isfinite(dobj)
+    if isfinite(sol.pobj) || isfinite(sol.dobj)
       lab("objective")
-      @printf(io, "pobj % .6e   dobj % .6e   rel. gap %s\n", pobj, dobj, _e1(rGap))
+      @printf(io, "pobj % .6e   dobj % .6e   rel. gap %s\n", sol.pobj, sol.dobj, _e1(sol.rGap))
     end
     if st !== :Optimal && iters > 0
       lab("best")
-      print(io, "iteration $iter_best: ")
-      for (name, x) in (("primal", prFeas), ("dual", duFeas), ("compl", muFeas),
-                        ("gap", rGap))
+      print(io, "iteration $(sol.Iter): ")
+      for (name, x) in (("primal", sol.prFeas), ("dual", sol.duFeas), ("compl", sol.muFeas),
+                        ("gap", sol.rGap))
         isfinite(x) || continue
         print(io, name, " ")
         _put(log, _e1(x); color = x < tol ? :green : :red)
