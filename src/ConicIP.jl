@@ -538,27 +538,34 @@ function maxstep_rp(x, e::Nothing)
   # 0       if α < 0   (point is STRICTLY feasible)
   # 1 + α   otherwise
 
-  if all(x .> 0)
-    return 0;
+  if all(>(0), x)
+    return 0.0;
   else
     return -1 + minimum(x);
   end
 
 end
 
-function maxstep_soc(x,d)
+# `dn` and `xbar` are scratch of length(x) for -d and x/√γ; the solver
+# passes views of its own buffers (this runs per cone, several times per
+# iteration), a caller that omits them gets fresh vectors. The operations
+# are those of the allocating form, so the result is the same to the bit.
+function maxstep_soc(x, d, dn = Vector{Float64}(undef, length(x)),
+                     xbar = Vector{Float64}(undef, length(x)))
 
   # Assume x in Q.
   # Returns maximum α such that x - α*d in Q.
 
-  d = -d;
+  dn .= .-d
   γ = Q(x,x)
-  xbar = x/sqrt(γ)
-  β = Q(xbar,d)
+  xbar .= x ./ sqrt(γ)
+  β = Q(xbar,dn)
 
   ρ1 = β /sqrt(γ)
-  μ  = (β + d[1])/(xbar[1] + 1)
-  ρ2 = (d[2:end] - μ*xbar[2:end])
+  μ  = (β + dn[1])/(xbar[1] + 1)
+  # ρ2 = dn[2:end] - μ*xbar[2:end], formed over dn's own tail
+  ρ2 = view(dn, 2:length(dn))
+  ρ2 .= ρ2 .- μ .* view(xbar, 2:length(xbar))
   alpha = norm(ρ2)/sqrt(γ) - ρ1
   if alpha < 0
     return Inf
@@ -571,8 +578,8 @@ end
 function maxstep_soc(x, e::Nothing)
 
   # Maximum step to cone
-  α = norm(x[2:end]) - x[1];
-  return α < 0 ? 0 : -1 - α;
+  α = norm(view(x, 2:length(x))) - x[1];
+  return α < 0 ? 0.0 : -1 - α;
 
 end
 
@@ -611,9 +618,9 @@ function maxstep_sdc(x,d::Nothing)
 
   # Maximum step to Semidefinite cone (see maxstep_rp(x, ::Nothing))
   # An order-0 block is vacuously strictly feasible and needs no shift.
-  isempty(x) && return 0
+  isempty(x) && return 0.0
   minΛ = eigmin(Symmetric(mat(x)))
-  return minΛ > 0 ? 0 : -1 + minΛ
+  return minΛ > 0 ? 0.0 : -1 + minΛ
 
 end
 
@@ -1267,9 +1274,12 @@ function _conicIP(
   _rhs_s     = zeros(m)
   # λ = F*z.v, recomputed at the top of every iteration
   _λ         = zeros(m)
-  # Trial iterate for the interiority check of the line search
+  # Trial iterate for the interiority check of the line search, and the
+  # second-order-cone step length's scratch (-d and x/√γ per cone)
   _trial_v   = zeros(m)
   _trial_s   = zeros(m)
+  _ms_dn     = zeros(m)
+  _ms_xbar   = zeros(m)
   _rkkt = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _rIr  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   # Best step seen so far during refinement (restored when a correction
@@ -1495,9 +1505,12 @@ function _conicIP(
     min_α = Inf;
     @inbounds for (btype, I, i) = block_data
       xI = view(x,I)
-      dI = ( d == nothing ? nothing : view(d,I) )
+      dI = ( d === nothing ? nothing : view(d,I) )
       if btype == "R"; α = maxstep_rp(xI,dI);  end
-      if btype == "Q"; α = maxstep_soc(xI,dI); end
+      if btype == "Q"
+        α = dI === nothing ? maxstep_soc(xI, nothing) :
+                             maxstep_soc(xI, dI, view(_ms_dn, I), view(_ms_xbar, I))
+      end
       if btype == "S"; α = maxstep_sdc(xI,dI); end
       min_α = min(α, min_α)
     end
