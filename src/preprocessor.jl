@@ -86,17 +86,38 @@ function preprocess_conicIP(Q, c::AbstractVector,
   fix_singletons = true,
   timeLimit = Inf,
   timing = nothing,
+  log_style = :auto,
+  log_io::IO = stdout,
+  trace = nothing,
+  _log = nothing,
   options...)
 
+  # The log is created here (see logging.jl) and handed down to the solve;
+  # its owner reports the final verdict on every exit and closes a trace
+  # file.
+  owner = _log === nothing
+  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io,
+                          trace = trace === nothing ? _env_trace() : trace) : _log
+  try
+    return _preprocess_entry(Q, c, A, b, cone_dims, G, d, log, owner;
+                             rank_check = rank_check, fix_singletons = fix_singletons,
+                             timeLimit = timeLimit, timing = timing, options...)
+  finally
+    owner && _close_log!(log)
+  end
+end
+
+function _preprocess_entry(Q, c, A, b, cone_dims, G, d, log, owner;
+                           rank_check, fix_singletons, timeLimit, timing, options...)
   t_start = time()
   time_left() = timeLimit - (time() - t_start)
   gc0 = gc_start(timing)   # t_gc: assigned on every exit (timing.jl)
-
-  if verbose == true
-    println()
-    println(" > INTERIOR POINT PREPROCESSOR")
-    println()
+  function finish(sol)
+    owner && log.on && _log_final!(log, sol, timing)
+    return gc_stop!(timing, gc0, sol)
   end
+
+  log.on && _log_presolve_start!(log)
 
   # An SDP routed to kktsolver_sdpschur keeps the singleton rows on its
   # cone variables: fixing a matrix entry (X_ii = 1 in a max-cut
@@ -110,8 +131,8 @@ function preprocess_conicIP(Q, c::AbstractVector,
     fix_singletons ? _singleton_fixings(G, d; protect = protect) : nothing
   end
   if fx === nothing
-    return gc_stop!(timing, gc0, _preprocess_core(Q, c, A, b, cone_dims, G, d;
-                            verbose = verbose, rank_check = rank_check, timeLimit = time_left(),
+    return finish(_preprocess_core(Q, c, A, b, cone_dims, G, d;
+                            _log = log, rank_check = rank_check, timeLimit = time_left(),
                             timing = timing, options...))
   end
 
@@ -128,7 +149,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
     # sign with dᵀw < 0 and let the validator normalize and confirm it.
     # (The block evaluates to the Solution so the phase closes before the
     # return.)
-    return gc_stop!(timing, gc0, @phase timing t_presolve b_presolve begin
+    return finish(@phase timing t_presolve b_presolve begin
       (i, k, j) = conflict
       Gs = sparse(G)
       w0 = zeros(p); w0[i] = 1 / Gs[i, j]; w0[k] = -1 / Gs[k, j]
@@ -137,10 +158,9 @@ function preprocess_conicIP(Q, c::AbstractVector,
       (chk, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims, G, d,
           w0, zeros(m); abstol = get(opts, :infeasAbsTol, 1e-9),
                         reltol = get(opts, :infeasTol, 1e-7))
-      if verbose
-        println("   - Conflicting singleton equality rows $i and $k on variable $j",
-                chk.valid ? " (certified infeasible)" : " (no valid certificate)")
-      end
+      log.on && _log_note!(log, :presolve,
+        "Conflicting singleton equality rows $i and $k on variable $j" *
+        (chk.valid ? " (certified infeasible)" : " (no valid certificate)"))
       chk.valid ?
         Solution(nanv(n), w̄, v̄, nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, true) :
         Solution(nanv(n), nanv(p), nanv(m), nanv(m), :Infeasible, 0, NaN, NaN, NaN, NaN, NaN, NaN, false)
@@ -161,9 +181,8 @@ function preprocess_conicIP(Q, c::AbstractVector,
       keepc = setdiff(1:n, cols)
       keepr = setdiff(1:p, rows)
       yfix  = zeros(n); yfix[cols] = vals
-      if verbose
-        println("   - Fixing $(length(cols)) variable(s) from singleton equality rows")
-      end
+      log.on && _log_note!(log, :presolve,
+        "Fixing $(length(cols)) variable(s) from singleton equality rows")
       Qs = sparse(Q); As = sparse(A); Gs = sparse(G)
       cr = (c - Qs * yfix)[keepc]
       br = b - As * yfix
@@ -176,7 +195,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # The nested solve is timed by the solver itself (never inside the
   # presolve phase).
   sol = _preprocess_core(Qr, cr, Ar, br, cone_dims, Gr, dr;
-                         verbose = verbose, rank_check = rank_check,
+                         _log = log, rank_check = rank_check,
                          objective_offset = offset, timeLimit = time_left(),
                          timing = timing,
                          Base.structdiff(opts0, NamedTuple{(:objective_offset,)})...)
@@ -189,7 +208,7 @@ function preprocess_conicIP(Q, c::AbstractVector,
   # row's stationarity formula exact). Rays: a primal ray has zero fixed
   # components; a Farkas ray needs wᵢ chosen so that column j of Gᵀw − Aᵀv
   # vanishes, which is the same formula with c and Qy dropped.
-  return gc_stop!(timing, gc0, @phase timing t_postsolve begin
+  return finish(@phase timing t_postsolve begin
     y = fill(NaN, n); w = fill(NaN, p)
     if all(isfinite, sol.y)
       y[keepc] = sol.y
@@ -285,10 +304,12 @@ end
 function _preprocess_core(Q, c::AbstractVector,
   A, b::AbstractVector, cone_dims,
   G = spzeros(0,length(c)), d = zeros(0);
-  verbose = false,
   rank_check = :auto,
   timing = nothing,
+  _log::SolverLog = _NOLOG,
   options...)
+
+  log = _log
 
   n = length(c) # Number of variables
   m = size(A,1) # Number of inequality constraints
@@ -322,7 +343,7 @@ function _preprocess_core(Q, c::AbstractVector,
                                           !(ks === kktsolver_ldl || ks isa cached_kktsolver_ldl))
 
     if !do_rank
-      if verbose; println("   - Rank detection skipped (KKT solver regularizes)"); end
+      log.on && _log_note!(log, :presolve, "Rank detection skipped (KKT solver regularizes)")
       IP = collect(1:p); pconsistent = true
       ID = collect(1:n); dconsistent = true
     else
@@ -340,10 +361,8 @@ function _preprocess_core(Q, c::AbstractVector,
       (check, w̄, v̄) = validate_infeasibility_certificate(Q, c, A, b, cone_dims,
         G, d, -r, zeros(m); abstol = abstol, reltol = reltol)
 
-      if verbose == true
-        println("   - Primal equality constraints inconsistent",
-                check.valid ? " (certified)" : " (no valid certificate)")
-      end
+      log.on && _log_note!(log, :presolve, "Primal equality constraints inconsistent" *
+                                           (check.valid ? " (certified)" : " (no valid certificate)"))
 
       check.valid ?
         ConicIP.Solution(nanvec(n), w̄, v̄, nanvec(m),
@@ -367,10 +386,9 @@ function _preprocess_core(Q, c::AbstractVector,
         (check, ȳ) = validate_unboundedness_certificate(Q, c, A, b, cone_dims,
           G, d, y_res; abstol = abstol, reltol = reltol)
 
-        if verbose == true
-          println("   - Dual equality constraints inconsistent (primal unbounded)",
-                  check.valid ? " (certified)" : " (no valid certificate)")
-        end
+        log.on && _log_note!(log, :presolve,
+          "Dual equality constraints inconsistent (primal unbounded)" *
+          (check.valid ? " (certified)" : " (no valid certificate)"))
 
         check.valid ?
           ConicIP.Solution(ȳ, nanvec(p), nanvec(m), A*ȳ,
@@ -380,16 +398,14 @@ function _preprocess_core(Q, c::AbstractVector,
 
       else
 
-        if (verbose == true) && (length(IP) != p)
-          println("   - Removing $(p - length(IP)) redundant primal constraints ");
+        if log.on && length(IP) != p
+          _log_note!(log, :presolve, "Removing $(p - length(IP)) redundant primal constraints")
         end
-
-        if (verbose == true) && (length(ID) != n)
-          println("   - Rank deficient dual constraints: enabling static regularization");
+        if log.on && length(ID) != n
+          _log_note!(log, :presolve, "Rank deficient dual constraints: enabling static regularization")
         end
-
-        if (verbose == true) && do_rank && (length(ID) == n) && (length(IP) == p)
-          println("   - No changes made")
+        if log.on && do_rank && length(ID) == n && length(IP) == p
+          _log_note!(log, :presolve, "No changes made")
         end
 
         (IP, ID, do_rank)
@@ -418,7 +434,7 @@ function _preprocess_core(Q, c::AbstractVector,
   (GIP, dIP) = @phase timing t_presolve b_presolve (G[IP,:], d[IP])
 
   sol = conicIP(Q, c, A, b, cone_dims, GIP, dIP;
-    verbose = verbose,       #                   |
+    _log = log,              #                   |
     staticReg = reg,         # Removed redundant linear constraints
     timeLimit = time_left(),
     timing = timing,
@@ -431,9 +447,9 @@ function _preprocess_core(Q, c::AbstractVector,
   # it (imcols already trimmed dependent rows above).
   if sol.status == :Error && do_rank && reg == 0.0 && !haskey(opts, :staticReg) &&
      time_left() > 0
-    if verbose; println("   - KKT failure; retrying once with staticReg = 1e-8"); end
+    log.on && _log_note!(log, :presolve, "KKT failure; retrying once with staticReg = 1e-8")
     sol = conicIP(Q, c, A, b, cone_dims, GIP, dIP;
-      verbose = verbose, staticReg = 1e-8, timeLimit = time_left(),
+      _log = log, staticReg = 1e-8, timeLimit = time_left(),
       timing = timing, rest...)
   end
 

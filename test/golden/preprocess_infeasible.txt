@@ -1,0 +1,3 @@
+> INTERIOR POINT PREPROCESSOR
+- Primal equality constraints inconsistent (certified)
+> EXIT -- Infeasible

@@ -428,6 +428,8 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     diag.repaired        = regularized_entries(Fact)
     diag.repaired_total += diag.repaired
     diag.pos_inertia     = positive_inertia(Fact)
+    diag.repaired > 0 &&
+      @debug "LDLᵀ: dynamic regularization replaced pivots" _group = :kkt repaired = diag.repaired pos_inertia = diag.pos_inertia
     if pt !== nothing
       pt.t_ldl_factor += time_ns() - t0
       pt.n_ldl_factor += 1
@@ -445,6 +447,7 @@ function kktsolver_ldl(Q, A, G, cone_dims;
     numeric_factor!()
     diag.refactors       += 1
     diag.refactors_total += 1
+    @debug "LDLᵀ: static shifts bumped, refactorized" _group = :kkt δp δe refactors = diag.refactors
     return nothing
   end
 

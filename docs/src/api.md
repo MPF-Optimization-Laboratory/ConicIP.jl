@@ -128,6 +128,21 @@ ConicIP.vecm!
 ConicIP.imcols
 ```
 
+## Logging and Tracing
+
+The iteration log is selected with `verbose`, `log_style` and `log_io`
+(see [`conicIP`](@ref ConicIP.conicIP)); the same events are available as
+data through `trace`, and `JULIA_DEBUG=ConicIP` turns on developer
+diagnostics. The tutorial [Reading the Iteration Log](@ref) walks through
+all three.
+
+```@docs
+ConicIP.SolverTrace
+ConicIP.iterations
+ConicIP.write_jsonl
+ConicIP.jsonl_trace
+```
+
 ## Timing
 
 Opt-in per-phase instrumentation (`timing = PhaseTimes()`).

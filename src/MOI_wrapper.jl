@@ -12,6 +12,12 @@ Settable as constructor keywords or through
 `MOI.RawOptimizerAttribute` / JuMP's `set_attribute`:
 
 - `verbose::Bool` -- print solver iterations (default: `false`)
+- `log_style` -- `"auto"` (default: rich on an interactive terminal,
+  classic otherwise), `"classic"` or `"rich"`; see [`conicIP`](@ref)
+- `log_io::IO` -- where the log is printed (default: `stdout`)
+- `trace` -- `nothing` (default), a [`SolverTrace`](@ref), a callable that
+  receives one record per solver event, or a path to append JSON Lines to;
+  not affected by `MOI.Silent` (see [`conicIP`](@ref))
 - `optTol::Float64` -- optimality tolerance (default: `1e-6`)
 - `maxIters::Int` -- maximum iterations (default: `100`)
 - `infeasTol::Float64` -- infeasibility/unboundedness certificate tolerance
@@ -99,7 +105,8 @@ const _SUPPORTED_OPTIONS = (
     "maxRefinementSteps", "refineRelTol", "refineAbsTol", "staticReg",
     "certFallback", "certFallbackIters", "cache_nestodd", "kktsolver",
     "preprocess", "rank_check", "fix_singletons", "timeLimit", "equilibrate",
-    "assemble_only", "centralityCorrectors", "timing",
+    "assemble_only", "centralityCorrectors", "timing", "log_style", "log_io",
+    "trace",
 )
 
 # Map a kktsolver name to the solver constructor. Accepts the name
@@ -236,6 +243,10 @@ function MOI.set(model::Optimizer, attr::MOI.RawOptimizerAttribute, value)
     end
     if attr.name == "kktsolver"
         _resolve_kktsolver(value)   # validate eagerly
+    elseif attr.name == "log_style"
+        _check_log_style(value)
+    elseif attr.name == "log_io"
+        value isa IO || throw(ArgumentError("log_io must be an IO (got $(typeof(value)))"))
     elseif attr.name == "timing"
         # The caller owns the PhaseTimes: optimize! adds to it and never
         # resets it (one object per measured call).
@@ -259,7 +270,8 @@ function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
         "cache_nestodd" => false, "kktsolver" => "auto",
         "preprocess" => true, "rank_check" => "auto", "fix_singletons" => true,
         "timeLimit" => Inf, "equilibrate" => true, "assemble_only" => false,
-        "centralityCorrectors" => 0, "timing" => nothing)
+        "centralityCorrectors" => 0, "timing" => nothing, "log_style" => "auto",
+        "log_io" => stdout, "trace" => nothing)
     return get(model.options, attr.name, defaults[attr.name])
 end
 

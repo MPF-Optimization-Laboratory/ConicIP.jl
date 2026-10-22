@@ -290,6 +290,7 @@ function _revalidate_certificate!(sol::Solution, Q, c, A, b, cone_dims, G, d;
   end
 
   kind = sol.status == :Infeasible ? "infeasibility" : "unboundedness"
+  @debug "postsolve: certificate rejected on the original data" _group = :postsolve kind source chk chk100
   sol.has_certificate = false
   sol.status = chk100.valid ? almost : :Abandoned
   g3(x) = @sprintf("%.3g", x)
@@ -383,6 +384,7 @@ function _check_postsolve!(sol::Solution, Q, c, A, b, cone_dims, G, d;
   _refresh_point!(sol, Q, c, A, b, G, d; objective_offset = objective_offset)
   if sol.status == :Optimal
     if !(max(sol.prFeas, sol.duFeas, sol.rGap) < optTol)
+      @debug "postsolve: optimal point fails optTol on the original data" _group = :postsolve sol.prFeas sol.duFeas sol.rGap optTol
       sol.status = :Error
       sol.message = "presolved point fails the original-data optimality tolerance"
     end

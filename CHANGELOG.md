@@ -6,6 +6,39 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Rich iteration log: `log_style = :rich` prints a Unicode table with
+  colour (residuals that pass `optTol` turn green), a per-row progress bar
+  toward the tolerance, a four-line problem summary, and an exit card with
+  the verdict, objective, best iterate, and sparklines of the residuals,
+  μ and step length. `log_style = :auto` (the default) uses it on an
+  interactive terminal and keeps the classic table elsewhere;
+  `ENV["CONICIP_LOG_STYLE"]` overrides the default, and `NO_COLOR` turns
+  colour off. `log_io` redirects the log. MOI options `"log_style"`,
+  `"log_io"`.
+- Solver trace: `trace = SolverTrace()` (or any callable, or a path to a
+  JSON Lines file; `ENV["CONICIP_TRACE"]` when none is given) records one
+  `NamedTuple` per event — header, iteration, note, exit, final verdict —
+  with every residual of the stopping test, the step length and centering,
+  refinement, KKT diagnostics and correctors. Schema `conicip-trace/1`;
+  `write_jsonl`, `ConicIP.iterations`, `ConicIP.jsonl_trace`. Independent
+  of `verbose` and `MOI.Silent`; MOI option `"trace"`.
+- `@debug` diagnostics (`JULIA_DEBUG=ConicIP`) for KKT routing,
+  regularization repairs and shift bumps, refinement roll-backs,
+  line-search back-offs, certificate screening, and postsolve rejections.
+
+### Changed
+- Every exit prints a verdict: `:Abandoned`, `:AlmostInfeasible`,
+  `:AlmostDualInfeasible`, the post-loop time limit, a non-finite initial
+  point and an unvalidated structural certificate used to end the log
+  silently. When postsolve changes the status the solver announced, a
+  `POSTSOLVE -- status changed` line says so; a verdict reached in presolve
+  ends with an `EXIT` line.
+- Classic table: the KKT solver line follows the solver banner, and
+  "Certificate of Infeasiblity" is spelled "Infeasibility".
+- The refinement statistics of the main loop are no longer boxed closure
+  captures (a small allocation and type-stability fix).
+
 ## [0.7.0] - 2026-10-20
 
 ### Breaking changes

@@ -37,7 +37,7 @@ println("status: ", sol.status)
 # The `icertp` column tells the story: it starts at `1.5e+00`, falls by one
 # or two orders of magnitude per iteration, and once it drops under `infeasTol`
 # the nominated ray is handed to the validator, which accepts it — hence
-# `EXIT -- Certificate of Infeasiblity Found!`. Meanwhile `muFeas` blows up
+# `EXIT -- Certificate of Infeasibility Found!`. Meanwhile `muFeas` blows up
 # and `pobj` stalls: the iterates are running off to infinity, which is what
 # an infeasible-start interior-point method does on an empty feasible set.
 #

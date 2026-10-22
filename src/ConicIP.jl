@@ -1,7 +1,8 @@
 module ConicIP
 
 export Id, conicIP, pivot, preprocess_conicIP,
-  Optimizer, Block, choose_kktsolver, default_kktsolver
+  Optimizer, Block, choose_kktsolver, default_kktsolver,
+  SolverTrace, write_jsonl
 
 import Base: +, *, -, \, ^
 using LinearAlgebra
@@ -9,11 +10,6 @@ using LinearAlgebra.BLAS: axpy!, scal!
 using SparseArrays
 using WoodburyMatrices
 using Printf
-
-# Verbose log: an iteration row is printed in bold red when the scaled KKT
-# residual of the step, ‖r - K Δz‖/(n + p + 2m), is still above this after
-# the iterative-refinement loop. It flags an ill-conditioned KKT system.
-const REFINE_WARN_NORM = 1e-3
 
 """
     Id(n)
@@ -46,6 +42,8 @@ Base.size(W::VecCongurance, i)         = round(Int, size(W.R,1)*(size(W.R,1)+1)/
 
 include("blockmatrices.jl")
 include("timing.jl")
+include("logging.jl")
+include("trace.jl")
 include("kktsolvers.jl")
 include("kktsolver_ldl.jl")
 include("schur.jl")
@@ -924,7 +922,10 @@ structurally_zero_cols(M::Diagonal) = iszero.(M.diag)
   refineAbsTol = 1e-12,
   timeLimit = Inf,
   centralityCorrectors = 0,
-  timing = nothing)
+  timing = nothing,
+  log_style = :auto,
+  log_io = stdout,
+  trace = nothing)
 
 Interior point solver for the system
 
@@ -1018,6 +1019,25 @@ Selected keyword arguments:
 - `timing` — a [`PhaseTimes`](@ref) object to accumulate per-phase wall
   times, allocation bytes, and counts into (see `src/timing.jl` for the
   contract); `nothing` (default) leaves the solver uninstrumented.
+- `verbose` — print the iteration log (default `true`).
+- `log_style` — `:auto` (default), `:classic` or `:rich`. `:classic` is the
+  fixed-width ASCII table; `:rich` is a Unicode table with colour, a
+  per-row progress bar toward `optTol`, and an exit card with sparklines
+  of the residuals. `:auto` prints `:rich` on an interactive terminal and
+  `:classic` anywhere else (files, pipes, notebooks, CI), and can be
+  overridden with `ENV["CONICIP_LOG_STYLE"]`. Colour follows `log_io`'s
+  `:color` property and is off when `ENV["NO_COLOR"]` is set.
+- `log_io` — where the log is printed (default `stdout`).
+- `trace` — the iteration history as data, independent of `verbose`: a
+  [`SolverTrace`](@ref), a function called with one `NamedTuple` per
+  event, or a path to append JSON Lines to. When `nothing` (default),
+  `ENV["CONICIP_TRACE"]` names a file if set. See [`SolverTrace`](@ref)
+  for the record schema.
+
+Developer diagnostics for rare internal events (KKT routing and
+regularization, refinement roll-backs, line-search back-offs, certificate
+screening, postsolve rejections) are emitted with `@debug` and shown with
+`ENV["JULIA_DEBUG"] = "ConicIP"`.
 
 The parameter solve3x3gen allows the passing of a custom solver
 for the KKT System, as follows
@@ -1067,17 +1087,38 @@ original coordinates; see [`equilibrate_conicIP`](@ref). A custom
 """
 function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                  G = spzeros(0, length(c)), d = zeros(0);
-                 equilibrate = true, timeLimit = Inf, timing = nothing, kwargs...)
+                 equilibrate = true, timeLimit = Inf, timing = nothing,
+                 verbose = true, log_style = :auto, log_io::IO = stdout,
+                 trace = nothing, _log = nothing, kwargs...)
   t_start = time()
+  # The log is created here unless a caller up the stack (presolve) owns
+  # it; the owner reports the final verdict and closes a trace file.
+  owner = _log === nothing
+  log = owner ? _make_log(verbose; log_style = log_style, log_io = log_io,
+                          trace = trace === nothing ? _env_trace() : trace) : _log
+  try
+    return _conicIP_entry(Q, c, A, b, cone_dims, G, d, log, owner, t_start;
+                          equilibrate = equilibrate, timeLimit = timeLimit,
+                          timing = timing, kwargs...)
+  finally
+    owner && _close_log!(log)
+  end
+end
+
+function _conicIP_entry(Q, c, A, b, cone_dims, G, d, log, owner, t_start;
+                        equilibrate, timeLimit, timing, kwargs...)
   # t_gc: every entry point (this one, preprocess_conicIP, _preprocess_core,
   # the MOI optimize!) assigns it on exit; the outermost writes last and
   # wins (see gc_start/gc_stop! in timing.jl). `_conicIP` never touches it.
   gc0 = gc_start(timing)
   if !equilibrate
-    sol = _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, timing = timing, kwargs...)
+    sol = _conicIP(Q, c, A, b, cone_dims, G, d; timeLimit = timeLimit, timing = timing,
+                   _log = log, kwargs...)
+    owner && log.on && _log_final!(log, sol, timing)
     return gc_stop!(timing, gc0, sol)
   end
   eq = @phase timing t_equilibrate b_equilibrate equilibrate_conicIP(Q, c, A, b, cone_dims, G, d)
+  log.on && _log_note!(log, :equilibrate, _equilibrate_msg(eq))
   # The core tests termination on residuals mapped back to the original
   # coordinates, so optTol keeps its meaning under any scaling.
   scaling = @phase timing t_equilibrate b_equilibrate (
@@ -1085,7 +1126,7 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
     normc = norm(c), normb = normsafe(b), normd = normsafe(d))
   sol = _conicIP(eq.Q, eq.c, eq.A, eq.b, cone_dims, eq.G, eq.d;
                  scaling = scaling, timeLimit = timeLimit - (time() - t_start),
-                 timing = timing, kwargs...)
+                 timing = timing, _log = log, kwargs...)
   sol = @phase timing t_postsolve begin
     unequilibrate!(sol, eq, Q, c, A, b, cone_dims, G, d;
                    objective_offset = get(kwargs, :objective_offset, 0.0))
@@ -1097,6 +1138,7 @@ function conicIP(Q, c::AbstractVector, A, b::AbstractVector, cone_dims,
                              infeasTol = Float64(get(kwargs, :infeasTol, 1e-7)),
                              infeasAbsTol = Float64(get(kwargs, :infeasAbsTol, 1e-9)))
   end
+  owner && log.on && _log_final!(log, sol, timing)
   return gc_stop!(timing, gc0, sol)
 end
 
@@ -1134,7 +1176,6 @@ function _conicIP(
 
   optTol = 1e-6,           # Optimal Tolerance
   DTB = 0.01,              # Distance to Boundary
-  verbose = true,          # Verbose Output
   maxRefinementSteps = 3,  # Maximum number of IR Steps
   maxIters = 100,          # Maximum number of interior iterations
   cache_nestodd = false,   # Set to true if there are many small blocks
@@ -1157,10 +1198,14 @@ function _conicIP(
                            # original coordinates (see equilibrate.jl)
   centralityCorrectors::Integer = 0,  # Gondzio correctors per iteration (0 = off;
                            # see the corrector block after the line search)
-  timing = nothing         # PhaseTimes to accumulate into (timing.jl); bound
+  timing = nothing,        # PhaseTimes to accumulate into (timing.jl); bound
                            # once here and only ever read, so the closures
                            # below capture it by value
+  _log::SolverLog = _NOLOG,# the caller's log (logging.jl); read-only here too
+  verbose::Bool = false    # direct callers only: a log of its own, classic
   )
+
+  log = verbose && _log === _NOLOG ? _make_log(true; log_style = :classic) : _log
 
   centralityCorrectors >= 0 ||
     throw(ArgumentError("centralityCorrectors must be a nonnegative integer (got $centralityCorrectors)"))
@@ -1347,16 +1392,15 @@ function _conicIP(
         Q, c, A, b, cone_dims, G, d, w̄0, zeros(m);
         abstol = infeasAbsTol, reltol = infeasTol)
     if chk.valid
-      if verbose
-        print("\n > EXIT -- Structurally infeasible (zero row $(i0) of G, d[$(i0)] ≠ 0)\n\n")
-      end
+      log.on && _log_exit!(log, :struct_infeasible, "zero row $(i0) of G, d[$(i0)] ≠ 0")
       sol0 = Solution(fill(NaN,n), zeros(p), zeros(m), fill(NaN,m),
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
       return exit_setup(claim_infeasible!(sol0, w̄, v̄))
     end
+    msg0 = "zero equality row certificate could not be normalized and validated"
+    log.on && _log_exit!(log, :error, msg0)
     return exit_setup(Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false,
-                    "zero equality row certificate could not be normalized and validated", 0))
+                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false, msg0, 0))
   end
 
   j0 = findfirst(j -> Zc[j] && c[j] != 0, 1:n)
@@ -1366,16 +1410,15 @@ function _conicIP(
         Q, c, A, b, cone_dims, G, d, ȳ0;
         abstol = infeasAbsTol, reltol = infeasTol)
     if chk.valid
-      if verbose
-        print("\n > EXIT -- Structurally dual infeasible (zero column $(j0) of [Q; A; G], c[$(j0)] ≠ 0)\n\n")
-      end
+      log.on && _log_exit!(log, :struct_dual_infeasible, "zero column $(j0) of [Q; A; G], c[$(j0)] ≠ 0")
       sol0 = Solution(zeros(n), fill(NaN,p), fill(NaN,m), zeros(m),
                       :None, 0, 0, Inf, Inf, Inf, NaN, NaN)
       return exit_setup(claim_dual_infeasible!(sol0, ȳ, A))
     end
+    msg0 = "zero column certificate could not be normalized and validated"
+    log.on && _log_exit!(log, :error, msg0)
     return exit_setup(Solution(fill(NaN,n), fill(NaN,p), fill(NaN,m), fill(NaN,m),
-                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false,
-                    "zero column certificate could not be normalized and validated", 0))
+                    :Error, 0, NaN, Inf, Inf, Inf, NaN, NaN, false, msg0, 0))
   end
 
   if any(Gzr) || any(Zc)
@@ -1387,7 +1430,7 @@ function _conicIP(
     solr = _conicIP(Q[keep_c, keep_c], c[keep_c], A[:, keep_c], b, cone_dims,
                    G[keep_r, keep_c], d[keep_r];
                    kktsolver = kktsolver, optTol = optTol, DTB = DTB,
-                   verbose = verbose, maxRefinementSteps = maxRefinementSteps,
+                   _log = log, maxRefinementSteps = maxRefinementSteps,
                    maxIters = maxIters, cache_nestodd = cache_nestodd,
                    infeasTol = infeasTol, infeasAbsTol = infeasAbsTol,
                    staticReg = staticReg, certFallback = certFallback,
@@ -1578,7 +1621,7 @@ function _conicIP(
   # sol.message, never as an escaped exception (issue #10).
   function kkt_error(where, err)
     msg = "KKT solve failed ($where): $(sprint(showerror, err))"
-    if verbose; print("\n > EXIT -- Error! ($msg)\n\n"); end
+    log.on && _log_exit!(log, :error, msg)
     return msg
   end
 
@@ -1604,11 +1647,6 @@ function _conicIP(
   routed = schur ? (kktsolver_sdpschur, nothing) :
            kktsolver === default_kktsolver ?
            _choose_kktsolver(Qᵣ, A, G, cone_dims) : nothing
-
-  if verbose && routed !== nothing
-    nnz_pc = (_structural_nnz(Q) + _structural_nnz(A) + _structural_nnz(G)) / max(n, 1)
-    @printf(" > KKT solver: %s (auto, %.1f nnz/col)\n", nameof(routed[1]), nnz_pc)
-  end
 
   solve3x3gen = try
     if routed === nothing
@@ -1675,9 +1713,10 @@ function _conicIP(
 
   end
 
-  if verbose
-      print("\n > INTERIOR POINT SOLVER (ConicIP v$(pkgversion(@__MODULE__)))\n\n")
-  end
+  log.on && _log_header!(log, _header_record(Q, A, G, cone_dims, n, m, p,
+                                               kktsolver, routed, staticReg, scaling,
+                                               optTol, infeasTol, maxIters,
+                                               centralityCorrectors, timeLimit))
 
   # ────────────────────────────────────────────────────────────
   #  Initial Point
@@ -1703,7 +1742,10 @@ function _conicIP(
   end
 
   # A nonfinite initial point would reach LAPACK through maxstep below.
-  isfinite4(z) || return exit_init(errsol("non-finite initial point (initial point)"))
+  if !isfinite4(z)
+    log.on && _log_exit!(log, :error, "non-finite initial point (initial point)")
+    return exit_init(errsol("non-finite initial point (initial point)"))
+  end
 
   (α_v, α_s) = try
     (maxstep(z.v, nothing), maxstep(z.s, nothing))
@@ -1717,13 +1759,7 @@ function _conicIP(
   z.s = z.s - α_s*e
   exit_init(nothing)
 
-  if verbose
-      println("            Optimality                      Objective              Infeasibility       ")
-      println()
-      printstyled(@sprintf(" %-6s  │  %-8s  %-8s  %-8s │  %-8s  %-8s  │  %-8s  %-8s │  %-6s  %-8s  %-5s\n",
-                  "  Iter","prFeas","duFeas","muFeas","pobj","dobj","icertp","icertd","refine","kkt","cc");
-                  bold = true)
-  end
+  log.on && _log_table_start!(log, kkt_diagnostics(_s3_cur[]) !== nothing)
 
   # ────────────────────────────────────────────────────────────
   #  Iterate Loop
@@ -1732,12 +1768,16 @@ function _conicIP(
   sol     = Solution(copy(z.y), copy(z.w), copy(z.v), copy(z.s), :None, 0, 0, Inf, Inf, Inf, Inf, -Inf)
   _stamp_kkt!(sol)
   optBest = Inf
-  nref    = 0      # refinement corrections applied in the previous iteration
+  # Refinement corrections applied in the previous iteration and the
+  # relative KKT residual of its step. Fields, not locals: refine! updates
+  # them, and a local assigned both there and in the loop would be boxed.
+  _it     = IterStats(0, 0.0)
   cc_acc  = 0      # centrality correctors accepted / tried in the previous
   cc_try  = 0      #   iteration (verbose cc column)
-  rnorm   = 0
   nstall  = 0      # consecutive iterations with a negligible step
   μ_history = Float64[]   # complementarity gap per iteration (exhaustion path only)
+  α_prev  = NaN    # step length and centering of the step that produced
+  σ_prev  = NaN    #   the current iterate (log row; NaN at the initial point)
 
   # ── Guards ──
   #
@@ -1767,7 +1807,7 @@ function _conicIP(
     sol.status = :Error
     sol.message = "non-finite $what ($stage)"
     _stamp_kkt!(sol)
-    if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
+    log.on && _log_exit!(log, :error, sol.message)
     return sol
   end
 
@@ -1800,7 +1840,7 @@ function _conicIP(
     _stamp_kkt!(sol)
 
     if over_time()
-      if verbose; print("\n > EXIT -- Time limit reached ($(timeLimit) s)\n\n"); end
+      log.on && _log_exit!(log, :time_limit, "$(timeLimit) s")
       sol.status = :TimeLimit
       return exit_loop(sol)
     end
@@ -1892,7 +1932,7 @@ function _conicIP(
       sol.message = "objective Hessian is not positive semidefinite " *
                     "(yᵀQy < 0 at iteration $Iter); ConicIP requires a convex objective"
       _stamp_kkt!(sol)
-      if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
+      log.on && _log_exit!(log, :error, sol.message)
       return exit_res(sol, t_res0, b_res0)
     end
 
@@ -1989,7 +2029,8 @@ function _conicIP(
     # gap is not part of bestMeasure, so an earlier iterate with a smaller
     # bestMeasure but a larger gap could otherwise be the one returned as
     # :Optimal (it is sol, not z, that the exit below hands back).
-    if optimal || bestMeasure < optBest
+    isbest = optimal || bestMeasure < optBest
+    if isbest
       sol.y[:] = z.y; sol.w[:] = z.w; sol.v[:] = z.v; sol.s[:] = z.s
       sol.Iter = Iter; sol.Mu = μ;
       sol.duFeas = rDu; sol.prFeas = max(rPr, rEq); sol.muFeas = rCp
@@ -2047,6 +2088,7 @@ function _conicIP(
         (pchk, w̄, v̄) = validate_infeasibility_certificate(
                           Q, c, A, b, cone_dims, G, d, z.w, z.v;
                           abstol = infeasAbsTol, reltol = infeasTol)
+        @debug "Farkas ray nominated by the screen" _group = :certificate Iter screen = p_infeas pchk
         if pchk.valid; claim = :Infeasible; end
       end
 
@@ -2083,50 +2125,46 @@ function _conicIP(
         (dchk, ȳ) = validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, z.y;
                        abstol = infeasAbsTol, reltol = infeasTol)
+        @debug "recession ray nominated by the screen" _group = :certificate Iter screen = d_infeas dchk
         if dchk.valid; claim = :DualInfeasible; end
       end
 
     end
 
-    if verbose
-      # A row is highlighted in red when the KKT step is still inaccurate
-      # after iterative refinement (see REFINE_WARN_NORM). The kkt cell is
-      # repaired/refactors of the factorization that produced this
-      # iterate (the previous iteration's, or the initial point's); blank
-      # when the solver reports no diagnostics.
-      # The cc cell is accepted/tried centrality correctors of the step
-      # that produced this iterate; blank when the option is off.
-      dg  = kkt_diagnostics(_s3_cur[])
-      kkt = dg === nothing ? "" : @sprintf("%d/%d", dg.repaired, dg.refactors)
-      cc  = centralityCorrectors > 0 ? @sprintf("%d/%d", cc_acc, cc_try) : ""
-      row = @sprintf(" %6i  │  %-8.1e  %-8.1e  %-8.1e │  % -8.1e  % -8.1e  │  %-8.1e  %-8.1e │  %-6i  %-8s  %s\n",
-                     Iter, rPr, rDu, rCp, pobj, dobj, p_infeas, d_infeas, nref, kkt, cc)
-      if rnorm > REFINE_WARN_NORM
-        printstyled(row; bold = true, color = :red)
-      else
-        print(row)
-      end
+    if log.on
+      dg = kkt_diagnostics(_s3_cur[])
+      cc_on = centralityCorrectors > 0
+      _log_iter!(log, (; iter = Iter, rPr, rDu, rCp, rEq, rGap, rPrRow, rEqRow,
+                         optMeasure, pobj, dobj, mu = μ,
+                         icertp = p_infeas, icertd = d_infeas,
+                         alpha = α_prev, sigma = σ_prev,
+                         refine = _it.nref, rnorm = _it.rnorm,
+                         kkt_repaired  = dg === nothing ? -1 : dg.repaired,
+                         kkt_refactors = dg === nothing ? -1 : dg.refactors,
+                         cc_acc = cc_on ? cc_acc : -1, cc_try = cc_on ? cc_try : -1,
+                         kkt_solves = _nsolve[], best = isbest,
+                         refine_warn = _it.rnorm > REFINE_WARN_NORM))
     end
 
     if optimal
-      if verbose; print("\n > EXIT -- Below Tolerance!\n\n"); end
+      log.on && _log_exit!(log, :optimal)
       sol.status = :Optimal
       return exit_res(sol, t_res0, b_res0)
     end
 
     if claim == :Infeasible
-      if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+      log.on && _log_exit!(log, :infeasible)
       return exit_res(claim_infeasible!(sol, w̄, v̄), t_res0, b_res0)
     end
 
     if claim == :DualInfeasible
-      if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+      log.on && _log_exit!(log, :dual_infeasible)
       return exit_res(claim_dual_infeasible!(sol, ȳ, A), t_res0, b_res0)
     end
 
     # Cause of Divergence Unknown
     if !(isfinite(μ) && isfinite(rDu) && isfinite(rPr) && isfinite(rCp))
-      if verbose; print("\n > EXIT -- Error!\n\n"); end
+      log.on && _log_exit!(log, :diverged)
       sol.status = :Error; return exit_res(sol, t_res0, b_res0)
     end
 
@@ -2179,7 +2217,7 @@ function _conicIP(
     # that does not reduce it is undone and ends the loop: refinement with
     # an approximate factorization K̃ contracts only when ‖I − K̃⁻¹K‖ < 1,
     # and a worsening step is the evidence that it does not. The step that
-    # leaves this function is therefore the best one seen, and `rnorm`
+    # leaves this function is therefore the best one seen, and `_it.rnorm`
     # (relative, shown in red in the verbose row when large) describes it.
     # The tolerance is a target, not a guarantee: a step that still misses
     # it is used as is. Returns false after stamping sol when a correction
@@ -2219,17 +2257,20 @@ function _conicIP(
         timing === nothing || (timing.n_refine_resid += 1)
         rnew = @phase timing t_dir_refine_resid step_residual!(Δz, r)
         if !(rnew < rres)               # also catches a NaN residual
+          @debug "refinement correction rolled back: residual grew" _group = :refine stage rres rnew
           copy4!(Δz, _Δz_keep)
           break
         end
         rres = rnew
       end
-      nref += k                         # iteration total, for the verbose row
-      rnorm = rres / (1 + nr)
+      k == maxRefinementSteps && rres > rtol &&
+        @debug "refinement budget spent above tolerance" _group = :refine stage rres rtol
+      _it.nref += k                     # iteration total, for the log row
+      _it.rnorm = rres / (1 + nr)
       true
       end # @phase t_dir_refine
     end
-    nref = 0
+    _it.nref = 0
 
     # t_direction covers the base solve (also t_dir_base) and the
     # refinement; the finiteness checks between them are left out.
@@ -2389,6 +2430,7 @@ function _conicIP(
     # exactly and back off geometrically before accepting it.
     @phase timing t_linesearch b_linesearch begin
     ok = false
+    nhalf = 0
     for _ in 1:30
       _trial_v .= z.v .- α .* Δz.v
       _trial_s .= z.s .- α .* Δz.s
@@ -2397,12 +2439,14 @@ function _conicIP(
         break
       end
       α /= 2
+      nhalf += 1
     end
+    nhalf > 0 && @debug "line search: interiority back-off" _group = :linesearch Iter nhalf α
     if !ok
       sol.status = :Error
       sol.message = "no interior point along the search direction (line search, iteration $Iter)"
       _stamp_kkt!(sol)
-      if verbose; print("\n > EXIT -- Error! ($(sol.message))\n\n"); end
+      log.on && _log_exit!(log, :error, sol.message)
       return exit_loop(sol)
     end
 
@@ -2415,13 +2459,15 @@ function _conicIP(
     timing === nothing || (timing.n_steps += 1)
     end # @phase t_linesearch
 
+    α_prev = α; σ_prev = σ
+
     # Stall: three consecutive negligible steps mean the iteration is no
     # longer moving. Leave the loop and let the post-loop screens decide
     # between a certificate, an "almost" verdict, and :Abandoned.
     nstall = α < 1e-8 ? nstall + 1 : 0
     if nstall >= 3
       sol.message = "stalled: step length below 1e-8 for 3 consecutive iterations (iteration $Iter)"
-      if verbose; print("\n > Stalled: step length below 1e-8 for 3 iterations\n"); end
+      log.on && _log_note!(log, :stall, "step length below 1e-8 for 3 iterations")
       break
     end
 
@@ -2430,6 +2476,7 @@ function _conicIP(
 
   _stamp_kkt!(sol)
   if over_time()
+    log.on && _log_exit!(log, :time_limit, "$(timeLimit) s")
     sol.status = :TimeLimit
     return sol
   end
@@ -2473,6 +2520,7 @@ function _conicIP(
   # evidence that no interior optimum exists.
   μ_diverged = length(μ_history) > 1 && (!isfinite(μ_history[end]) ||
                 μ_history[end] >= 1e3*minimum(μ_history))
+  @debug "loop exhausted: best iterate re-screened" _group = :certificate best = sol.Iter primal = pchk.valid dual = dchk.valid primal_100x = pchk100.valid dual_100x = dchk100.valid μ_collapsed μ_diverged
   end # @phase t_final
 
   # ── WP5 fallback: recover a ray by an auxiliary min-norm QP ──
@@ -2491,50 +2539,57 @@ function _conicIP(
     # Each solve is gated on the deadline separately: the first can use
     # up what is left of the budget, and the second must not then start.
     if (pchk100.valid || μ_collapsed || μ_diverged) && p + m > 0 && !over_time()
+      log.on && _log_note!(log, :fallback, "auxiliary min-norm solve for a Farkas ray")
       # The auxiliary solve runs untimed inside (no `timing` reaches it).
       ray = @phase timing t_fallback fallback_infeasibility_ray(
                                        Q, c, A, b, cone_dims, G, d;
                                        maxIters = certFallbackIters,
                                        timeLimit = max(time_left(), 0.0))
+      log.on && ray === nothing && _log_note!(log, :fallback, "no Farkas ray found")
       if ray !== nothing
         (fchk, fw̄, fv̄) = @phase timing t_final validate_infeasibility_certificate(
                             Q, c, A, b, cone_dims, G, d, ray[1], ray[2];
                             abstol = infeasAbsTol, reltol = infeasTol)
         if fchk.valid
-          if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+          log.on && _log_exit!(log, :infeasible)
           return claim_infeasible!(sol, fw̄, fv̄)
         end
+        log.on && _log_note!(log, :fallback, "Farkas ray found but not validated")
       end
     end
 
     if (dchk100.valid || μ_collapsed || μ_diverged) && n > 0 && !over_time()
+      log.on && _log_note!(log, :fallback, "auxiliary min-norm solve for a recession ray")
       ray = @phase timing t_fallback fallback_unbounded_ray(
                                    Q, c, A, b, cone_dims, G, d;
                                    maxIters = certFallbackIters,
                                    timeLimit = max(time_left(), 0.0))
+      log.on && ray === nothing && _log_note!(log, :fallback, "no recession ray found")
       if ray !== nothing
         (fchk, fȳ) = @phase timing t_final validate_unboundedness_certificate(
                        Q, c, A, b, cone_dims, G, d, ray;
                        abstol = infeasAbsTol, reltol = infeasTol)
         if fchk.valid
-          if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+          log.on && _log_exit!(log, :dual_infeasible)
           return claim_dual_infeasible!(sol, fȳ, A)
         end
+        log.on && _log_note!(log, :fallback, "recession ray found but not validated")
       end
     end
 
   end
 
   if over_time()
+    log.on && _log_exit!(log, :time_limit, "$(timeLimit) s")
     sol.status = :TimeLimit
     return sol
   end
 
   if pchk.valid
-    if verbose; print("\n > EXIT -- Certificate of Infeasiblity Found!\n\n"); end
+    log.on && _log_exit!(log, :infeasible)
     return claim_infeasible!(sol, w̄, v̄)
   elseif dchk.valid
-    if verbose; print("\n > EXIT -- Certificate of Dual Infeasibility Found!\n\n"); end
+    log.on && _log_exit!(log, :dual_infeasible)
     return claim_dual_infeasible!(sol, ȳ, A)
   elseif pchk100.valid && μ_collapsed
     sol.status = :AlmostInfeasible
@@ -2542,6 +2597,18 @@ function _conicIP(
     sol.status = :AlmostDualInfeasible
   else
     sol.status = :Abandoned
+  end
+
+  if log.on
+    best = "best iterate from iteration $(sol.Iter)"
+    if sol.status === :Abandoned
+      reason = isempty(sol.message) ? "iteration limit $maxIters" : sol.message
+      _log_exit!(log, :abandoned, "$reason; $best")
+    else
+      _log_exit!(log, sol.status === :AlmostInfeasible ? :almost_infeasible :
+                      :almost_dual_infeasible,
+                 "a ray validates only at 100×infeasTol; $best")
+    end
   end
 
   return sol

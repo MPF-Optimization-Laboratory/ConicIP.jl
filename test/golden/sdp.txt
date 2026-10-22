@@ -1,0 +1,6 @@
+> INTERIOR POINT SOLVER (ConicIP v#)
+> KKT solver: kktsolver_sdpschur (auto, # nnz/col)
+Optimality Objective Infeasibility
+Iter │ prFeas duFeas muFeas │ pobj dobj │ icertp icertd │ refine kkt cc
+# │ # # # │ # # │ # # │ #
+> EXIT -- Below Tolerance!

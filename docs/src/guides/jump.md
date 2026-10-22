@@ -24,8 +24,13 @@ The available options are:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `verbose` | `Bool` | `false` | Print solver iterations |
+| `log_style` | `String` | `"auto"` | `"classic"` table, `"rich"` Unicode table, or `"auto"` (rich on an interactive terminal) |
+| `log_io` | `IO` | `stdout` | Where the log is printed |
+| `trace` | | `nothing` | A `ConicIP.SolverTrace`, a callable, or a JSON Lines path; records every iteration even under `MOI.Silent` |
 | `optTol` | `Float64` | `1e-6` | Optimality tolerance |
 | `maxIters` | `Int` | `100` | Maximum iterations |
+
+`set_silent(model)` turns the log off; it does not stop a `trace`.
 
 ## Example: Simple LP
 

@@ -1,0 +1,1 @@
+> EXIT -- Structurally infeasible (zero row # of G, d[#] ≠ #)

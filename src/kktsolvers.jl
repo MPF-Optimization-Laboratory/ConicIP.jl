@@ -172,12 +172,15 @@ function _choose_kktsolver(Q, A, G, cone_dims;
   # of its predicted cost. LDL regularizes dependent equality rows.
   p > n && return (kktsolver_ldl, nothing)
   if n + m + p < size_min
+    @debug "KKT routing: small problem, dense QR" _group = :routing n m p size_min
     return (kktsolver_qr, nothing)
   end
   pat = _ldl_pattern(Q, A, G, cone_dims)
   flops_qr = dense_kkt_flops(n, m, p; nnzA = _structural_nnz(A),
                              nnzQ = _structural_nnz(Q))
-  if flops_qr < ldl_flop_weight * _ldl_flops(pat)
+  flops_ldl = _ldl_flops(pat)
+  @debug "KKT routing by predicted cost per iteration" _group = :routing n m p flops_qr flops_ldl ldl_flop_weight choice = (flops_qr < ldl_flop_weight * flops_ldl ? :qr : :ldl)
+  if flops_qr < ldl_flop_weight * flops_ldl
     return (kktsolver_qr, nothing)
   end
   return (kktsolver_ldl, pat)
