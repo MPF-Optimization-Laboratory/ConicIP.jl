@@ -216,7 +216,7 @@ function _gram_trace!(M::Matrix{Float64}, plan::GramPlan, W::Block)
     if Blk isa DiagBlock
       _gram_diag!(M, gb, Blk.diag)
     elseif Blk isa VecCongurance
-      _gram_sdp!(M, gb, plan.sdp[bi], Blk.R, plan.suspect)
+      _gram_sdp!(M, gb, plan.sdp[bi]::_GramSDP, Blk.R, plan.suspect)
     else
       _gram_dense!(M, gb, Blk)
     end
@@ -856,7 +856,7 @@ function _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = 0.0)
       @inbounds for j = 1:N, i = 1:N
         Ks[i, j] = dsc[i] * Kred[i, j] * dsc[j]
       end
-      fact = nothing
+      found = nothing         # not `fact`: `solve3x3` captures that name
       for σ in (static_reg, max(static_reg, 1e-12))
         # A fresh copy: an earlier solve3x3 may still hold its factors.
         Kf = copy(Ks)
@@ -864,11 +864,11 @@ function _sdpschur_mixed(Q, A, G, cone_dims, sp; static_reg = 0.0)
         @inbounds for i in iu; Kf[i, i] -= σ; end
         f = bunchkaufman!(Symmetric(Kf, :U), false; check = false)
         if issuccess(f) && _bk_minpivot(f) > 1e-14
-          fact = f; break
+          found = f; break
         end
       end
-      fact === nothing && throw(LinearAlgebra.SingularException(0))
-      fact
+      found === nothing && throw(LinearAlgebra.SingularException(0))
+      found
     end
     pt === nothing || (pt.n_kkt_factor += 1)
     d = copy(dsc)          # this factorization's scaling, kept with it
