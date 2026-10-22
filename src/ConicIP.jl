@@ -33,7 +33,7 @@ The action `W * x` computes `vecm(R' * mat(x) * R)`.
 
 Used internally as the Nesterov-Todd scaling matrix for semidefinite cones.
 """
-mutable struct VecCongurance; R :: Matrix; end
+mutable struct VecCongurance; R :: Matrix{Float64}; end
 
 Base.adjoint(W::VecCongurance)         = VecCongurance(W.R');
 Base.inv(W::VecCongurance)             = VecCongurance(inv(W.R))
@@ -54,8 +54,9 @@ VectorTypes = Union{Vector, ViewTypes}
 MatrixTypes = Union{Matrix, Array{Real,2},
                     SparseMatrixCSC{Real,Integer}}
 
-# returns 0 for matrices with dimension 0.
-normsafe(x) = isempty(x) ? 0 : norm(x)
+# returns 0 for matrices with dimension 0. A Float64 either way: an integer
+# zero would make every norm built from it a Union.
+normsafe(x) = isempty(x) ? 0.0 : norm(x)
 
 # Entrywise absolute value |M| of a data matrix, for the backward-error
 # style residual normalizations ‖|M||x|‖. Storage is preserved: sparse
@@ -784,10 +785,10 @@ the certificate-fallback auxiliary problems are not included.
 
 Residual and diagnostic tail:
 
-- `rEq::Real` -- relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))`
+- `rEq::Float64` -- relative equality residual `‖Gy − d‖ / (1 + max(‖d‖, ‖|G||y|‖))`
   of the returned point (`prFeas = max(rPr, rEq)`); `NaN` when no iterate
   was evaluated or when a certificate is returned (the iterate is discarded)
-- `rGap::Real` -- relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`,
+- `rGap::Float64` -- relative duality gap `|vᵀs| / (1 + |pobj + objective_offset|)`,
   the quantity the termination test compares with `optTol`; `NaN` when
   unset or when a certificate is returned
 - `kkt_repaired::Int` -- pivots the KKT solver dynamically regularized,
@@ -807,19 +808,19 @@ mutable struct Solution
   v      :: Vector{Float64}  # dual (linear inequality)
   s      :: Vector{Float64}  # cone slack (Ay - s = b, s ∈ K)
   status :: Symbol  # :Optimal, :Infeasible
-  Iter   :: Integer # number of iterations
-  Mu     :: Real    # optimality conditions
-  prFeas :: Real
-  duFeas :: Real
-  muFeas :: Real
-  pobj   :: Real
-  dobj   :: Real
+  Iter   :: Int     # number of iterations
+  Mu     :: Float64 # optimality conditions
+  prFeas :: Float64
+  duFeas :: Float64
+  muFeas :: Float64
+  pobj   :: Float64
+  dobj   :: Float64
   has_certificate :: Bool  # y/w/v carry a verified ray
   message :: String        # diagnostic detail (e.g. the factorization
                            # failure behind an :Error status); "" otherwise
   kkt_solves :: Int        # KKT back-solves performed by the main loop
-  rEq    :: Real           # equality residual ‖Gy − d‖ (relative); NaN if unset
-  rGap   :: Real           # relative gap |vᵀs| / (1 + |pobj + offset|); NaN if unset
+  rEq    :: Float64        # equality residual ‖Gy − d‖ (relative); NaN if unset
+  rGap   :: Float64        # relative gap |vᵀs| / (1 + |pobj + offset|); NaN if unset
   kkt_repaired  :: Int     # dynamically regularized pivots, summed over the solve
   kkt_refactors :: Int     # retry refactorizations (shift bumps), summed over the solve
 
@@ -1282,17 +1283,17 @@ function _conicIP(
   _d_aff = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _Δz    = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
   _Δzr   = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-  # Centrality-corrector scratch (allocated only when the option is on):
+  # Centrality-corrector scratch (full size only when the option is on):
   # trial scaled iterates ṽ, s̃, their product w, the correction Δw, the
   # corrector right-hand side (zero except the s block), and the candidate
-  # direction Δz + Δz_c.
-  if centralityCorrectors > 0
-    _cc_v  = zeros(m); _cc_s = zeros(m); _cc_w = zeros(m); _cc_dw = zeros(m)
-    _cc_b1 = zeros(m); _cc_b2 = zeros(m)   # FΔv and F⁻ᵀΔs
-    _cc_r  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-    _cc_Δz = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-    _Δz_c  = v4x1(zeros(n), zeros(p), zeros(m), zeros(m))
-  end
+  # direction Δz + Δz_c. Bound on both paths, empty when off: a local
+  # bound inside an `if` is boxed by the closures that capture it.
+  (ncc, pcc, mcc) = centralityCorrectors > 0 ? (n, p, m) : (0, 0, 0)
+  _cc_v  = zeros(mcc); _cc_s = zeros(mcc); _cc_w = zeros(mcc); _cc_dw = zeros(mcc)
+  _cc_b1 = zeros(mcc); _cc_b2 = zeros(mcc)   # FΔv and F⁻ᵀΔs
+  _cc_r  = v4x1(zeros(ncc), zeros(pcc), zeros(mcc), zeros(mcc))
+  _cc_Δz = v4x1(zeros(ncc), zeros(pcc), zeros(mcc), zeros(mcc))
+  _Δz_c  = v4x1(zeros(ncc), zeros(pcc), zeros(mcc), zeros(mcc))
 
   # KKT back-solve counter, reported as Solution.kkt_solves
   _nsolve = Ref(0)
